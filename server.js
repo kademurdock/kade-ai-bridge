@@ -1,17 +1,12 @@
 /**
- * kade-ai-bridge — SMS + voice call bridge for Kade-AI
+ * kade-ai-bridge — voice call bridge for Kade-AI
  *
- * Env vars (set in Railway):
- *   TWILIO_ACCOUNT_SID    — twilio.com/console
- *   TWILIO_AUTH_TOKEN     — twilio.com/console
- *   TWILIO_PHONE_NUMBER   — your Twilio number e.g. +14178923268
- *   LIBRECHAT_URL         — https://kademurdock.com
- *   LIBRECHAT_EMAIL       — login email
- *   LIBRECHAT_PASSWORD    — login password (Railway secret)
- *   DEFAULT_AGENT_ID      — fallback agent when caller has no preference
- *   BRIDGE_SECRET         — random string protecting /register & /users
- *   PORT                  — set automatically by Railway
- *   PUBLIC_URL            — set automatically via RAILWAY_PUBLIC_DOMAIN
+ * Env vars (Railway):
+ *   TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER
+ *   LIBRECHAT_URL / LIBRECHAT_EMAIL / LIBRECHAT_PASSWORD
+ *   DEFAULT_AGENT_ID  — fallback agent (Kiana)
+ *   BRIDGE_SECRET     — protects /register & /users
+ *   PORT / PUBLIC_URL — set automatically by Railway
  */
 
 'use strict';
@@ -37,7 +32,7 @@ const TWILIO_TOKEN    = process.env.TWILIO_AUTH_TOKEN;
 const LIBRECHAT_URL   = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
 const LIBRECHAT_EMAIL = process.env.LIBRECHAT_EMAIL;
 const LIBRECHAT_PASS  = process.env.LIBRECHAT_PASSWORD;
-const DEFAULT_AGENT   = process.env.DEFAULT_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb';
+const DEFAULT_AGENT      = process.env.DEFAULT_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb';
 const DEFAULT_AGENT_NAME = 'Kiana';
 const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -52,12 +47,12 @@ function getTwilioClient() {
 const twilioClient = getTwilioClient();
 
 // ── Persistent user store ─────────────────────────────────────────────────────
-// users: phone (E.164) → { name, agentId, agentName }
+// users: phone (E.164) → { name, agentId, agentName, lcEmail?, lcPass? }
+// lcEmail/lcPass = real LibreChat account creds. Guests omit these and use admin token.
 const USERS_FILE = path.join(
   process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
   'bridge-users.json'
 );
-
 function loadUsers() {
   try {
     if (fs.existsSync(USERS_FILE))
@@ -69,15 +64,71 @@ function saveUsers() {
   try { fs.writeFileSync(USERS_FILE, JSON.stringify(Object.fromEntries(users))); }
   catch (e) { console.error('[bridge] Could not save users:', e.message); }
 }
+const users = loadUsers();
 
-const users       = loadUsers();
-const convHistory = new Map(); // phone → [{role,content}] (last 10 SMS turns)
-const voiceStates = new Map(); // callSid → {from, agentId, agentName, history}
-const tempMedia   = new Map(); // id → {filePath, expires}
+// In-memory state maps
+const voiceStates = new Map(); // callSid → { from, agentId, agentName, history, step?, pendingName?, pendingEmail?, lcEmail?, lcPass? }
+const convHistory = new Map(); // phone → [{role,content}] for SMS
+const tempMedia   = new Map(); // id → { filePath, expires }
+
+// ── LibreChat auth — admin token ───────────────────────────────────────────────
+let _adminToken = null, _adminTokenExp = 0;
+async function getLCToken() {
+  if (_adminToken && Date.now() < _adminTokenExp) return _adminToken;
+  const r = await axios.post(
+    `${LIBRECHAT_URL}/api/auth/login`,
+    { email: LIBRECHAT_EMAIL, password: LIBRECHAT_PASS },
+    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+  );
+  _adminToken    = r.data.token;
+  _adminTokenExp = Date.now() + 20 * 60 * 1000;
+  return _adminToken;
+}
+
+// ── LibreChat auth — per-user token ────────────────────────────────────────────
+const _userTokens = new Map(); // email → { token, expires }
+async function getUserToken(email, password) {
+  const cached = _userTokens.get(email);
+  if (cached && Date.now() < cached.expires) return cached.token;
+  const r = await axios.post(
+    `${LIBRECHAT_URL}/api/auth/login`,
+    { email, password },
+    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+  );
+  _userTokens.set(email, { token: r.data.token, expires: Date.now() + 20 * 60 * 1000 });
+  return r.data.token;
+}
+
+// Returns the right token for a call state — user's own if they have an account, admin otherwise
+async function getTokenForCall(state) {
+  if (state.lcEmail && state.lcPass) return getUserToken(state.lcEmail, state.lcPass);
+  return getLCToken();
+}
+
+// ── LibreChat account creation ────────────────────────────────────────────────
+async function createLCAccount(name, email, password) {
+  await axios.post(
+    `${LIBRECHAT_URL}/api/auth/register`,
+    { name, email, password, confirm_password: password },
+    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 }
+  );
+}
+
+// ── Spoken email parser ───────────────────────────────────────────────────────
+// Handles "john at gmail dot com", "my email is jane underscore doe at outlook dot com", etc.
+function parseSpokenEmail(text) {
+  let s = text.toLowerCase().trim();
+  s = s.replace(/^(?:my email(?: address)? is|email is|it's|its)\s+/i, '');
+  s = s.replace(/\s+at\s+/g, '@');
+  s = s.replace(/\s+dot\s+/g, '.');
+  s = s.replace(/\s+underscore\s+/g, '_');
+  s = s.replace(/\s+(?:dash|hyphen|minus)\s+/g, '-');
+  s = s.replace(/\s+/g, '');
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s) ? s : null;
+}
 
 // ── Agent cache ───────────────────────────────────────────────────────────────
 let _agentCache = null, _agentCacheExp = 0;
-
 async function getAgents() {
   if (_agentCache && Date.now() < _agentCacheExp) return _agentCache;
   try {
@@ -87,8 +138,8 @@ async function getAgents() {
       timeout: 10000,
     });
     _agentCache    = (r.data.data || []).filter(a => a.isPublic);
-    _agentCacheExp = Date.now() + 60 * 60 * 1000; // refresh hourly
-    console.log(`[bridge] Agent cache refreshed: ${_agentCache.length} public agents`);
+    _agentCacheExp = Date.now() + 60 * 60 * 1000;
+    console.log(`[bridge] Agent cache: ${_agentCache.length} public agents`);
   } catch (e) {
     console.error('[bridge] Failed to fetch agents:', e.message);
     _agentCache = _agentCache || [];
@@ -96,7 +147,6 @@ async function getAgents() {
   return _agentCache;
 }
 
-// Three-level fuzzy match: exact → query contains name → name contains query
 function findAgent(agents, query) {
   if (!query || !agents.length) return null;
   const q = query.toLowerCase().trim();
@@ -106,8 +156,6 @@ function findAgent(agents, query) {
       || null;
 }
 
-// Detect "switch to X" command or a bare agent name (≤2 words) in an utterance.
-// Returns the matched agent object or null.
 function extractSwitchTarget(text, agents) {
   const m = text.match(
     /^(?:switch(?:\s+to)?|change(?:\s+to)?|talk(?:\s+to)?|give me|i want(?:\s+to(?:\s+talk(?:\s+to)?)?)?)\s+(.+)/i
@@ -116,26 +164,10 @@ function extractSwitchTarget(text, agents) {
   return query ? findAgent(agents, query) : null;
 }
 
-// ── LibreChat auth ─────────────────────────────────────────────────────────────
-let _lcToken = null, _lcTokenExp = 0;
-async function getLCToken() {
-  if (_lcToken && Date.now() < _lcTokenExp) return _lcToken;
-  const r = await axios.post(
-    `${LIBRECHAT_URL}/api/auth/login`,
-    { email: LIBRECHAT_EMAIL, password: LIBRECHAT_PASS },
-    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
-  );
-  _lcToken    = r.data.token;
-  _lcTokenExp = Date.now() + 20 * 60 * 1000;
-  return _lcToken;
-}
-
 // ── AI call ────────────────────────────────────────────────────────────────────
-async function askAgent(agentId, history, userMessage) {
-  const token = await getLCToken();
+async function askAgent(agentId, history, userMessage, token) {
   history.push({ role: 'user', content: userMessage });
   while (history.length > 10) history.shift();
-
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/ask/agents`,
     { agentId, messages: history, conversationId: null, parentMessageId: null },
@@ -145,7 +177,6 @@ async function askAgent(agentId, history, userMessage) {
       timeout: 30000,
     }
   );
-
   let reply = '';
   await new Promise((resolve, reject) => {
     r.data.on('data', chunk => {
@@ -157,7 +188,6 @@ async function askAgent(agentId, history, userMessage) {
     r.data.on('end', resolve);
     r.data.on('error', reject);
   });
-
   if (!reply) throw new Error('Empty reply from agent');
   history.push({ role: 'assistant', content: reply });
   return reply;
@@ -176,38 +206,27 @@ async function synthesizeVoice(text) {
 }
 
 function storeAudio(buffer) {
-  const id  = crypto.randomBytes(12).toString('hex');
-  const fp  = path.join(os.tmpdir(), `bridge-${id}.wav`);
+  const id = crypto.randomBytes(12).toString('hex');
+  const fp = path.join(os.tmpdir(), `bridge-${id}.wav`);
   fs.writeFileSync(fp, buffer);
   tempMedia.set(id, { filePath: fp, expires: Date.now() + 5 * 60 * 1000 });
   setTimeout(() => { try { fs.unlinkSync(fp); } catch {} tempMedia.delete(id); }, 5 * 60 * 1000);
   return `${PUBLIC_URL}/media/${id}`;
 }
 
-// Play synthesized audio; fall back to Twilio alice if TTS fails
 async function playOrSay(twiml, text) {
-  try {
-    const wav = await synthesizeVoice(text);
-    twiml.play(storeAudio(wav));
-  } catch {
-    twiml.say({ voice: 'alice' }, text);
-  }
+  try { twiml.play(storeAudio(await synthesizeVoice(text))); }
+  catch { twiml.say({ voice: 'alice' }, text); }
 }
 
-// Build a TwiML string that plays a message then kicks off a fresh Record.
-// Used by the transcription callback when it needs to update a live call
-// (e.g. after an agent switch).
+// Build TwiML that plays a message then re-records (used in async call updates)
 async function buildReRecordTwiml(message) {
   const vr = new twilio.twiml.VoiceResponse();
   await playOrSay(vr, message);
   vr.record({
-    action:             '/voice/reply',
-    method:             'POST',
-    timeout:            5,
-    maxLength:          120,
-    playBeep:           true,
-    transcribe:         true,
-    transcribeCallback: '/voice/transcribed',
+    action: '/voice/reply', method: 'POST',
+    timeout: 5, maxLength: 120, playBeep: true,
+    transcribe: true, transcribeCallback: '/voice/transcribed',
   });
   return vr.toString();
 }
@@ -225,16 +244,15 @@ app.get('/media/:id', (req, res) => {
 
 // ── Admin: register / list users ───────────────────────────────────────────────
 app.post('/register', (req, res) => {
-  const { phone, name, agentId, agentName, secret } = req.body;
+  const { phone, name, agentId, agentName, lcEmail, lcPass, secret } = req.body;
   if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const digits = phone.replace(/\D/g, '');
   const e164   = digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
-  users.set(e164, {
-    name:      name      || 'Friend',
-    agentId:   agentId   || DEFAULT_AGENT,
-    agentName: agentName || DEFAULT_AGENT_NAME,
-  });
+  const record = { name: name || 'Friend', agentId: agentId || DEFAULT_AGENT, agentName: agentName || DEFAULT_AGENT_NAME };
+  if (lcEmail) record.lcEmail = lcEmail;
+  if (lcPass)  record.lcPass  = lcPass;
+  users.set(e164, record);
   saveUsers();
   console.log(`[bridge] Admin registered ${e164} → ${agentId || DEFAULT_AGENT} (${name})`);
   res.json({ ok: true, phone: e164 });
@@ -252,22 +270,18 @@ app.post('/sms', async (req, res) => {
   const body  = (req.body.Body || '').trim();
   if (!body) { res.type('text/xml').send(twiml.toString()); return; }
   console.log(`[sms] from=${from} body="${body}"`);
-
   const user    = users.get(from) || { agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME, name: 'there' };
   const history = convHistory.get(from) || [];
   convHistory.set(from, history);
-
   try {
-    const reply = await askAgent(user.agentId, history, body);
+    const token = user.lcEmail ? await getUserToken(user.lcEmail, user.lcPass) : await getLCToken();
+    const reply = await askAgent(user.agentId, history, body, token);
     try {
       const wav = await synthesizeVoice(reply);
-      const url = storeAudio(wav);
       const msg = twiml.message();
       msg.body(reply);
-      msg.media(url);
-    } catch {
-      twiml.message(reply);
-    }
+      msg.media(storeAudio(wav));
+    } catch { twiml.message(reply); }
   } catch (err) {
     console.error('[sms] Error:', err.message);
     twiml.message("Sorry, I'm having trouble right now. Try again in a moment.");
@@ -284,186 +298,124 @@ app.post('/voice', async (req, res) => {
   console.log(`[voice] inbound from=${from} callSid=${callSid} known=${!!user}`);
 
   if (!user) {
-    // ── NEW CALLER: capture name, then register and jump into chat ──
+    // New caller — ask for name
     voiceStates.set(callSid, { from, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME, history: [] });
     await playOrSay(twiml, "Hey! I don't have you on file yet. What's your name?");
-    twiml.gather({
-      input:         'speech',
-      speechTimeout: 'auto',
-      timeout:       8,
-      action:        `/voice/setup/${callSid}`,
-      method:        'POST',
-    });
+    twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
+      action: `/voice/setup-name/${callSid}`, method: 'POST' });
     twiml.say({ voice: 'alice' }, "I didn't catch that. Call back anytime!");
     twiml.hangup();
   } else {
-    // ── EXISTING CALLER: short greeting, straight to recording ──
-    voiceStates.set(callSid, { from, agentId: user.agentId, agentName: user.agentName || DEFAULT_AGENT_NAME, history: [] });
+    // Returning caller — short greeting, straight to record
+    voiceStates.set(callSid, {
+      from, agentId: user.agentId, agentName: user.agentName || DEFAULT_AGENT_NAME,
+      history: [], lcEmail: user.lcEmail, lcPass: user.lcPass,
+    });
     await playOrSay(twiml,
       `Hey ${user.name}! You're with ${user.agentName || DEFAULT_AGENT_NAME}. ` +
-      `Go ahead — say "switch to" and an agent name anytime to change.`
+      `Go ahead — say "switch to" and a name anytime to change agents.`
     );
-    twiml.record({
-      action:             '/voice/reply',
-      method:             'POST',
-      timeout:            5,
-      maxLength:          120,
-      playBeep:           true,
-      transcribe:         true,
-      transcribeCallback: '/voice/transcribed',
-    });
+    twiml.record({ action: '/voice/reply', method: 'POST',
+      timeout: 5, maxLength: 120, playBeep: true,
+      transcribe: true, transcribeCallback: '/voice/transcribed' });
   }
-
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── Voice: name capture for new callers ───────────────────────────────────────
-app.post('/voice/setup/:callSid', async (req, res) => {
+// ── Voice setup step 1: name ──────────────────────────────────────────────────
+app.post('/voice/setup-name/:callSid', async (req, res) => {
   const twiml   = new twilio.twiml.VoiceResponse();
   const callSid = req.params.callSid;
   const state   = voiceStates.get(callSid);
   const name    = (req.body.SpeechResult || '').trim() || 'Friend';
 
-  if (state) {
-    users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
-    saveUsers();
-    console.log(`[voice] self-registered ${state.from} as "${name}"`);
-  }
+  if (state) state.pendingName = name;
 
   await playOrSay(twiml,
-    `Nice to meet you, ${name}! You're talking to ${DEFAULT_AGENT_NAME} by default. ` +
-    `Go ahead and speak — say "switch to" and a name anytime to change agents.`
+    `Nice to meet you, ${name}! To set up your own account so the AI remembers you between calls, ` +
+    `what's your email address? Say it like "john at gmail dot com", or say skip to chat as a guest.`
   );
-  twiml.record({
-    action:             '/voice/reply',
-    method:             'POST',
-    timeout:            5,
-    maxLength:          120,
-    playBeep:           true,
-    transcribe:         true,
-    transcribeCallback: '/voice/transcribed',
-  });
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 12,
+    action: `/voice/setup-email/${callSid}`, method: 'POST' });
+  // If they don't say anything, register as guest
+  twiml.redirect({ method: 'POST' }, `/voice/setup-guest/${callSid}`);
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── Voice: reply placeholder (holds the call while transcription processes) ────
-app.post('/voice/reply', (_req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.pause({ length: 12 });
-  res.type('text/xml').send(twiml.toString());
-});
-
-// ── Voice: transcription → agent → update live call ───────────────────────────
-app.post('/voice/transcribed', async (req, res) => {
-  const callSid = req.body.CallSid;
-  const text    = (req.body.TranscriptionText || '').trim();
-  const state   = voiceStates.get(callSid);
-
-  res.status(200).end(); // Twilio doesn't need a response here
-  if (!state || !text || !twilioClient) return;
-  console.log(`[voice] transcribed callSid=${callSid}: "${text}"`);
-
-  try {
-    const agents = await getAgents();
-    const target = extractSwitchTarget(text, agents);
-
-    if (target && target.id !== state.agentId) {
-      // ── Agent switch ──
-      console.log(`[voice] switching ${state.agentId} → ${target.name} (${target.id})`);
-      state.agentId   = target.id;
-      state.agentName = target.name;
-      state.history   = []; // fresh context with the new agent
-      const user = users.get(state.from);
-      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
-      const twimlStr = await buildReRecordTwiml(`Switching to ${target.name}! What do you want to say?`);
-      await twilioClient.calls(callSid).update({ twiml: twimlStr });
-    } else {
-      // ── Normal conversation turn ──
-      const reply    = await askAgent(state.agentId, state.history, text);
-      const wav      = await synthesizeVoice(reply);
-      const audioUrl = storeAudio(wav);
-
-      const vr = new twilio.twiml.VoiceResponse();
-      vr.play(audioUrl);
-      vr.gather({
-        input:         'speech',
-        speechTimeout: 'auto',
-        timeout:       8,
-        action:        `/voice/continue/${callSid}`,
-        method:        'POST',
-      });
-      vr.say({ voice: 'alice' }, 'Talk to you later!');
-      vr.hangup();
-      await twilioClient.calls(callSid).update({ twiml: vr.toString() });
-    }
-  } catch (err) {
-    console.error('[voice] transcribed error:', err.message);
-    try {
-      await twilioClient.calls(callSid).update({
-        twiml: '<Response><Say voice="alice">Sorry, something went wrong. Goodbye!</Say><Hangup/></Response>',
-      });
-    } catch {}
-  }
-});
-
-// ── Voice: continued conversation turns ───────────────────────────────────────
-app.post('/voice/continue/:callSid', async (req, res) => {
+// ── Voice setup step 2: email ─────────────────────────────────────────────────
+app.post('/voice/setup-email/:callSid', async (req, res) => {
   const twiml   = new twilio.twiml.VoiceResponse();
   const callSid = req.params.callSid;
-  const speech  = (req.body.SpeechResult || '').trim();
   const state   = voiceStates.get(callSid);
+  const speech  = (req.body.SpeechResult || '').trim().toLowerCase();
 
-  if (!speech || !state) {
-    twiml.say({ voice: 'alice' }, 'Talk to you later!');
-    twiml.hangup();
-    voiceStates.delete(callSid);
+  // "skip" → guest
+  if (/^skip/.test(speech) || !speech) {
+    return res.type('text/xml').send(await buildGuestRegistration(twiml, callSid));
+  }
+
+  const email = parseSpokenEmail(speech);
+  if (!email) {
+    await playOrSay(twiml,
+      `I couldn't make that out as an email address. Try again — say it like "john at gmail dot com", or say skip.`
+    );
+    twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 12,
+      action: `/voice/setup-email/${callSid}`, method: 'POST' });
+    twiml.redirect({ method: 'POST' }, `/voice/setup-guest/${callSid}`);
     return res.type('text/xml').send(twiml.toString());
   }
 
-  console.log(`[voice] continue callSid=${callSid}: "${speech}"`);
+  if (state) state.pendingEmail = email;
 
-  try {
-    const agents = await getAgents();
-    const target = extractSwitchTarget(speech, agents);
-
-    if (target && target.id !== state.agentId) {
-      // ── Mid-call agent switch ──
-      console.log(`[voice] mid-call switch → ${target.name}`);
-      state.agentId   = target.id;
-      state.agentName = target.name;
-      state.history   = [];
-      const user = users.get(state.from);
-      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
-      await playOrSay(twiml, `Switching to ${target.name}! What's on your mind?`);
-    } else {
-      // ── Regular turn ──
-      const reply = await askAgent(state.agentId, state.history, speech);
-      const wav   = await synthesizeVoice(reply);
-      twiml.play(storeAudio(wav));
-    }
-  } catch (err) {
-    console.error('[voice] continue error:', err.message);
-    twiml.say({ voice: 'alice' }, 'Sorry, something went wrong. Try again.');
-  }
-
-  // Re-gather for next turn
-  twiml.gather({
-    input:         'speech',
-    speechTimeout: 'auto',
-    timeout:       8,
-    action:        `/voice/continue/${callSid}`,
-    method:        'POST',
-  });
-  twiml.say({ voice: 'alice' }, 'Talk to you later!');
-  twiml.hangup();
+  await playOrSay(twiml, `I heard ${email.replace('@', ' at ').replace(/\./g, ' dot ')}. Say yes to confirm, or no to try again.`);
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
+    action: `/voice/setup-confirm/${callSid}`, method: 'POST' });
+  twiml.redirect({ method: 'POST' }, `/voice/setup-guest/${callSid}`);
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
-app.listen(port, () => {
-  console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
-  console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
-  if (!twilioClient) console.warn('[bridge] Twilio not configured — set env vars');
-});
+// ── Voice setup step 3: confirm email ────────────────────────────────────────
+app.post('/voice/setup-confirm/:callSid', async (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const callSid = req.params.callSid;
+  const state   = voiceStates.get(callSid);
+  const speech  = (req.body.SpeechResult || '').trim().toLowerCase();
+
+  if (/^y(es|ep|eah)?/.test(speech) && state?.pendingEmail) {
+    // Confirmed — create the account
+    const name     = state.pendingName || 'Friend';
+    const email    = state.pendingEmail;
+    const password = crypto.randomBytes(10).toString('base64url');
+
+    try {
+      await createLCAccount(name, email, password);
+      console.log(`[voice] created LibreChat account for ${state.from}: ${email}`);
+
+      // Update state + persist user
+      state.lcEmail = email;
+      state.lcPass  = password;
+      users.set(state.from, {
+        name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME,
+        lcEmail: email, lcPass: password,
+      });
+      saveUsers();
+
+      const spokenPwd = password.replace(/[^a-zA-Z0-9]/g, ' ');
+      await playOrSay(twiml,
+        `You're all set, ${name}! Your account is live at kademurdock.com. ` +
+        `Log in with ${email.replace('@', ' at ')} and the temporary password: ${spokenPwd}. ` +
+        `Go ahead and talk — the AI will remember you from now on.`
+      );
+    } catch (err) {
+      const alreadyExists = err.response?.status === 400 || err.response?.status === 409
+        || (err.response?.data?.message || '').toLowerCase().includes('exist');
+      if (alreadyExists) {
+        console.log(`[voice] ${email} already registered — saving as guest for now`);
+        await playOrSay(twiml,
+          `Looks like ${email.replace('@', ' at ')} already has an account at kademurdock.com. ` +
+          `You're good to chat — log in on the website to see your history.`
+        );
+        // Register with name only, no creds (we don't have their password)
+        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName
