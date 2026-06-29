@@ -38,6 +38,40 @@ const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
+const TTS_PROXY_URL   = 'https://inworld-tts-proxy-production.up.railway.app';
+
+// ── Pronunciation fixes ───────────────────────────────────────────────────────
+// "Kade" (the person) is pronounced "Kadie" — fix it before sending to TTS.
+function fixPronunciation(text) {
+  return text.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
+}
+
+// ── Phone voice list ──────────────────────────────────────────────────────────
+// Curated subset of available Inworld voices, friendly for phone conversations.
+// Full list at kademurdock.com/voices — these are just the ones worth switching to by name.
+const PHONE_VOICES = [
+  'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
+  'Amy', 'Hannah', 'Kiana (Comedian)', 'Zadiana', 'Honey', 'Sadie',
+  'Lannie', 'Reanne', 'Sharma', 'Fara', 'Fucia', 'Colby', 'Zadia',
+  'Mazy (Podcaster)', 'Houston Stone', 'DJ Velvet', 'Podcaster 1', 'Podcaster 2',
+];
+
+function findVoice(query) {
+  if (!query) return null;
+  const q = query.toLowerCase().trim();
+  return PHONE_VOICES.find(v => v.toLowerCase() === q)
+      || PHONE_VOICES.find(v => q.includes(v.toLowerCase()))
+      || PHONE_VOICES.find(v => v.toLowerCase().includes(q))
+      || null;
+}
+
+function extractVoiceSwitch(text) {
+  const m = text.match(
+    /^(?:switch|change)\s+(?:my\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:the\s+)?voice(?:\s+to)?\s+(.+)/i
+  );
+  if (!m) return null;
+  return findVoice((m[1] || m[2]).trim());
+}
 
 function getTwilioClient() {
   if (!TWILIO_SID || !TWILIO_TOKEN || TWILIO_SID === 'FILL_IN') return null;
@@ -194,9 +228,20 @@ async function askAgent(agentId, history, userMessage, token) {
 }
 
 // ── TTS + audio hosting ────────────────────────────────────────────────────────
-async function synthesizeVoice(text) {
+// voice = null → use LibreChat's configured default (Kiana's voice)
+// voice = "Sarah" etc → call the Inworld proxy directly with that voice name
+async function synthesizeVoice(text, voice = null) {
+  const input = fixPronunciation(text).slice(0, 4096);
+  if (voice) {
+    const r = await axios.post(
+      `${TTS_PROXY_URL}/v1/audio/speech`,
+      { model: 'tts-1', input, voice },
+      { responseType: 'arraybuffer', timeout: 30000 }
+    );
+    return Buffer.from(r.data);
+  }
   const fd = new FormData();
-  fd.append('input', text.slice(0, 4096));
+  fd.append('input', input);
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/files/speech/tts/manual`,
     fd,
@@ -214,15 +259,15 @@ function storeAudio(buffer) {
   return `${PUBLIC_URL}/media/${id}`;
 }
 
-async function playOrSay(twiml, text) {
-  try { twiml.play(storeAudio(await synthesizeVoice(text))); }
+async function playOrSay(twiml, text, voice = null) {
+  try { twiml.play(storeAudio(await synthesizeVoice(text, voice))); }
   catch { twiml.say({ voice: 'alice' }, text); }
 }
 
 // Build TwiML that plays a message then re-records (used in async call updates)
-async function buildReRecordTwiml(message) {
+async function buildReRecordTwiml(message, voice = null) {
   const vr = new twilio.twiml.VoiceResponse();
-  await playOrSay(vr, message);
+  await playOrSay(vr, message, voice);
   vr.record({
     action: '/voice/reply', method: 'POST',
     timeout: 5, maxLength: 120, playBeep: true,
@@ -309,11 +354,12 @@ app.post('/voice', async (req, res) => {
     // Returning caller — short greeting, straight to record
     voiceStates.set(callSid, {
       from, agentId: user.agentId, agentName: user.agentName || DEFAULT_AGENT_NAME,
-      history: [], lcEmail: user.lcEmail, lcPass: user.lcPass,
+      history: [], lcEmail: user.lcEmail, lcPass: user.lcPass, voice: user.voice || null,
     });
     await playOrSay(twiml,
       `Hey ${user.name}! You're with ${user.agentName || DEFAULT_AGENT_NAME}. ` +
-      `Go ahead — say "switch to" and a name anytime to change agents.`
+      `Go ahead — say "switch to" and a name anytime to change agents, or "switch voice to" a voice name to change how I sound.`,
+      user.voice || null
     );
     twiml.record({ action: '/voice/reply', method: 'POST',
       timeout: 5, maxLength: 120, playBeep: true,
@@ -481,6 +527,20 @@ app.post('/voice/transcribed', async (req, res) => {
   console.log(`[voice] transcribed callSid=${callSid}: "${text}"`);
 
   try {
+    // Voice switch check first ("switch voice to Sarah")
+    const voiceTarget = extractVoiceSwitch(text);
+    if (voiceTarget) {
+      console.log(`[voice] voice switch -> ${voiceTarget}`);
+      state.voice = voiceTarget;
+      const user = users.get(state.from);
+      if (user) { user.voice = voiceTarget; saveUsers(); }
+      await twilioClient.calls(callSid).update({
+        twiml: await buildReRecordTwiml(`Switching to ${voiceTarget}'s voice! Go ahead.`, voiceTarget),
+      });
+      return;
+    }
+
+    // Agent switch check
     const agents = await getAgents();
     const target = extractSwitchTarget(text, agents);
 
@@ -492,14 +552,13 @@ app.post('/voice/transcribed', async (req, res) => {
       const user = users.get(state.from);
       if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
       await twilioClient.calls(callSid).update({
-        twiml: await buildReRecordTwiml(`Switching to ${target.name}! What do you want to say?`),
+        twiml: await buildReRecordTwiml(`Switching to ${target.name}! What do you want to say?`, state.voice),
       });
     } else {
       const token    = await getTokenForCall(state);
       const reply    = await askAgent(state.agentId, state.history, text, token);
-      const audioUrl = storeAudio(await synthesizeVoice(reply));
+      const audioUrl = storeAudio(await synthesizeVoice(reply, state.voice));
       const vr = new twilio.twiml.VoiceResponse();
-      vr.play(audioUrl);
       vr.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
         action: `/voice/continue/${callSid}`, method: 'POST' });
       vr.say({ voice: 'alice' }, 'Talk to you later!');
@@ -533,20 +592,30 @@ app.post('/voice/continue/:callSid', async (req, res) => {
   console.log(`[voice] continue callSid=${callSid}: "${speech}"`);
 
   try {
-    const agents = await getAgents();
-    const target = extractSwitchTarget(speech, agents);
-
-    if (target && target.id !== state.agentId) {
-      state.agentId   = target.id;
-      state.agentName = target.name;
-      state.history   = [];
+    // Voice switch check first
+    const voiceTarget = extractVoiceSwitch(speech);
+    if (voiceTarget) {
+      state.voice = voiceTarget;
       const user = users.get(state.from);
-      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
-      await playOrSay(twiml, `Switching to ${target.name}! What's on your mind?`);
+      if (user) { user.voice = voiceTarget; saveUsers(); }
+      await playOrSay(twiml, `Switching to ${voiceTarget}'s voice!`, voiceTarget);
     } else {
-      const token = await getTokenForCall(state);
-      const reply = await askAgent(state.agentId, state.history, speech, token);
-      twiml.play(storeAudio(await synthesizeVoice(reply)));
+      // Agent switch check
+      const agents = await getAgents();
+      const target = extractSwitchTarget(speech, agents);
+
+      if (target && target.id !== state.agentId) {
+        state.agentId   = target.id;
+        state.agentName = target.name;
+        state.history   = [];
+        const user = users.get(state.from);
+        if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
+        await playOrSay(twiml, `Switching to ${target.name}! What's on your mind?`, state.voice);
+      } else {
+        const token = await getTokenForCall(state);
+        const reply = await askAgent(state.agentId, state.history, speech, token);
+        twiml.play(storeAudio(await synthesizeVoice(reply, state.voice)));
+      }
     }
   } catch (err) {
     console.error('[voice] continue error:', err.message);
