@@ -418,4 +418,151 @@ app.post('/voice/setup-confirm/:callSid', async (req, res) => {
           `You're good to chat — log in on the website to see your history.`
         );
         // Register with name only, no creds (we don't have their password)
-        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName
+        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
+        saveUsers();
+      } else {
+        console.error('[voice] account creation failed:', err.message);
+        await playOrSay(twiml, `Something went wrong setting up your account, but you can still chat as a guest.`);
+        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
+        saveUsers();
+      }
+    }
+  } else {
+    // No / try again
+    await playOrSay(twiml, `No problem. What's your email? Say it like "john at gmail dot com", or say skip.`);
+    twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 12,
+      action: `/voice/setup-email/${callSid}`, method: 'POST' });
+    twiml.redirect({ method: 'POST' }, `/voice/setup-guest/${callSid}`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // Start conversation
+  twiml.record({ action: '/voice/reply', method: 'POST',
+    timeout: 5, maxLength: 120, playBeep: true,
+    transcribe: true, transcribeCallback: '/voice/transcribed' });
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── Voice setup: guest fallback ────────────────────────────────────────────────
+app.post('/voice/setup-guest/:callSid', async (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const callSid = req.params.callSid;
+  const state   = voiceStates.get(callSid);
+  const name    = state?.pendingName || 'Friend';
+
+  if (state?.from) {
+    users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
+    saveUsers();
+    console.log(`[voice] registered ${state.from} as guest "${name}"`);
+  }
+
+  await playOrSay(twiml, `No problem, ${name}! Go ahead and start talking.`);
+  twiml.record({ action: '/voice/reply', method: 'POST',
+    timeout: 5, maxLength: 120, playBeep: true,
+    transcribe: true, transcribeCallback: '/voice/transcribed' });
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── Voice: reply placeholder ──────────────────────────────────────────────────
+app.post('/voice/reply', (_req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.pause({ length: 12 });
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── Voice: transcription → agent → update live call ───────────────────────────
+app.post('/voice/transcribed', async (req, res) => {
+  const callSid = req.body.CallSid;
+  const text    = (req.body.TranscriptionText || '').trim();
+  const state   = voiceStates.get(callSid);
+
+  res.status(200).end();
+  if (!state || !text || !twilioClient) return;
+  console.log(`[voice] transcribed callSid=${callSid}: "${text}"`);
+
+  try {
+    const agents = await getAgents();
+    const target = extractSwitchTarget(text, agents);
+
+    if (target && target.id !== state.agentId) {
+      console.log(`[voice] switching -> ${target.name}`);
+      state.agentId   = target.id;
+      state.agentName = target.name;
+      state.history   = [];
+      const user = users.get(state.from);
+      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
+      await twilioClient.calls(callSid).update({
+        twiml: await buildReRecordTwiml(`Switching to ${target.name}! What do you want to say?`),
+      });
+    } else {
+      const token    = await getTokenForCall(state);
+      const reply    = await askAgent(state.agentId, state.history, text, token);
+      const audioUrl = storeAudio(await synthesizeVoice(reply));
+      const vr = new twilio.twiml.VoiceResponse();
+      vr.play(audioUrl);
+      vr.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
+        action: `/voice/continue/${callSid}`, method: 'POST' });
+      vr.say({ voice: 'alice' }, 'Talk to you later!');
+      vr.hangup();
+      await twilioClient.calls(callSid).update({ twiml: vr.toString() });
+    }
+  } catch (err) {
+    console.error('[voice] transcribed error:', err.message);
+    try {
+      await twilioClient.calls(callSid).update({
+        twiml: '<Response><Say voice="alice">Sorry, something went wrong. Goodbye!</Say><Hangup/></Response>',
+      });
+    } catch {}
+  }
+});
+
+// ── Voice: continued turns ────────────────────────────────────────────────────
+app.post('/voice/continue/:callSid', async (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const callSid = req.params.callSid;
+  const speech  = (req.body.SpeechResult || '').trim();
+  const state   = voiceStates.get(callSid);
+
+  if (!speech || !state) {
+    twiml.say({ voice: 'alice' }, 'Talk to you later!');
+    twiml.hangup();
+    voiceStates.delete(callSid);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  console.log(`[voice] continue callSid=${callSid}: "${speech}"`);
+
+  try {
+    const agents = await getAgents();
+    const target = extractSwitchTarget(speech, agents);
+
+    if (target && target.id !== state.agentId) {
+      state.agentId   = target.id;
+      state.agentName = target.name;
+      state.history   = [];
+      const user = users.get(state.from);
+      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
+      await playOrSay(twiml, `Switching to ${target.name}! What's on your mind?`);
+    } else {
+      const token = await getTokenForCall(state);
+      const reply = await askAgent(state.agentId, state.history, speech, token);
+      twiml.play(storeAudio(await synthesizeVoice(reply)));
+    }
+  } catch (err) {
+    console.error('[voice] continue error:', err.message);
+    twiml.say({ voice: 'alice' }, 'Sorry, something went wrong. Try again.');
+  }
+
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
+    action: `/voice/continue/${callSid}`, method: 'POST' });
+  twiml.say({ voice: 'alice' }, 'Talk to you later!');
+  twiml.hangup();
+  res.type('text/xml').send(twiml.toString());
+});
+
+// ── Start ──────────────────────────────────────────────────────────────────────
+app.listen(port, () => {
+  console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
+  console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
+  if (!twilioClient) console.warn('[bridge] Twilio not configured -- set env vars');
+});
