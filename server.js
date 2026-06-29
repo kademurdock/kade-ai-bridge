@@ -279,6 +279,13 @@ async function buildReRecordTwiml(message, voice = null) {
 // ── Health ─────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, users: users.size }));
 
+// Static opt-in / SMS consent disclosure image — used for Twilio toll-free verification.
+app.get('/optin.png', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'optin.png'), (err) => {
+    if (err) { res.status(404).send('not found'); }
+  });
+});
+
 // ── Serve temp audio ──────────────────────────────────────────────────────────
 app.get('/media/:id', (req, res) => {
   const e = tempMedia.get(req.params.id);
