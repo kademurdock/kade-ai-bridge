@@ -43,9 +43,12 @@ const PUBLIC_URL    = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
 
-const twilioClient = (TWILIO_SID && TWILIO_TOKEN)
-  ? twilio(TWILIO_SID, TWILIO_TOKEN)
-  : null;
+function getTwilioClient() {
+  if (!TWILIO_SID || !TWILIO_TOKEN || TWILIO_SID === 'FILL_IN') return null;
+  try { return twilio(TWILIO_SID, TWILIO_TOKEN); }
+  catch (e) { console.warn('[bridge] Twilio init failed:', e.message); return null; }
+}
+const twilioClient = getTwilioClient();
 
 // ── Stores ────────────────────────────────────────────────────────────────────
 const USERS_FILE = path.join(
