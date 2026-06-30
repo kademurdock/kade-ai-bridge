@@ -190,6 +190,7 @@ class CallSession {
     this.partialBuf     = '';         // accumulate partial transcripts
     this.finalBuf       = '';         // confirmed final words this turn
     this.busy           = false;      // prevent overlapping turns
+    this._pending       = null;       // utterance queued during LLM generation
   }
 
   twSend(obj) {
@@ -304,7 +305,15 @@ async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
   if (session.busy) {
-    console.log(`[voice-stream] busy, dropping utterance: "${text}"`);
+    if (!session.isSpeaking && !session.bargedIn) {
+      // Still generating, not speaking yet — abort LLM and queue this utterance
+      console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
+      session.llmAbort = true;
+      session.bargedIn = true;
+      session._pending = text;
+    } else {
+      console.log(`[voice-stream] busy+speaking, dropping: "${text.slice(0,50)}"`);
+    }
     return;
   }
   console.log(`[voice-stream] utterance: "${text.slice(0, 80)}"`);
@@ -340,6 +349,11 @@ async function handleUtterance(session, text) {
     try { await speak(session, 'Sorry, something went wrong. Go ahead.', session.voice); } catch {}
   } finally {
     session.busy = false;
+    if (session._pending) {
+      const next = session._pending;
+      session._pending = null;
+      handleUtterance(session, next);
+    }
   }
 }
 
