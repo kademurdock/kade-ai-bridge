@@ -218,7 +218,7 @@ async function askAgent(agentId, history, userMessage) {
     { agentId, messages: history },
     {
       headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
-      timeout: 60000,
+      timeout: 150000,
     }
   );
   const reply = r.data.text;
@@ -668,7 +668,7 @@ app.post('/voice/heard/:callSid', async (req, res) => {
   const state   = voiceStates.get(callSid);
 
   twiml.play({ digits: '0' }); // short beep: received signal without verbal ack
-  twiml.pause({ length: 90 });
+  twiml.pause({ length: 150 });
   res.type('text/xml').send(twiml.toString());
 
   if (!state || !speech || !twilioClient) return;
@@ -716,3 +716,4 @@ app.listen(port, () => {
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
   if (!twilioClient) console.warn('[bridge] Twilio not configured -- set env vars');
 });
+
