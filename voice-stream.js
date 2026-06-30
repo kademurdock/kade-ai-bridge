@@ -10,19 +10,11 @@
  * Key features:
  *   - First sentence spoken within ~2-3s of caller finishing (vs 20-30s before)
  *   - Barge-in: caller interrupts mid-sentence → Kiana stops immediately
+ *   - US ringback tone plays during call setup (no more dead air before greeting)
+ *   - Once in a while, if reply runs long, Kiana naturally checks in ("am I rambling?")
  *   - Voice/agent switching still works via transcript detection
  *   - All Inworld voices preserved (nothing moves to ElevenLabs/Google)
  *   - Existing /voice Gather path untouched — still works as instant fallback
- *
- * Requires env vars:
- *   DEEPGRAM_API_KEY  — free tier: sign up at deepgram.com (45,000 min/month free)
- *   LIBRECHAT_PROXY_URL / LIBRECHAT_PROXY_SECRET  — already set (same as /librechat/ask)
- *   TTS_PROXY_URL     — Inworld TTS proxy URL (already used by main server.js)
- *   DEFAULT_PHONE_VOICE / PHONE_TTS_MODEL — already used by main server.js
- *
- * Called from server.js:
- *   const { attachMediaStreams } = require('./voice-stream');
- *   attachMediaStreams(httpServer, users, config);
  */
 
 const WebSocket = require('ws');
@@ -31,7 +23,7 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-// ── Helpers shared with server.js ─────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function fixPronunciation(t) {
   return t.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
 }
@@ -39,10 +31,11 @@ function fixPronunciation(t) {
 const PHONE_SUFFIX =
   '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
   'Talk the way you naturally would: warm, engaged, conversational. ' +
-  'Do NOT monologue — two or three sentences is usually right, go longer only if you are ' +
-  'genuinely mid-story and it would feel weird to stop. ' +
-  'If you have been going for a while, throw in a natural check-in: ' +
-  '\"am I rambling?\" or \"jump in whenever\" — whatever fits your voice. ' +
+  'Two or three sentences is usually right; go longer only if you are genuinely ' +
+  'mid-story and stopping would feel weird. ' +
+  'Once in a while, if a reply is running long, naturally invite them to jump in — ' +
+  'something like "am I rambling?" or "jump in whenever." ' +
+  'Don\'t do this every turn — only when it genuinely fits. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
 const PHONE_VOICES = [
@@ -86,8 +79,6 @@ function extractSwitchTarget(text, agents) {
 }
 
 // ── SentenceStreamer ──────────────────────────────────────────────────────────
-// Buffers LLM token stream and emits complete, speakable sentences the instant
-// they're safely done (peek at the char after the terminator to decide).
 class SentenceStreamer extends EventEmitter {
   constructor() {
     super();
@@ -98,10 +89,7 @@ class SentenceStreamer extends EventEmitter {
     ]);
   }
 
-  push(token) {
-    this._buf += token;
-    this._flush(false);
-  }
+  push(token) { this._buf += token; this._flush(false); }
 
   end() {
     this._flush(true);
@@ -121,15 +109,10 @@ class SentenceStreamer extends EventEmitter {
       const abs = pos + rel;
       const term = this._buf[abs];
       const next = this._buf[abs + 1];
-
       if (!next && !isFinal) break;
-
-      // Number: "3.50", "2.5s"
       if (term === '.' && next && /\d/.test(next)) { pos = abs + 1; continue; }
-      // Abbreviation
       const pre = this._buf.slice(0, abs).split(/\s+/).pop();
       if (term === '.' && this._isAbbrev(pre)) { pos = abs + 1; continue; }
-
       if (!next || /[\s.!?]/.test(next)) {
         let end = abs;
         while (end < this._buf.length && /[.!?]/.test(this._buf[end])) end++;
@@ -137,12 +120,7 @@ class SentenceStreamer extends EventEmitter {
         if (sentence.length > 4) this.emit('sentence', sentence);
         this._buf = this._buf.slice(end).trimStart();
         pos = 0;
-        // Safety flush if buffer grows huge
-        if (this._buf.length > 1400) {
-          this.emit('sentence', this._buf.trim());
-          this._buf = '';
-          break;
-        }
+        if (this._buf.length > 1400) { this.emit('sentence', this._buf.trim()); this._buf = ''; break; }
         continue;
       }
       pos = abs + 1;
@@ -150,10 +128,38 @@ class SentenceStreamer extends EventEmitter {
   }
 }
 
-// ── μ-law decode (for Deepgram echo-check, not needed for output) ─────────────
-// (Deepgram accepts raw μ-law bytes directly, no decode needed.)
+// ── μ-law helpers + US ringback tone ─────────────────────────────────────────
+// G.711 μ-law: encodes 16-bit signed PCM to 8-bit byte. Silence = 0xFF.
+function encodeUlaw(pcm) {
+  const CLIP = 32635;
+  const BIAS = 132;
+  const sign = pcm >= 0 ? 0 : 0x80;
+  if (sign) pcm = -pcm;
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+  let exp = 7;
+  for (let m = 0x4000; (pcm & m) === 0 && exp > 0; exp--, m >>= 1);
+  const mantissa = (pcm >> (exp + 3)) & 0x0F;
+  return (~(sign | (exp << 4) | mantissa)) & 0xFF;
+}
 
-// ── HTTP(S) helper — simple streaming fetch without axios ────────────────────
+// Dual-tone 440+480 Hz (US ringback standard) as μ-law 8kHz buffer.
+function makeToneBuf(durationMs, freq1, freq2, amplitude) {
+  const n = Math.floor(8000 * durationMs / 1000);
+  const buf = Buffer.alloc(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / 8000;
+    const s = amplitude * (Math.sin(2 * Math.PI * freq1 * t) + Math.sin(2 * Math.PI * freq2 * t)) / 2;
+    buf[i] = encodeUlaw(Math.round(s * 32767));
+  }
+  return buf;
+}
+
+// Pre-generate once at module load: 1s ring ON, 500ms silence OFF.
+const RING_ON  = makeToneBuf(1000, 440, 480, 0.45);
+const RING_OFF = Buffer.alloc(4000, 0xFF); // 500ms μ-law silence
+
+// ── HTTP(S) helper ────────────────────────────────────────────────────────────
 function streamPost(urlStr, headers, body) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
@@ -185,29 +191,24 @@ class CallSession {
     this.voice       = user?.voice     || cfg.defaultVoice;
     this.history     = [];
     this.isSpeaking     = false;
-    this.speakStartedAt = 0;          // epoch ms when we started speaking (echo gate)
-    this.lastSpokAt     = 0;          // epoch ms when Kiana STOPPED speaking (echo drain gate)
-    this.bargedIn       = false;      // true once we barge-in this turn (prevent double)
-    this.llmAbort       = null;       // set to true to cancel in-flight LLM
-    this.dgWs           = null;       // Deepgram WebSocket
-    this.partialBuf     = '';         // accumulate partial transcripts
-    this.finalBuf       = '';         // confirmed final words this turn
-    this.busy           = false;      // prevent overlapping turns
-    this._pending       = null;       // utterance queued during LLM generation
+    this.speakStartedAt = 0;
+    this.lastSpokAt     = 0;
+    this.bargedIn       = false;
+    this.llmAbort       = null;
+    this.dgWs           = null;
+    this.partialBuf     = '';
+    this.finalBuf       = '';
+    this.busy           = false;
+    this._pending       = null;
+    this._ringbackActive = false;  // true while pre-greeting ringback is playing
   }
 
   twSend(obj) {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(obj));
-    }
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
   }
 
   sendMedia(mulawBuf) {
-    this.twSend({
-      event: 'media',
-      streamSid: this.streamSid,
-      media: { payload: mulawBuf.toString('base64') },
-    });
+    this.twSend({ event: 'media', streamSid: this.streamSid, media: { payload: mulawBuf.toString('base64') } });
   }
 
   sendClear() {
@@ -220,28 +221,19 @@ function bargeIn(session) {
   if (!session.isSpeaking) return;
   console.log(`[voice-stream] BARGE-IN ${session.streamSid}`);
   session.sendClear();
-  session.llmAbort = true;      // signal in-flight LLM loop to stop
+  session.llmAbort = true;
   session.isSpeaking = false;
 }
 
-// ── Deepgram STT connection ────────────────────────────────────────────────────
+// ── Deepgram STT ──────────────────────────────────────────────────────────────
 function openDeepgram(session) {
   const key = process.env.DEEPGRAM_API_KEY;
-  if (!key) {
-    console.warn('[voice-stream] DEEPGRAM_API_KEY not set — no STT');
-    return null;
-  }
+  if (!key) { console.warn('[voice-stream] DEEPGRAM_API_KEY not set — no STT'); return null; }
 
   const params = new URLSearchParams({
-    encoding: 'mulaw',
-    sample_rate: '8000',
-    channels: '1',
-    model: 'nova-2-phonecall',
-    smart_format: 'true',
-    interim_results: 'true',
-    utterance_end_ms: '1000',
-    endpointing: '350',
-    vad_events: 'true',
+    encoding: 'mulaw', sample_rate: '8000', channels: '1',
+    model: 'nova-2-phonecall', smart_format: 'true', interim_results: 'true',
+    utterance_end_ms: '1000', endpointing: '350', vad_events: 'true',
   });
 
   const dg = new WebSocket(
@@ -255,40 +247,27 @@ function openDeepgram(session) {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // SpeechStarted — do NOT barge-in here.
-    // Deepgram fires SpeechStarted on acoustic echo of our own TTS audio leaking
-    // back through the phone mic.  We wait for a real transcript instead.
-    if (msg.type === 'SpeechStarted') return;
+    if (msg.type === 'SpeechStarted') return; // echo-safe: wait for real transcript
 
-    // Results: collect transcript + echo-safe barge-in
     if (msg.type === 'Results') {
       const alt  = msg.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (!text) return;
-
-      // Barge-in: user produced real text while we're speaking.
-      // Guard: ignore the first 800ms of echo (Kiana's own voice looping back).
-      if (session.isSpeaking && !session.bargedIn &&
-          Date.now() - session.speakStartedAt > 800) {
+      if (session.isSpeaking && !session.bargedIn && Date.now() - session.speakStartedAt > 800) {
         session.bargedIn = true;
         bargeIn(session);
       }
-
-      if (msg.is_final) {
-        session.finalBuf += (session.finalBuf ? ' ' : '') + text;
-      }
+      if (msg.is_final) session.finalBuf += (session.finalBuf ? ' ' : '') + text;
       if (msg.speech_final && session.finalBuf) {
         const utterance = session.finalBuf.trim();
         session.finalBuf = '';
         session.partialBuf = '';
-        // Ignore if Kiana is speaking (echo) or within 500ms of stopping (echo drain)
         const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 500);
         if (!echoWindow) handleUtterance(session, utterance);
       }
       return;
     }
 
-    // UtteranceEnd fallback
     if (msg.type === 'UtteranceEnd' && session.finalBuf) {
       const utterance = session.finalBuf.trim();
       session.finalBuf = '';
@@ -299,17 +278,15 @@ function openDeepgram(session) {
 
   dg.on('error', (e) => console.error('[voice-stream] Deepgram error:', e.message));
   dg.on('close', () => console.log(`[voice-stream] Deepgram closed ${session.streamSid}`));
-
   return dg;
 }
 
-// ── Handle a completed utterance ──────────────────────────────────────────────
+// ── Handle utterance ──────────────────────────────────────────────────────────
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
   if (session.busy) {
     if (!session.isSpeaking && !session.bargedIn) {
-      // Still generating, not speaking yet — abort LLM and queue this utterance
       console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
       session.llmAbort = true;
       session.bargedIn = true;
@@ -322,7 +299,6 @@ async function handleUtterance(session, text) {
   console.log(`[voice-stream] utterance: "${text.slice(0, 80)}"`);
   session.busy = true;
   try {
-    // Voice switch?
     const newVoice = extractVoiceSwitch(text);
     if (newVoice) {
       session.voice = newVoice;
@@ -331,8 +307,6 @@ async function handleUtterance(session, text) {
       await speak(session, `Switching to ${newVoice}'s voice! Go ahead.`, newVoice);
       return;
     }
-
-    // Agent switch?
     const agents = await session.cfg.getAgents();
     const target = extractSwitchTarget(text, agents);
     if (target && target.id !== session.agentId) {
@@ -344,8 +318,6 @@ async function handleUtterance(session, text) {
       await speak(session, `Switching to ${target.name}! What's on your mind?`, session.voice);
       return;
     }
-
-    // Normal turn — stream the reply
     await streamReply(session, text);
   } catch (err) {
     console.error('[voice-stream] utterance error:', err.message);
@@ -360,9 +332,8 @@ async function handleUtterance(session, text) {
   }
 }
 
-// ── Stream LLM reply sentence-by-sentence ─────────────────────────────────────
+// ── Stream LLM reply ──────────────────────────────────────────────────────────
 async function streamReply(session, userText) {
-  // Build message list
   session.history.push({ role: 'user', content: userText });
   while (session.history.length > 60) session.history.shift();
   const outgoing = session.history.map((m, i) =>
@@ -374,20 +345,14 @@ async function streamReply(session, userText) {
   session.llmAbort = false;
   const streamer = new SentenceStreamer();
   let fullReply = '';
-  // Pipeline: sentences complete asynchronously; we synthesize + play each in order.
-  // Use an ordered promise chain so audio is always sequential.
   let playChain = Promise.resolve();
 
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
-    // Fire synthesis immediately (concurrent with playback of previous sentence).
-    // .catch(() => null) ensures the promise ALWAYS resolves so it can never
-    // cause an unhandled rejection if llmAbort causes us to return before awaiting it.
     const synthPromise = synthesize(sentence, session.voice).catch((e) => {
       console.error('[voice-stream] synthesis prefetch error:', e.message);
       return null;
     });
-    // Chain playback in order — await the already-started promise
     playChain = playChain.then(async () => {
       if (session.llmAbort) return;
       const mulawBuf = await synthPromise;
@@ -395,7 +360,6 @@ async function streamReply(session, userText) {
     });
   });
 
-  // Open SSE stream to the TTS proxy
   const res = await streamPost(
     `${session.cfg.proxyUrl}/librechat/ask-stream`,
     {
@@ -420,16 +384,12 @@ async function streamReply(session, userText) {
         try {
           const d = JSON.parse(raw);
           if (d.error) { reject(new Error(d.error)); return; }
-          if (d.token) {
-            fullReply += d.token;
-            if (!session.llmAbort) streamer.push(d.token);
-          }
+          if (d.token) { fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
         } catch {}
       }
     });
     res.on('end', resolve);
     res.on('error', reject);
-    // If barge-in happens mid-stream, destroy the response to stop network traffic
     const checkAbort = setInterval(() => {
       if (session.llmAbort) { clearInterval(checkAbort); res.destroy(); resolve(); }
     }, 100);
@@ -437,33 +397,21 @@ async function streamReply(session, userText) {
   });
 
   if (!session.llmAbort) streamer.end();
-
-  // Wait for any in-flight sentence to finish playing
   await playChain;
-
-  // Save reply to history even if barge-in cut it short — partial context is
-  // better than a hole. Without this, barge-ins cause amnesia on the next turn.
-  if (fullReply) {
-    session.history.push({ role: 'assistant', content: fullReply });
-  }
+  if (fullReply) session.history.push({ role: 'assistant', content: fullReply });
   session.llmAbort = false;
 }
 
-// ── Synthesize a sentence to μ-law 8kHz raw bytes ────────────────────────────
+// ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
 async function synthesize(text, voice) {
-  const cfg = global._vsConfig; // set in attachMediaStreams
+  const cfg = global._vsConfig;
   const input = fixPronunciation(text).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
-
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech?telephony=1`,
-    {
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0',
-    },
+    { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
     { model: cfg.ttsModel, input, voice: useVoice }
   );
-
   return new Promise((resolve, reject) => {
     const chunks = [];
     res.on('data', c => chunks.push(c));
@@ -472,62 +420,72 @@ async function synthesize(text, voice) {
   });
 }
 
-// ── Speak a one-shot message (not streamed) ───────────────────────────────────
+// ── Speak (one-shot, not streamed) ────────────────────────────────────────────
 async function speak(session, text, voice) {
   try {
     const buf = await synthesize(text, voice || session.voice);
     await playBuffer(session, buf);
-  } catch (e) {
-    console.error('[voice-stream] speak error:', e.message);
-  }
+  } catch (e) { console.error('[voice-stream] speak error:', e.message); }
 }
 
-// ── Play μ-law bytes as 20ms Twilio media frames ─────────────────────────────
-const FRAME_BYTES = 160; // 8kHz × 20ms × 1 byte/sample = 160 bytes
+// ── Play μ-law as 20ms frames ─────────────────────────────────────────────────
+const FRAME_BYTES = 160;
 
 async function playBuffer(session, mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
-  // Clear any accumulated echo transcripts from before this playback slot
   session.finalBuf       = '';
   session.partialBuf     = '';
   session.isSpeaking     = true;
   session.speakStartedAt = Date.now();
   session.bargedIn       = false;
 
-  // Pace: send one 20ms frame every 20ms.
-  // We target wall-clock time rather than just sleeping 20ms after each frame
-  // so timer jitter doesn't accumulate over long utterances.
   const start = Date.now();
   let frameIdx = 0;
   const totalFrames = Math.ceil(mulawBuf.length / FRAME_BYTES);
-
   while (frameIdx < totalFrames) {
     if (session.llmAbort || !session.isSpeaking || session.ws.readyState !== WebSocket.OPEN) break;
     const offset = frameIdx * FRAME_BYTES;
     const slice  = mulawBuf.slice(offset, offset + FRAME_BYTES);
-    // Pad last frame
     const frame  = slice.length === FRAME_BYTES
       ? slice
       : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length)]);
     session.sendMedia(frame);
     frameIdx++;
-    // Sleep until the next frame's wall-clock deadline
-    const nextDeadline = start + frameIdx * 20;
-    const wait = nextDeadline - Date.now();
+    const wait = (start + frameIdx * 20) - Date.now();
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
   }
 
   if (!session.llmAbort) {
     session.isSpeaking = false;
-    session.lastSpokAt = Date.now(); // echo drain gate starts now
+    session.lastSpokAt = Date.now();
   }
 }
 
-// ── Attach WebSocket Media Streams handler to an HTTP server ──────────────────
+// ── Ringback loop ─────────────────────────────────────────────────────────────
+// Plays US ring tone (440+480 Hz, 1s on / 500ms off) until _ringbackActive=false.
+// Does NOT touch session.isSpeaking — totally independent of the barge-in system.
+async function playRingback(session) {
+  async function sendBuf(buf) {
+    for (let i = 0; i < buf.length; i += FRAME_BYTES) {
+      if (!session._ringbackActive || session.ws.readyState !== WebSocket.OPEN) return false;
+      const slice = buf.slice(i, i + FRAME_BYTES);
+      const frame = slice.length === FRAME_BYTES
+        ? slice
+        : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length, 0xFF)]);
+      session.sendMedia(frame);
+      await new Promise(r => setTimeout(r, 20));
+    }
+    return true;
+  }
+  while (session._ringbackActive && session.ws.readyState === WebSocket.OPEN) {
+    if (!await sendBuf(RING_ON))  break;
+    if (!await sendBuf(RING_OFF)) break;
+  }
+}
+
+// ── Attach to HTTP server ─────────────────────────────────────────────────────
 function attachMediaStreams(server, users, cfg) {
-  // cfg: { proxyUrl, proxySecret, ttsProxyUrl, ttsModel, defaultVoice,
-  //        defaultAgent, defaultAgentName, getAgents, saveUsers }
   global._vsConfig = { ...cfg, users };
 
   const wss = new WebSocket.Server({ server, path: '/ws/media' });
@@ -552,10 +510,8 @@ function attachMediaStreams(server, users, cfg) {
           session = new CallSession(streamSid, callSid, from, user, ws, global._vsConfig);
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}`);
 
-          // Open Deepgram connection
           session.dgWs = openDeepgram(session);
 
-          // Play greeting — pick a fresh one each call so it never sounds canned
           const name      = user?.name || 'there';
           const agentName = session.agentName;
           const knownGreetings = [
@@ -574,10 +530,31 @@ function attachMediaStreams(server, users, cfg) {
             `Oh hey! You can register at kademurdock dot com slash signup so I know who you are. But go ahead, I'm Kiana.`,
             `Hey! Didn't recognize the number — I'm Kiana. What can I do for you?`,
           ];
-          const pool    = user ? knownGreetings : unknownGreetings;
+          const pool     = user ? knownGreetings : unknownGreetings;
           const greeting = pool[Math.floor(Math.random() * pool.length)];
-          // Fire and forget — don't await so we don't block the WS message loop
-          speak(session, greeting, session.voice).catch(console.error);
+
+          // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
+          // The ~8-12s between call connect and first Kiana word used to be
+          // total silence. Now: play US ring tone (440+480 Hz) immediately,
+          // then the instant greeting audio is ready, clear it and speak.
+          session._ringbackActive = true;
+          playRingback(session).catch(console.error);
+
+          synthesize(greeting, session.voice)
+            .then(async (greetingBuf) => {
+              session._ringbackActive = false; // stop ring loop
+              session.sendClear();             // flush queued ring frames from Twilio buffer
+              await new Promise(r => setTimeout(r, 120)); // brief gap after clear
+              if (session.ws.readyState === WebSocket.OPEN) {
+                await playBuffer(session, greetingBuf);
+              }
+            })
+            .catch((err) => {
+              session._ringbackActive = false;
+              console.error('[voice-stream] greeting synthesis error:', err.message);
+              speak(session, 'Hey, give me just a second.', session.voice).catch(() => {});
+            });
+
           break;
         }
 
@@ -593,6 +570,7 @@ function attachMediaStreams(server, users, cfg) {
         case 'stop': {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           if (session) {
+            session._ringbackActive = false;
             session.llmAbort = true;
             session.isSpeaking = false;
             if (session.dgWs) { try { session.dgWs.close(); } catch {} }
@@ -605,6 +583,7 @@ function attachMediaStreams(server, users, cfg) {
 
     ws.on('close', () => {
       if (session) {
+        session._ringbackActive = false;
         session.llmAbort = true;
         session.isSpeaking = false;
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
