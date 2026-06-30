@@ -214,7 +214,7 @@ async function askAgent(agentId, history, userMessage, token) {
   while (history.length > 14) history.shift();
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/ask/agents`,
-    { agentId, messages: history, conversationId: null, parentMessageId: null },
+    { agentId, messages: history, conversationId: null, parentMessageId: null, reasoning_effort: 'none' },
     {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' },
       responseType: 'stream',
@@ -245,7 +245,7 @@ async function synthesizeVoice(text, voice = null) {
   const useVoice = voice || DEFAULT_PHONE_VOICE;
   const r = await axios.post(
     `${TTS_PROXY_URL}/v1/audio/speech`,
-    { model: 'tts-1', input, voice: useVoice },
+    { model: process.env.PHONE_TTS_MODEL || 'tts-1-mini', input, voice: useVoice },
     { responseType: 'arraybuffer', timeout: 30000 }
   );
   return Buffer.from(r.data);
