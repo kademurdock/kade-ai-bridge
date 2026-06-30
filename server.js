@@ -214,7 +214,7 @@ async function askAgent(agentId, history, userMessage, token) {
   while (history.length > 14) history.shift();
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/ask/agents`,
-    { agentId, messages: history, conversationId: null, parentMessageId: null, reasoning_effort: 'none' },
+    { agentId, messages: history, conversationId: null, parentMessageId: null },
     {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' },
       responseType: 'stream',
