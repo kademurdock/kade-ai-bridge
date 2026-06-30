@@ -235,7 +235,7 @@ function openDeepgram(session) {
     model: 'nova-2-phonecall',
     smart_format: 'true',
     interim_results: 'true',
-    utterance_end_ms: '800',
+    utterance_end_ms: '1000',
     endpointing: '350',
     vad_events: 'true',
   });
