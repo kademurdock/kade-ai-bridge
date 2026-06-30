@@ -680,7 +680,7 @@ app.post('/voice/heard/:callSid', async (req, res) => {
   const speech  = (req.body.SpeechResult || '').trim();
   const state   = voiceStates.get(callSid);
 
-  twiml.say({ voice: 'alice' }, 'Got it, one moment.');
+  twiml.play({ digits: '0' }); // short beep: received signal without verbal ack
   twiml.pause({ length: 90 });
   res.type('text/xml').send(twiml.toString());
 
