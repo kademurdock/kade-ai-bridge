@@ -347,7 +347,7 @@ async function handleUtterance(session, text) {
 async function streamReply(session, userText) {
   // Build message list
   session.history.push({ role: 'user', content: userText });
-  while (session.history.length > 14) session.history.shift();
+  while (session.history.length > 60) session.history.shift();
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
       ? { ...m, content: m.content + PHONE_SUFFIX }
