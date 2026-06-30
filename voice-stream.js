@@ -37,10 +37,10 @@ function fixPronunciation(t) {
 }
 
 const PHONE_SUFFIX =
-  '\n\n[PHONE CALL — talk like a real, engaged phone conversation: usually ' +
-  'four to seven sentences, go longer when you are telling a story or really into ' +
-  'the topic. Be warm, expressive, and full — do not cut yourself short. Plain ' +
-  'spoken words only, no lists, no markdown.]';
+  '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
+  'Talk the way you would on a real call: natural, warm, conversational. ' +
+  'Long or short, whatever fits — if you are in the middle of something good, keep going. ' +
+  'No lists, no markdown, no formatting. Just talk.]';
 
 const PHONE_VOICES = [
   'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
@@ -181,12 +181,14 @@ class CallSession {
     this.agentName   = user?.agentName || cfg.defaultAgentName;
     this.voice       = user?.voice     || cfg.defaultVoice;
     this.history     = [];
-    this.isSpeaking  = false;
-    this.llmAbort    = null;          // set to true to cancel in-flight LLM
-    this.dgWs        = null;          // Deepgram WebSocket
-    this.partialBuf  = '';            // accumulate partial transcripts
-    this.finalBuf    = '';            // confirmed final words this turn
-    this.busy        = false;         // prevent overlapping turns
+    this.isSpeaking     = false;
+    this.speakStartedAt = 0;          // epoch ms when we started speaking (echo gate)
+    this.bargedIn       = false;      // true once we barge-in this turn (prevent double)
+    this.llmAbort       = null;       // set to true to cancel in-flight LLM
+    this.dgWs           = null;       // Deepgram WebSocket
+    this.partialBuf     = '';         // accumulate partial transcripts
+    this.finalBuf       = '';         // confirmed final words this turn
+    this.busy           = false;      // prevent overlapping turns
   }
 
   twSend(obj) {
@@ -248,17 +250,25 @@ function openDeepgram(session) {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // SpeechStarted → barge-in if currently speaking
-    if (msg.type === 'SpeechStarted') {
-      if (session.isSpeaking) bargeIn(session);
-      return;
-    }
+    // SpeechStarted — do NOT barge-in here.
+    // Deepgram fires SpeechStarted on acoustic echo of our own TTS audio leaking
+    // back through the phone mic.  We wait for a real transcript instead.
+    if (msg.type === 'SpeechStarted') return;
 
-    // Results: collect transcript
+    // Results: collect transcript + echo-safe barge-in
     if (msg.type === 'Results') {
-      const alt = msg.channel?.alternatives?.[0];
+      const alt  = msg.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (!text) return;
+
+      // Barge-in: user produced real text while we're speaking.
+      // Guard: ignore the first 800ms of echo (Kiana's own voice looping back).
+      if (session.isSpeaking && !session.bargedIn &&
+          Date.now() - session.speakStartedAt > 800) {
+        session.bargedIn = true;
+        bargeIn(session);
+      }
+
       if (msg.is_final) {
         session.finalBuf += (session.finalBuf ? ' ' : '') + text;
       }
@@ -452,7 +462,9 @@ const FRAME_BYTES = 160; // 8kHz × 20ms × 1 byte/sample = 160 bytes
 async function playBuffer(session, mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
-  session.isSpeaking = true;
+  session.isSpeaking     = true;
+  session.speakStartedAt = Date.now();
+  session.bargedIn       = false;
 
   // Pace: send one 20ms frame every 20ms.
   // We target wall-clock time rather than just sleeping 20ms after each frame
@@ -511,14 +523,27 @@ function attachMediaStreams(server, users, cfg) {
           // Open Deepgram connection
           session.dgWs = openDeepgram(session);
 
-          // Play greeting
+          // Play greeting — pick a fresh one each call so it never sounds canned
           const name      = user?.name || 'there';
           const agentName = session.agentName;
-          const greeting  = user
-            ? `Hey ${name}! You're with ${agentName}. Go ahead — I'm listening. ` +
-              `Say "switch to" a name anytime to change agents.`
-            : `Hey! I don't know you yet — you can register at kademurdock dot com slash signup. ` +
-              `But go ahead and talk — I'm Kiana, and I'm listening.`;
+          const knownGreetings = [
+            `Hey ${name}! It's ${agentName}. What's going on?`,
+            `${name}! Good to hear from you. What's up?`,
+            `Hey, ${name}! ${agentName} here. Talk to me.`,
+            `Oh it's ${name}! ${agentName} is in. What do you need?`,
+            `${name}! What's the move? I'm listening.`,
+            `Hey ${name}, ${agentName} picked up. Go ahead.`,
+            `It's ${agentName} — hey ${name}! What's good?`,
+            `${name}! Caught me at a good time. What's on your mind?`,
+          ];
+          const unknownGreetings = [
+            `Hey! I don't think we've met — I'm Kiana. Go ahead and talk, I'm listening.`,
+            `Hey there! New number, not sure who this is — I'm Kiana. What's up?`,
+            `Oh hey! You can register at kademurdock dot com slash signup so I know who you are. But go ahead, I'm Kiana.`,
+            `Hey! Didn't recognize the number — I'm Kiana. What can I do for you?`,
+          ];
+          const pool    = user ? knownGreetings : unknownGreetings;
+          const greeting = pool[Math.floor(Math.random() * pool.length)];
           // Fire and forget — don't await so we don't block the WS message loop
           speak(session, greeting, session.voice).catch(console.error);
           break;

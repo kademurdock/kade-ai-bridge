@@ -216,10 +216,10 @@ function extractSwitchTarget(text, agents) {
 // to ~1-2 sentences and latency to ~3-8s. Kept out of stored history so it never
 // accumulates.
 const PHONE_SUFFIX =
-  '\n\n[PHONE CALL — talk like a real, engaged phone conversation: usually about ' +
-  'four to seven sentences, and go longer when you are telling a story or really into ' +
-  'the topic. Be warm, expressive, and full — do not cut yourself short. Plain spoken ' +
-  'words only, no lists, no markdown.]';
+  '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
+  'Talk the way you would on a real call: natural, warm, conversational. ' +
+  'Long or short, whatever fits — if you are in the middle of something good, keep going. ' +
+  'No lists, no markdown, no formatting. Just talk.]';
 
 async function askAgent(agentId, history, userMessage) {
   history.push({ role: 'user', content: userMessage });
