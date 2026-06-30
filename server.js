@@ -214,8 +214,9 @@ function extractSwitchTarget(text, agents) {
 // to ~1-2 sentences and latency to ~3-8s. Kept out of stored history so it never
 // accumulates.
 const PHONE_SUFFIX =
-  '\n\n[PHONE CALL — you MUST answer in 1, maximum 2, short spoken sentences. ' +
-  'Hard limit. No exceptions. Conversational, like talking on the phone.]';
+  '\n\n[PHONE CALL — answer in two to four warm, conversational sentences, ' +
+  'like a real phone call. Expressive and natural, but do not ramble into a long ' +
+  'monologue. Plain spoken words only, no lists, no markdown.]';
 
 async function askAgent(agentId, history, userMessage) {
   history.push({ role: 'user', content: userMessage });
