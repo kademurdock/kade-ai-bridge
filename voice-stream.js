@@ -22,6 +22,8 @@ const EventEmitter = require('events');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+const fs = require('fs');
+const path = require('path');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fixPronunciation(t) {
@@ -288,6 +290,7 @@ async function handleUtterance(session, text) {
   if (session.busy) {
     if (!session.isSpeaking && !session.bargedIn) {
       console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
+      session.sendClear(); // flush any in-flight thinking-filler audio
       session.llmAbort = true;
       session.bargedIn = true;
       session._pending = text;
@@ -347,6 +350,14 @@ async function streamReply(session, userText) {
   let fullReply = '';
   let playChain = Promise.resolve();
 
+  // Thinking-gap filler: starts its own delay timer now; only actually speaks/
+  // plays anything if the real reply hasn't produced a sentence within
+  // THINK_DELAY_MS. ctx is turn-scoped (not session-scoped) so it can't leak
+  // into the next utterance.
+  const fillerCtx = { firstAudioReady: false, fillerStarted: false };
+  maybeStartThinkingFiller(session, fillerCtx).catch((e) =>
+    console.error('[voice-stream] thinking-filler error:', e.message));
+
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
     const synthPromise = synthesize(sentence, session.voice).catch((e) => {
@@ -356,7 +367,18 @@ async function streamReply(session, userText) {
     playChain = playChain.then(async () => {
       if (session.llmAbort) return;
       const mulawBuf = await synthPromise;
-      if (mulawBuf && !session.llmAbort) await playBuffer(session, mulawBuf);
+      if (mulawBuf && !session.llmAbort) {
+        if (!fillerCtx.firstAudioReady) {
+          fillerCtx.firstAudioReady = true;
+          // Only worth a clear+pause if the filler actually played something —
+          // keeps the common fast-reply path exactly as quick as before.
+          if (fillerCtx.fillerStarted) {
+            session.sendClear();
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+        await playBuffer(session, mulawBuf);
+      }
     });
   });
 
@@ -398,6 +420,7 @@ async function streamReply(session, userText) {
 
   if (!session.llmAbort) streamer.end();
   await playChain;
+  fillerCtx.firstAudioReady = true; // safety: stop the filler loop even on an empty/aborted reply
   if (fullReply) session.history.push({ role: 'assistant', content: fullReply });
   session.llmAbort = false;
 }
@@ -462,6 +485,195 @@ async function playBuffer(session, mulawBuf) {
   }
 }
 
+// ── Thinking-gap filler (dead-air fix during LLM generation) ─────────────────
+// If the LLM hasn't produced a speakable first sentence within THINK_DELAY_MS,
+// this plays one short, agent-voice-neutral transition phrase (synthesized
+// live through the same TTS pipeline as the real reply -- not a static
+// recording, and cached per-voice after first use so it doesn't add repeat
+// latency/cost) followed by a soft, looping typing-sound effect until the
+// real reply is ready to play. Cut instantly via the same `clear` mechanism
+// barge-in already uses, so there's never an audio collision with the real
+// reply or with the caller talking over it.
+const THINK_DELAY_MS = 3000;
+
+const FILLER_PHRASES = [
+  'Mm, hold on a sec.',
+  'Let me think on that.',
+  'One sec.',
+  'Give me just a moment.',
+  "Hmm, let's see.",
+  'Okay, thinking.',
+  'Just a moment here.',
+  'Let me get there.',
+  'Bear with me a sec.',
+  'Mm-hm, one second.',
+  "Let's see here.",
+  'Okay, hang on.',
+  'Give me a beat.',
+  'Just a sec, working it out.',
+  'Let me put that together.',
+  'Hang tight a sec.',
+  'Okay, give me a moment.',
+  'Mm, let me think.',
+];
+
+const ORIENTATION_LINES = [
+  "Quick heads up before we get going -- I turn your voice into text and think through what you say, so there can be a couple seconds of quiet between us sometimes. That's normal, I'm still here.",
+  "One quick thing first -- there's sometimes a few seconds of pause while I work out what to say back. Don't worry, I haven't gone anywhere.",
+  "Just so you know -- I listen, turn it into text, and think it over, so a short pause between us is normal. Stick with me.",
+];
+
+// Lazy per-voice cache so a given filler phrase is only synthesized once per
+// running process, not on every single call.
+const _fillerCache = new Map();
+async function getFillerClip(voice) {
+  const idx = Math.floor(Math.random() * FILLER_PHRASES.length);
+  const key = `${voice}::${idx}`;
+  if (_fillerCache.has(key)) return _fillerCache.get(key);
+  const buf = await synthesize(FILLER_PHRASES[idx], voice);
+  _fillerCache.set(key, buf);
+  return buf;
+}
+
+// ── Typing-sound asset: real files win, procedural placeholder is the fallback ──
+// Drop one or more 16-bit PCM .wav files (any sample rate, mono or stereo) into
+// assets/typing/ in this repo and redeploy -- no code changes needed. Until then,
+// a procedurally-generated keyboard-clatter sound is used so this works today.
+const TYPING_ASSETS_DIR = path.join(__dirname, 'assets', 'typing');
+
+function makeTypingBurst(durationMs) {
+  const n = Math.floor(8000 * durationMs / 1000);
+  const buf = Buffer.alloc(n, 0xFF); // 0xFF = mu-law silence
+  let t = 0;
+  while (t < n) {
+    t += Math.floor(8000 * (28 + Math.random() * 55) / 1000); // ~12-18 clicks/sec, randomized
+    if (t >= n) break;
+    const clickLen = Math.floor(8000 * (4 + Math.random() * 7) / 1000); // 4-11ms click
+    for (let i = 0; i < clickLen && t + i < n; i++) {
+      const decay  = Math.exp(-i / (clickLen * 0.35));
+      const noise  = Math.random() * 2 - 1;
+      const sample = noise * decay * 9000 * (0.6 + Math.random() * 0.4);
+      buf[t + i] = encodeUlaw(Math.round(sample));
+    }
+  }
+  return buf;
+}
+const TYPING_PLACEHOLDER_CLIPS = Array.from({ length: 4 }, () => makeTypingBurst(2400 + Math.random() * 900));
+
+// Minimal RIFF/WAVE reader: 16-bit PCM, any channel count/sample rate -> mu-law 8kHz mono.
+function loadWavAsMulaw8k(filePath) {
+  const raw = fs.readFileSync(filePath);
+  if (raw.toString('ascii', 0, 4) !== 'RIFF' || raw.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error('not a RIFF/WAVE file');
+  }
+  let offset = 12, fmt = null, dataStart = -1, dataLen = 0;
+  while (offset + 8 <= raw.length) {
+    const id   = raw.toString('ascii', offset, offset + 4);
+    const size = raw.readUInt32LE(offset + 4);
+    const body = offset + 8;
+    if (id === 'fmt ') {
+      fmt = {
+        numChannels:   raw.readUInt16LE(body + 2),
+        sampleRate:    raw.readUInt32LE(body + 4),
+        bitsPerSample: raw.readUInt16LE(body + 14),
+      };
+    } else if (id === 'data') {
+      dataStart = body; dataLen = size;
+    }
+    offset = body + size + (size % 2);
+  }
+  if (!fmt || dataStart < 0) throw new Error('missing fmt/data chunk');
+  if (fmt.bitsPerSample !== 16) throw new Error(`only 16-bit PCM supported (got ${fmt.bitsPerSample}-bit)`);
+
+  const bytesPerFrame = 2 * fmt.numChannels;
+  const frameCount    = Math.floor(dataLen / bytesPerFrame);
+  const mono = new Float32Array(frameCount);
+  for (let i = 0; i < frameCount; i++) {
+    let sum = 0;
+    for (let ch = 0; ch < fmt.numChannels; ch++) sum += raw.readInt16LE(dataStart + i * bytesPerFrame + ch * 2);
+    mono[i] = sum / fmt.numChannels;
+  }
+  const ratio  = fmt.sampleRate / 8000;
+  const outLen = Math.max(1, Math.floor(frameCount / ratio));
+  const out    = Buffer.alloc(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcPos = i * ratio;
+    const i0     = Math.floor(srcPos);
+    const frac   = srcPos - i0;
+    const s0     = mono[i0] || 0;
+    const s1     = mono[Math.min(i0 + 1, frameCount - 1)] || 0;
+    out[i] = encodeUlaw(Math.max(-32768, Math.min(32767, Math.round(s0 + (s1 - s0) * frac))));
+  }
+  return out;
+}
+
+function loadTypingClips() {
+  try {
+    if (fs.existsSync(TYPING_ASSETS_DIR)) {
+      const files = fs.readdirSync(TYPING_ASSETS_DIR).filter(f => f.toLowerCase().endsWith('.wav'));
+      const clips = [];
+      for (const f of files) {
+        try { clips.push(loadWavAsMulaw8k(path.join(TYPING_ASSETS_DIR, f))); }
+        catch (e) { console.warn(`[voice-stream] skipping typing asset ${f}: ${e.message}`); }
+      }
+      if (clips.length) {
+        console.log(`[voice-stream] using ${clips.length} real typing-sound clip(s) from assets/typing/`);
+        return clips;
+      }
+    }
+  } catch (e) { console.warn('[voice-stream] typing asset load failed, using placeholder:', e.message); }
+  console.log('[voice-stream] no assets/typing/*.wav found -- using procedurally-generated placeholder typing sound');
+  return TYPING_PLACEHOLDER_CLIPS;
+}
+const TYPING_CLIPS = loadTypingClips();
+
+// Sends one mu-law clip as 20ms frames, bailing the instant the real reply is
+// ready (ctx.firstAudioReady) or the call ends/aborts. Mirrors playRingback's
+// per-frame check so it always cuts cleanly.
+async function sendFillerClip(session, ctx, buf) {
+  for (let i = 0; i < buf.length; i += FRAME_BYTES) {
+    if (ctx.firstAudioReady || session.llmAbort || session.ws.readyState !== WebSocket.OPEN) return false;
+    const slice = buf.slice(i, i + FRAME_BYTES);
+    const frame = slice.length === FRAME_BYTES
+      ? slice
+      : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length, 0xFF)]);
+    session.sendMedia(frame);
+    await new Promise(r => setTimeout(r, 20));
+  }
+  return true;
+}
+
+async function runThinkingFiller(session, ctx) {
+  if (ctx.firstAudioReady || session.llmAbort) return;
+  const phraseBuf = await getFillerClip(session.voice).catch((e) => {
+    console.error('[voice-stream] filler phrase synth error:', e.message);
+    return null;
+  });
+  if (ctx.firstAudioReady || session.llmAbort || session.ws.readyState !== WebSocket.OPEN) return;
+  if (phraseBuf) {
+    ctx.fillerStarted = true;
+    await playBuffer(session, phraseBuf);
+  }
+  while (!ctx.firstAudioReady && !session.llmAbort && session.ws.readyState === WebSocket.OPEN) {
+    ctx.fillerStarted = true;
+    const clip = TYPING_CLIPS[Math.floor(Math.random() * TYPING_CLIPS.length)];
+    const finishedClean = await sendFillerClip(session, ctx, clip);
+    if (!finishedClean || ctx.firstAudioReady || session.llmAbort) break;
+    await new Promise(r => setTimeout(r, 150 + Math.random() * 250));
+  }
+}
+
+async function maybeStartThinkingFiller(session, ctx) {
+  let waited = 0;
+  while (waited < THINK_DELAY_MS) {
+    if (ctx.firstAudioReady || session.llmAbort) return;
+    await new Promise(r => setTimeout(r, 150));
+    waited += 150;
+  }
+  if (ctx.firstAudioReady || session.llmAbort) return;
+  await runThinkingFiller(session, ctx);
+}
+
 // ── Ringback loop ─────────────────────────────────────────────────────────────
 // Plays US ring tone (440+480 Hz, 1s on / 500ms off) until _ringbackActive=false.
 // Does NOT touch session.isSpeaking — totally independent of the barge-in system.
@@ -523,15 +735,36 @@ function attachMediaStreams(server, users, cfg) {
             `Hey ${name}, ${agentName} picked up. Go ahead.`,
             `It's ${agentName} — hey ${name}! What's good?`,
             `${name}! Caught me at a good time. What's on your mind?`,
+            `Hey ${name}! What can I do for you today?`,
+            `${name}, hey! Go ahead, I'm all ears.`,
+            `There you are, ${name}! What's up?`,
+            `Hey ${name} — ${agentName} speaking. What's happening?`,
+            `Hi ${name}! What's on the agenda?`,
+            `${name}! Glad you called. What's going on?`,
+            `Hey ${name}, it's ${agentName}. Talk to me, what's up?`,
+            `Oh hey, ${name}! Perfect timing. What do you need?`,
+            `${name}! ${agentName} here, ready when you are.`,
+            `Hey there, ${name}! What's the word?`,
+            `${name}, hey! I'm here, go ahead.`,
+            `Hi ${name} — ${agentName} picking up. What's up?`,
+            `Hey ${name}! Good timing — what's going on?`,
+            `${name}! What can I help with?`,
           ];
           const unknownGreetings = [
-            `Hey! I don't think we've met — I'm Kiana. Go ahead and talk, I'm listening.`,
-            `Hey there! New number, not sure who this is — I'm Kiana. What's up?`,
-            `Oh hey! You can register at kademurdock dot com slash signup so I know who you are. But go ahead, I'm Kiana.`,
-            `Hey! Didn't recognize the number — I'm Kiana. What can I do for you?`,
+            `Hey! I don't think we've met — I'm ${agentName}. Go ahead and talk, I'm listening.`,
+            `Hey there! New number, not sure who this is — I'm ${agentName}. What's up?`,
+            `Oh hey! You can register at kademurdock dot com slash signup so I know who you are. But go ahead, I'm ${agentName}.`,
+            `Hey! Didn't recognize the number — I'm ${agentName}. What can I do for you?`,
+            `Hi! Don't think we've talked before — I'm ${agentName}. What's on your mind?`,
+            `Hey, new caller! I'm ${agentName}. Go ahead, I'm listening.`,
+            `Hi there! I'm ${agentName} — haven't met you yet. What's up?`,
+            `Hey! I'm ${agentName}. Go ahead and tell me what's up — you can register later at kademurdock dot com slash signup if you want me to remember you.`,
+            `Hello! I'm ${agentName}, and this is a new number to me. What can I help with?`,
+            `Hey there! I'm ${agentName} — go ahead, I'm listening.`,
           ];
-          const pool     = user ? knownGreetings : unknownGreetings;
-          const greeting = pool[Math.floor(Math.random() * pool.length)];
+          const pool        = user ? knownGreetings : unknownGreetings;
+          const greeting    = pool[Math.floor(Math.random() * pool.length)];
+          const isFirstCall = !session.cfg.seenCallNumbers?.has(from);
 
           // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
           // The ~8-12s between call connect and first Kiana word used to be
@@ -547,6 +780,14 @@ function attachMediaStreams(server, users, cfg) {
               await new Promise(r => setTimeout(r, 120)); // brief gap after clear
               if (session.ws.readyState === WebSocket.OPEN) {
                 await playBuffer(session, greetingBuf);
+              }
+              // First-ever call from this number: one quick, low-key heads-up
+              // about the speech-to-text/thinking delay, then never again.
+              if (isFirstCall && session.ws.readyState === WebSocket.OPEN) {
+                const orientation = ORIENTATION_LINES[Math.floor(Math.random() * ORIENTATION_LINES.length)];
+                await speak(session, orientation, session.voice);
+                session.cfg.seenCallNumbers?.add(from);
+                session.cfg.saveSeenCall?.();
               }
             })
             .catch((err) => {

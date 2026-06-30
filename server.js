@@ -110,6 +110,30 @@ function saveUsers() {
 }
 const users = loadUsers();
 
+// -- "Seen before" tracking -- separate from the users map on purpose --------
+// Used only to fire the one-time "translating your voice + thinking takes a
+// sec" heads-up exactly once per number, per channel (call vs text), without
+// touching the registration/name/agent data above.
+const SEEN_CALL_FILE = path.join(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
+  'bridge-seen-call.json'
+);
+const SEEN_SMS_FILE = path.join(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
+  'bridge-seen-sms.json'
+);
+function loadSeenSet(file) {
+  try { if (fs.existsSync(file)) return new Set(JSON.parse(fs.readFileSync(file, 'utf8'))); }
+  catch {}
+  return new Set();
+}
+function saveSeenSet(file, set) {
+  try { fs.writeFileSync(file, JSON.stringify([...set])); }
+  catch (e) { console.error(`[bridge] Could not save ${path.basename(file)}:`, e.message); }
+}
+const seenCallNumbers = loadSeenSet(SEEN_CALL_FILE);
+const seenSmsNumbers  = loadSeenSet(SEEN_SMS_FILE);
+
 // In-memory state maps
 const voiceStates = new Map(); // callSid → { from, agentId, agentName, history, step?, pendingName?, pendingEmail?, lcEmail?, lcPass? }
 const convHistory = new Map(); // phone → [{role,content}] for SMS
@@ -350,14 +374,21 @@ app.post('/sms', async (req, res) => {
   const user    = users.get(from) || { agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME, name: 'there' };
   const history = convHistory.get(from) || [];
   convHistory.set(from, history);
+  const isFirstText = !seenSmsNumbers.has(from);
   try {
     const reply = await askAgent(user.agentId, history, body);
+    let outText = reply;
+    if (isFirstText) {
+      outText += "\n\n(Quick heads up: replies can take a few seconds -- reading your message and thinking it through, not stuck.)";
+      seenSmsNumbers.add(from);
+      saveSeenSet(SEEN_SMS_FILE, seenSmsNumbers);
+    }
     try {
       const wav = await synthesizeVoice(reply);
       const msg = twiml.message();
-      msg.body(reply);
+      msg.body(outText);
       msg.media(storeAudio(wav));
-    } catch { twiml.message(reply); }
+    } catch { twiml.message(outText); }
   } catch (err) {
     console.error('[sms] Error:', err.message);
     twiml.message("Sorry, I'm having trouble right now. Try again in a moment.");
@@ -854,6 +885,8 @@ attachMediaStreams(server, users, {
   defaultAgentName: DEFAULT_AGENT_NAME,
   getAgents,
   saveUsers,
+  seenCallNumbers,
+  saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
 });
 
 server.listen(port, () => {
