@@ -363,18 +363,18 @@ async function streamReply(session, userText) {
 
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
-    // Fire synthesis immediately (concurrent with playback of previous sentence)
-    // so audio is ready (or nearly ready) when the play slot opens.
-    const synthPromise = synthesize(sentence, session.voice);
-    // Chain playback in order — but just await the already-started promise
+    // Fire synthesis immediately (concurrent with playback of previous sentence).
+    // .catch(() => null) ensures the promise ALWAYS resolves so it can never
+    // cause an unhandled rejection if llmAbort causes us to return before awaiting it.
+    const synthPromise = synthesize(sentence, session.voice).catch((e) => {
+      console.error('[voice-stream] synthesis prefetch error:', e.message);
+      return null;
+    });
+    // Chain playback in order — await the already-started promise
     playChain = playChain.then(async () => {
       if (session.llmAbort) return;
-      try {
-        const mulawBuf = await synthPromise;
-        if (!session.llmAbort) await playBuffer(session, mulawBuf);
-      } catch (e) {
-        if (!session.llmAbort) console.error('[voice-stream] TTS error:', e.message);
-      }
+      const mulawBuf = await synthPromise;
+      if (mulawBuf && !session.llmAbort) await playBuffer(session, mulawBuf);
     });
   });
 
