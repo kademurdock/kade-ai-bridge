@@ -761,6 +761,86 @@ app.post('/voice-ws', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
+
+// ── Outbound calls (staged — enable with ENABLE_OUTBOUND=true Railway env var) ──
+//
+// POST /outbound-call
+// Body (JSON): { "to": "+14175551234", "secret": "<BRIDGE_SECRET>", "agentId"?: "agent_xxx" }
+// Initiates an outbound Twilio call to the given number, routing through the
+// existing Media Streams pipeline (/voice-ws) so the caller gets the full
+// streaming Kiana experience. The agent defaults to whoever is registered for
+// that number, or Kiana if unknown.
+//
+// To enable: set Railway env var ENABLE_OUTBOUND=true on kade-ai-bridge.
+// To disable: remove or set ENABLE_OUTBOUND= (empty) — the endpoint returns 503.
+app.post('/outbound-call', async (req, res) => {
+  if (!process.env.ENABLE_OUTBOUND) {
+    return res.status(503).json({ error: 'Outbound calls not enabled. Set ENABLE_OUTBOUND=true to activate.' });
+  }
+  const { to, agentId, agentName, secret } = req.body;
+  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!to) return res.status(400).json({ error: 'to (phone number) required' });
+  if (!twilioClient) return res.status(500).json({ error: 'Twilio not configured' });
+
+  const digits = String(to).replace(/\D/g, '');
+  const e164   = digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
+  const ourNum = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
+
+  // Ensure the callee is registered so the bridge knows their name/agent.
+  // If they already have a record, leave it alone.  If agentId is passed
+  // explicitly, use that; otherwise fall back to DEFAULT_AGENT (Kiana).
+  if (!users.has(e164)) {
+    users.set(e164, {
+      name: 'there',
+      agentId:   agentId   || DEFAULT_AGENT,
+      agentName: agentName || DEFAULT_AGENT_NAME,
+    });
+    saveUsers();
+    console.log(`[bridge] Auto-registered ${e164} for outbound call`);
+  }
+
+  try {
+    const call = await twilioClient.calls.create({
+      to:   e164,
+      from: ourNum,
+      // When Twilio connects, it hits /voice-ws-outbound which returns the
+      // same <Connect><Stream> TwiML as /voice-ws, but passes the callee's
+      // number so the WebSocket handler can look them up as the "caller."
+      url:    `${PUBLIC_URL}/voice-ws-outbound?userPhone=${encodeURIComponent(e164)}`,
+      method: 'POST',
+      statusCallback:       `${PUBLIC_URL}/voice-status`,
+      statusCallbackMethod: 'POST',
+    });
+    console.log(`[bridge] Outbound call initiated: ${call.sid} → ${e164}`);
+    res.json({ ok: true, callSid: call.sid, to: e164 });
+  } catch (err) {
+    console.error('[bridge] Outbound call failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// TwiML for outbound Media Streams calls.
+// The user's phone number comes from the query param (Twilio doesn't put it in
+// From for outbound calls — our To becomes their From in the WS session).
+app.post('/voice-ws-outbound', (req, res) => {
+  const userPhone = req.query.userPhone || req.body.To || 'unknown';
+  const callSid   = req.body.CallSid || '';
+  const twiml     = new twilio.twiml.VoiceResponse();
+  const connect   = twiml.connect();
+  const wsHost    = process.env.RAILWAY_PUBLIC_DOMAIN || 'kade-ai-bridge-production.up.railway.app';
+  const stream    = connect.stream({ url: `wss://${wsHost}/ws/media` });
+  stream.parameter({ name: 'from',    value: userPhone });
+  stream.parameter({ name: 'callSid', value: callSid });
+  res.type('text/xml').send(twiml.toString());
+});
+
+// Call status callback (logs only — no action taken).
+app.post('/voice-status', (req, res) => {
+  const { CallSid, CallStatus, To, From } = req.body;
+  console.log(`[bridge] Call status: sid=${CallSid} ${From}→${To} status=${CallStatus}`);
+  res.status(200).end();
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
 
