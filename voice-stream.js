@@ -424,7 +424,9 @@ async function streamReply(session, userText) {
   // Wait for any in-flight sentence to finish playing
   await playChain;
 
-  if (fullReply && !session.llmAbort) {
+  // Save reply to history even if barge-in cut it short — partial context is
+  // better than a hole. Without this, barge-ins cause amnesia on the next turn.
+  if (fullReply) {
     session.history.push({ role: 'assistant', content: fullReply });
   }
   session.llmAbort = false;
