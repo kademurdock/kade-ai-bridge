@@ -271,10 +271,13 @@ async function buildReRecordTwiml(message, voice = null) {
 async function buildListenTwiml(message, voice, callSid) {
   const vr = new twilio.twiml.VoiceResponse();
   if (message) await playOrSay(vr, message, voice);
-  vr.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
-    action: `/voice/heard/${callSid}`, method: 'POST' });
-  vr.say({ voice: 'alice' }, 'Still there? Call back anytime!');
-  vr.hangup();
+  // A <Gather> embedded in TwiML injected via call.update does NOT reliably arm
+  // speech recognition, and relative action URLs have no base to resolve against
+  // when delivered over the REST API (that was the round-2 "no reply -> robot
+  // hangs up" bug). Redirect (absolute URL) to a fresh webhook that serves the
+  // Gather as a normal TwiML response -- the exact delivery path that works on
+  // round 1 -- so every turn listens reliably.
+  vr.redirect({ method: 'POST' }, `${PUBLIC_URL}/voice/listen/${callSid}`);
   return vr.toString();
 }
 
@@ -708,6 +711,19 @@ app.post('/voice/heard/:callSid', async (req, res) => {
       });
     } catch {}
   }
+});
+
+// ── Voice: serve a fresh listening Gather (direct webhook response) ───────────
+// Gathers delivered via call.update don't reliably listen; this route serves the
+// Gather as a normal webhook response so every turn listens like round 1 does.
+app.post('/voice/listen/:callSid', (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const callSid = req.params.callSid;
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
+    action: `${PUBLIC_URL}/voice/heard/${callSid}`, method: 'POST' });
+  twiml.say({ voice: 'alice' }, 'Still there? Call back anytime!');
+  twiml.hangup();
+  res.type('text/xml').send(twiml.toString());
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
