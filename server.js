@@ -39,6 +39,9 @@ const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
 const TTS_PROXY_URL      = 'https://inworld-tts-proxy-production.up.railway.app';
 const DEFAULT_PHONE_VOICE = process.env.DEFAULT_PHONE_VOICE || 'Kiana (Comedian)';
+const PHONE_BRIEF = 'SYSTEM NOTE (not from the caller): You are on a live phone call. ' +
+  'Keep every response under two sentences. No markdown, no lists, no asterisks — ' +
+  'plain spoken words only. Be warm and natural.';
 
 // ── Pronunciation fixes ───────────────────────────────────────────────────────
 // "Kade" (the person) is pronounced "Kadie" — fix it before sending to TTS.
@@ -203,8 +206,12 @@ function extractSwitchTarget(text, agents) {
 
 // ── AI call ────────────────────────────────────────────────────────────────────
 async function askAgent(agentId, history, userMessage, token) {
+  if (history.length === 0) {
+    history.push({ role: 'user', content: PHONE_BRIEF });
+    history.push({ role: 'assistant', content: 'Understood.' });
+  }
   history.push({ role: 'user', content: userMessage });
-  while (history.length > 10) history.shift();
+  while (history.length > 14) history.shift();
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/ask/agents`,
     { agentId, messages: history, conversationId: null, parentMessageId: null },
@@ -267,6 +274,17 @@ async function buildReRecordTwiml(message, voice = null) {
     timeout: 5, maxLength: 120, playBeep: true,
     transcribe: true, transcribeCallback: '/voice/transcribed',
   });
+  return vr.toString();
+}
+
+// Gather-based listen loop (replaces old Record+transcribeCallback).
+async function buildListenTwiml(message, voice, callSid) {
+  const vr = new twilio.twiml.VoiceResponse();
+  if (message) await playOrSay(vr, message, voice);
+  vr.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
+    action: `/voice/heard/${callSid}`, method: 'POST' });
+  vr.say({ voice: 'alice' }, 'Still there? Call back anytime!');
+  vr.hangup();
   return vr.toString();
 }
 
@@ -362,9 +380,10 @@ app.post('/voice', async (req, res) => {
       `Go ahead — say "switch to" and a name anytime to change agents, or "switch voice to" a voice name to change how I sound.`,
       user.voice || null
     );
-    twiml.record({ action: '/voice/reply', method: 'POST',
-      timeout: 5, maxLength: 120, playBeep: true,
-      transcribe: true, transcribeCallback: '/voice/transcribed' });
+    twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
+      action: `/voice/heard/${callSid}`, method: 'POST' });
+    twiml.say({ voice: 'alice' }, 'Still there? Call back anytime!');
+    twiml.hangup();
   }
   res.type('text/xml').send(twiml.toString());
 });
@@ -484,9 +503,10 @@ app.post('/voice/setup-confirm/:callSid', async (req, res) => {
   }
 
   // Start conversation
-  twiml.record({ action: '/voice/reply', method: 'POST',
-    timeout: 5, maxLength: 120, playBeep: true,
-    transcribe: true, transcribeCallback: '/voice/transcribed' });
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
+    action: `/voice/heard/${callSid}`, method: 'POST' });
+  twiml.say({ voice: 'alice' }, 'Still there?');
+  twiml.hangup();
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -504,9 +524,10 @@ app.post('/voice/setup-guest/:callSid', async (req, res) => {
   }
 
   await playOrSay(twiml, `No problem, ${name}! Go ahead and start talking.`);
-  twiml.record({ action: '/voice/reply', method: 'POST',
-    timeout: 5, maxLength: 120, playBeep: true,
-    transcribe: true, transcribeCallback: '/voice/transcribed' });
+  twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
+    action: `/voice/heard/${callSid}`, method: 'POST' });
+  twiml.say({ voice: 'alice' }, 'Still there?');
+  twiml.hangup();
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -536,7 +557,7 @@ app.post('/voice/transcribed', async (req, res) => {
       const user = users.get(state.from);
       if (user) { user.voice = voiceTarget; saveUsers(); }
       await twilioClient.calls(callSid).update({
-        twiml: await buildReRecordTwiml(`Switching to ${voiceTarget}'s voice! Go ahead.`, voiceTarget),
+        twiml: await buildListenTwiml(`Switching to ${voiceTarget}'s voice! Go ahead.`, voiceTarget, callSid),
       });
       return;
     }
@@ -553,7 +574,7 @@ app.post('/voice/transcribed', async (req, res) => {
       const user = users.get(state.from);
       if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
       await twilioClient.calls(callSid).update({
-        twiml: await buildReRecordTwiml(`Switching to ${target.name}! What do you want to say?`, state.voice),
+        twiml: await buildListenTwiml(`Switching to ${target.name}! What do you want to say?`, state.voice, callSid),
       });
     } else {
       const token    = await getTokenForCall(state);
@@ -649,6 +670,58 @@ app.post('/signup', (req, res) => {
   saveUsers();
   console.log('[bridge] Self-registered ' + e164 + ' as "' + name.trim() + '"');
   res.json({ ok: true, phone: e164 });
+});
+
+// ── Voice: heard (Gather fires here) ─────────────────────────────────────────
+// Acks immediately so caller hears something, then processes AI async.
+app.post('/voice/heard/:callSid', async (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const callSid = req.params.callSid;
+  const speech  = (req.body.SpeechResult || '').trim();
+  const state   = voiceStates.get(callSid);
+
+  twiml.say({ voice: 'alice' }, 'Got it, one moment.');
+  twiml.pause({ length: 90 });
+  res.type('text/xml').send(twiml.toString());
+
+  if (!state || !speech || !twilioClient) return;
+  console.log(`[voice] heard callSid=${callSid}: "${speech}"`);
+
+  try {
+    const voiceTarget = extractVoiceSwitch(speech);
+    if (voiceTarget) {
+      state.voice = voiceTarget;
+      const user = users.get(state.from);
+      if (user) { user.voice = voiceTarget; saveUsers(); }
+      await twilioClient.calls(callSid).update({
+        twiml: await buildListenTwiml(`Switching to ${voiceTarget}'s voice! Go ahead.`, voiceTarget, callSid),
+      });
+      return;
+    }
+    const agents = await getAgents();
+    const target = extractSwitchTarget(speech, agents);
+    if (target && target.id !== state.agentId) {
+      state.agentId = target.id; state.agentName = target.name; state.history = [];
+      const user = users.get(state.from);
+      if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
+      await twilioClient.calls(callSid).update({
+        twiml: await buildListenTwiml(`Switching to ${target.name}! What's on your mind?`, state.voice, callSid),
+      });
+      return;
+    }
+    const token = await getTokenForCall(state);
+    const reply = await askAgent(state.agentId, state.history, speech, token);
+    await twilioClient.calls(callSid).update({
+      twiml: await buildListenTwiml(reply, state.voice, callSid),
+    });
+  } catch (err) {
+    console.error('[voice] heard error:', err.message);
+    try {
+      await twilioClient.calls(callSid).update({
+        twiml: await buildListenTwiml('Sorry, something went wrong. Go ahead and try again.', state.voice, callSid),
+      });
+    } catch {}
+  }
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
