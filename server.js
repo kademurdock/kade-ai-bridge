@@ -31,6 +31,8 @@ const TWILIO_TOKEN    = process.env.TWILIO_AUTH_TOKEN;
 const LIBRECHAT_URL   = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
 const LIBRECHAT_EMAIL = process.env.LIBRECHAT_EMAIL;
 const LIBRECHAT_PASS  = process.env.LIBRECHAT_PASSWORD;
+const PROXY_URL    = (process.env.LIBRECHAT_PROXY_URL || 'https://inworld-tts-proxy-production.up.railway.app').replace(/\/$/, '');
+const PROXY_SECRET = process.env.LIBRECHAT_PROXY_SECRET || '';
 const DEFAULT_AGENT      = process.env.DEFAULT_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb';
 const DEFAULT_AGENT_NAME = 'Kiana';
 const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
@@ -172,12 +174,11 @@ let _agentCache = null, _agentCacheExp = 0;
 async function getAgents() {
   if (_agentCache && Date.now() < _agentCacheExp) return _agentCache;
   try {
-    const token = await getLCToken();
-    const r = await axios.get(`${LIBRECHAT_URL}/api/agents?limit=100`, {
-      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' },
-      timeout: 10000,
+    const r = await axios.get(`${PROXY_URL}/librechat/agents`, {
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      timeout: 15000,
     });
-    _agentCache    = (r.data.data || []).filter(a => a.isPublic);
+    _agentCache    = (r.data.agents || []);
     _agentCacheExp = Date.now() + 60 * 60 * 1000;
     console.log(`[bridge] Agent cache: ${_agentCache.length} public agents`);
   } catch (e) {
@@ -205,7 +206,7 @@ function extractSwitchTarget(text, agents) {
 }
 
 // ── AI call ────────────────────────────────────────────────────────────────────
-async function askAgent(agentId, history, userMessage, token) {
+async function askAgent(agentId, history, userMessage) {
   if (history.length === 0) {
     history.push({ role: 'user', content: PHONE_BRIEF });
     history.push({ role: 'assistant', content: 'Understood.' });
@@ -213,25 +214,14 @@ async function askAgent(agentId, history, userMessage, token) {
   history.push({ role: 'user', content: userMessage });
   while (history.length > 14) history.shift();
   const r = await axios.post(
-    `${LIBRECHAT_URL}/api/ask/agents`,
-    { agentId, messages: history, conversationId: null, parentMessageId: null },
+    `${PROXY_URL}/librechat/ask`,
+    { agentId, messages: history },
     {
-      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' },
-      responseType: 'stream',
-      timeout: 30000,
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      timeout: 60000,
     }
   );
-  let reply = '';
-  await new Promise((resolve, reject) => {
-    r.data.on('data', chunk => {
-      for (const line of chunk.toString().split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        try { const d = JSON.parse(line.slice(6)); if (d.text) reply = d.text; } catch {}
-      }
-    });
-    r.data.on('end', resolve);
-    r.data.on('error', reject);
-  });
+  const reply = r.data.text;
   if (!reply) throw new Error('Empty reply from agent');
   history.push({ role: 'assistant', content: reply });
   return reply;
@@ -338,8 +328,7 @@ app.post('/sms', async (req, res) => {
   const history = convHistory.get(from) || [];
   convHistory.set(from, history);
   try {
-    const token = user.lcEmail ? await getUserToken(user.lcEmail, user.lcPass) : await getLCToken();
-    const reply = await askAgent(user.agentId, history, body, token);
+    const reply = await askAgent(user.agentId, history, body);
     try {
       const wav = await synthesizeVoice(reply);
       const msg = twiml.message();
@@ -577,8 +566,7 @@ app.post('/voice/transcribed', async (req, res) => {
         twiml: await buildListenTwiml(`Switching to ${target.name}! What do you want to say?`, state.voice, callSid),
       });
     } else {
-      const token    = await getTokenForCall(state);
-      const reply    = await askAgent(state.agentId, state.history, text, token);
+      const reply    = await askAgent(state.agentId, state.history, text);
       const audioUrl = storeAudio(await synthesizeVoice(reply, state.voice));
       const vr = new twilio.twiml.VoiceResponse();
       vr.gather({ input: 'speech', speechTimeout: 'auto', timeout: 8,
@@ -634,8 +622,7 @@ app.post('/voice/continue/:callSid', async (req, res) => {
         if (user) { user.agentId = target.id; user.agentName = target.name; saveUsers(); }
         await playOrSay(twiml, `Switching to ${target.name}! What's on your mind?`, state.voice);
       } else {
-        const token = await getTokenForCall(state);
-        const reply = await askAgent(state.agentId, state.history, speech, token);
+        const reply = await askAgent(state.agentId, state.history, speech);
         twiml.play(storeAudio(await synthesizeVoice(reply, state.voice)));
       }
     }
@@ -709,8 +696,7 @@ app.post('/voice/heard/:callSid', async (req, res) => {
       });
       return;
     }
-    const token = await getTokenForCall(state);
-    const reply = await askAgent(state.agentId, state.history, speech, token);
+    const reply = await askAgent(state.agentId, state.history, speech);
     await twilioClient.calls(callSid).update({
       twiml: await buildListenTwiml(reply, state.voice, callSid),
     });
