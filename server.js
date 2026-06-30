@@ -206,16 +206,29 @@ function extractSwitchTarget(text, agents) {
 }
 
 // ── AI call ────────────────────────────────────────────────────────────────────
+// Appended to the LAST user turn on every call. A brevity note placed at the
+// START of history (the old PHONE_BRIEF seed) was flatly ignored — Kiana wrote
+// 2000+ char essays, which on the phone meant ~20-30s generation + minutes of
+// TTS playback + wasted phone/TTS cost. Appending a forceful instruction right
+// after the caller's words (recency) makes the model actually obey: replies drop
+// to ~1-2 sentences and latency to ~3-8s. Kept out of stored history so it never
+// accumulates.
+const PHONE_SUFFIX =
+  '\n\n[PHONE CALL — you MUST answer in 1, maximum 2, short spoken sentences. ' +
+  'Hard limit. No exceptions. Conversational, like talking on the phone.]';
+
 async function askAgent(agentId, history, userMessage) {
-  if (history.length === 0) {
-    history.push({ role: 'user', content: PHONE_BRIEF });
-    history.push({ role: 'assistant', content: 'Understood.' });
-  }
   history.push({ role: 'user', content: userMessage });
   while (history.length > 14) history.shift();
+  // Send a copy with the brevity instruction glued onto the final user turn.
+  const outgoing = history.map((m, i) =>
+    (i === history.length - 1 && m.role === 'user')
+      ? { ...m, content: m.content + PHONE_SUFFIX }
+      : m
+  );
   const r = await axios.post(
     `${PROXY_URL}/librechat/ask`,
-    { agentId, messages: history },
+    { agentId, messages: outgoing },
     {
       headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
       timeout: 150000,
