@@ -12,6 +12,8 @@
 'use strict';
 
 const express  = require('express');
+const http     = require('http');
+const { attachMediaStreams } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
 const crypto   = require('crypto');
@@ -741,8 +743,37 @@ app.post('/voice/listen/:callSid', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
+// ── Voice: Media Streams (streaming path) ────────────────────────────────────
+// Returns <Connect><Stream> TwiML.  Point a TEST number's webhook here while
+// keeping /voice as the Gather fallback.
+app.post('/voice-ws', (req, res) => {
+  const from    = req.body.From    || req.body.from    || 'unknown';
+  const callSid = req.body.CallSid || req.body.callSid || '';
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+  const wsHost  = process.env.RAILWAY_PUBLIC_DOMAIN || 'kade-ai-bridge-production.up.railway.app';
+  const stream  = connect.stream({ url: `wss://${wsHost}/ws/media` });
+  stream.parameter({ name: 'from',    value: from });
+  stream.parameter({ name: 'callSid', value: callSid });
+  res.type('text/xml').send(twiml.toString());
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
-app.listen(port, () => {
+const server = http.createServer(app);
+
+attachMediaStreams(server, users, {
+  proxyUrl:         PROXY_URL,
+  proxySecret:      PROXY_SECRET,
+  ttsProxyUrl:      TTS_PROXY_URL,
+  ttsModel:         process.env.PHONE_TTS_MODEL || 'tts-1-mini',
+  defaultVoice:     DEFAULT_PHONE_VOICE,
+  defaultAgent:     DEFAULT_AGENT,
+  defaultAgentName: DEFAULT_AGENT_NAME,
+  getAgents,
+  saveUsers,
+});
+
+server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
   if (!twilioClient) console.warn('[bridge] Twilio not configured -- set env vars');
