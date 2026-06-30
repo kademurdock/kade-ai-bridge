@@ -234,8 +234,8 @@ function openDeepgram(session) {
     model: 'nova-2-phonecall',
     smart_format: 'true',
     interim_results: 'true',
-    utterance_end_ms: '1200',
-    endpointing: '600',
+    utterance_end_ms: '800',
+    endpointing: '350',
     vad_events: 'true',
   });
 
@@ -359,11 +359,14 @@ async function streamReply(session, userText) {
 
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
-    // Chain synthesis+play so sentences don't overlap
+    // Fire synthesis immediately (concurrent with playback of previous sentence)
+    // so audio is ready (or nearly ready) when the play slot opens.
+    const synthPromise = synthesize(sentence, session.voice);
+    // Chain playback in order — but just await the already-started promise
     playChain = playChain.then(async () => {
       if (session.llmAbort) return;
       try {
-        const mulawBuf = await synthesize(sentence, session.voice);
+        const mulawBuf = await synthPromise;
         if (!session.llmAbort) await playBuffer(session, mulawBuf);
       } catch (e) {
         if (!session.llmAbort) console.error('[voice-stream] TTS error:', e.message);
