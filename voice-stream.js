@@ -183,6 +183,7 @@ class CallSession {
     this.history     = [];
     this.isSpeaking     = false;
     this.speakStartedAt = 0;          // epoch ms when we started speaking (echo gate)
+    this.lastSpokAt     = 0;          // epoch ms when Kiana STOPPED speaking (echo drain gate)
     this.bargedIn       = false;      // true once we barge-in this turn (prevent double)
     this.llmAbort       = null;       // set to true to cancel in-flight LLM
     this.dgWs           = null;       // Deepgram WebSocket
@@ -276,7 +277,9 @@ function openDeepgram(session) {
         const utterance = session.finalBuf.trim();
         session.finalBuf = '';
         session.partialBuf = '';
-        handleUtterance(session, utterance);
+        // Ignore if Kiana is speaking (echo) or within 500ms of stopping (echo drain)
+        const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 500);
+        if (!echoWindow) handleUtterance(session, utterance);
       }
       return;
     }
@@ -285,7 +288,8 @@ function openDeepgram(session) {
     if (msg.type === 'UtteranceEnd' && session.finalBuf) {
       const utterance = session.finalBuf.trim();
       session.finalBuf = '';
-      handleUtterance(session, utterance);
+      const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 500);
+      if (!echoWindow) handleUtterance(session, utterance);
     }
   });
 
@@ -465,6 +469,9 @@ const FRAME_BYTES = 160; // 8kHz × 20ms × 1 byte/sample = 160 bytes
 async function playBuffer(session, mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
+  // Clear any accumulated echo transcripts from before this playback slot
+  session.finalBuf       = '';
+  session.partialBuf     = '';
   session.isSpeaking     = true;
   session.speakStartedAt = Date.now();
   session.bargedIn       = false;
@@ -492,7 +499,10 @@ async function playBuffer(session, mulawBuf) {
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
   }
 
-  if (!session.llmAbort) session.isSpeaking = false;
+  if (!session.llmAbort) {
+    session.isSpeaking = false;
+    session.lastSpokAt = Date.now(); // echo drain gate starts now
+  }
 }
 
 // ── Attach WebSocket Media Streams handler to an HTTP server ──────────────────
