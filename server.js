@@ -217,8 +217,11 @@ function extractSwitchTarget(text, agents) {
 // accumulates.
 const PHONE_SUFFIX =
   '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
-  'Talk the way you would on a real call: natural, warm, conversational. ' +
-  'Long or short, whatever fits — if you are in the middle of something good, keep going. ' +
+  'Talk the way you naturally would: warm, engaged, conversational. ' +
+  'Do NOT monologue — two or three sentences is usually right, go longer only if you are ' +
+  'genuinely mid-story and it would feel weird to stop. ' +
+  'If you have been going for a while, throw in a natural check-in: ' +
+  '\"am I rambling?\" or \"jump in whenever\" — whatever fits your voice. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
 async function askAgent(agentId, history, userMessage) {
