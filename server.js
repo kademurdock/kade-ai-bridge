@@ -14,7 +14,6 @@
 const express  = require('express');
 const twilio   = require('twilio');
 const axios    = require('axios');
-const FormData = require('form-data');
 const crypto   = require('crypto');
 const fs       = require('fs');
 const path     = require('path');
@@ -38,7 +37,8 @@ const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
-const TTS_PROXY_URL   = 'https://inworld-tts-proxy-production.up.railway.app';
+const TTS_PROXY_URL      = 'https://inworld-tts-proxy-production.up.railway.app';
+const DEFAULT_PHONE_VOICE = process.env.DEFAULT_PHONE_VOICE || 'Kiana (Comedian)';
 
 // ── Pronunciation fixes ───────────────────────────────────────────────────────
 // "Kade" (the person) is pronounced "Kadie" — fix it before sending to TTS.
@@ -231,21 +231,12 @@ async function askAgent(agentId, history, userMessage, token) {
 // voice = null → use LibreChat's configured default (Kiana's voice)
 // voice = "Sarah" etc → call the Inworld proxy directly with that voice name
 async function synthesizeVoice(text, voice = null) {
-  const input = fixPronunciation(text).slice(0, 4096);
-  if (voice) {
-    const r = await axios.post(
-      `${TTS_PROXY_URL}/v1/audio/speech`,
-      { model: 'tts-1', input, voice },
-      { responseType: 'arraybuffer', timeout: 30000 }
-    );
-    return Buffer.from(r.data);
-  }
-  const fd = new FormData();
-  fd.append('input', input);
+  const input    = fixPronunciation(text).slice(0, 4096);
+  const useVoice = voice || DEFAULT_PHONE_VOICE;
   const r = await axios.post(
-    `${LIBRECHAT_URL}/api/files/speech/tts/manual`,
-    fd,
-    { headers: { ...fd.getHeaders(), 'User-Agent': 'Mozilla/5.0' }, responseType: 'arraybuffer', timeout: 30000 }
+    `${TTS_PROXY_URL}/v1/audio/speech`,
+    { model: 'tts-1', input, voice: useVoice },
+    { responseType: 'arraybuffer', timeout: 30000 }
   );
   return Buffer.from(r.data);
 }
