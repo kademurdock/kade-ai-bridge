@@ -555,21 +555,46 @@ async function playBuffer(session, mulawBuf) {
   const start = Date.now();
   let frameIdx = 0;
   const totalFrames = Math.ceil(mulawBuf.length / FRAME_BYTES);
+
+  // PACING FIX (July 1 2026, round 2): the old loop sent ONE 20ms frame per
+  // setTimeout tick, i.e. it tried to hit a 20ms deadline in real time,
+  // forever. Any event-loop contention (the next sentence's synthesis HTTP
+  // response landing, Deepgram websocket traffic) delivered frames late,
+  // Twilio's playout buffer ran dry, and every underrun was an audible gap
+  // ("buffering") with a click on resume. Twilio Media Streams BUFFERS
+  // outbound media server-side and the existing `clear` message (already sent
+  // by every barge-in/abort path) flushes it instantly -- so we now keep a
+  // LEAD_MS cushion queued at Twilio and top it up in relaxed bursts instead
+  // of tightrope-walking the wall clock. Barge-in latency is unchanged:
+  // `clear` dumps the cushion the moment she's interrupted.
+  const LEAD_MS = 600;
   while (frameIdx < totalFrames) {
     if (session.llmAbort || !session.isSpeaking || session.ws.readyState !== WebSocket.OPEN) break;
-    const offset = frameIdx * FRAME_BYTES;
-    const slice  = mulawBuf.slice(offset, offset + FRAME_BYTES);
-    const frame  = slice.length === FRAME_BYTES
-      ? slice
-      // Pad the final partial frame with 0xFF -- true mu-law SILENCE. 0x00 in
-      // mu-law decodes to a near-full-scale NEGATIVE sample (-8159), so zero
-      // padding was stapling a loud ~20ms DC snap onto the end of every
-      // sentence -- the "pop between sections of audio" bug (July 1 2026).
-      : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length, 0xff)]);
-    session.sendMedia(frame);
-    frameIdx++;
-    const wait = (start + frameIdx * 20) - Date.now();
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    const aheadFrames = Math.min(totalFrames, Math.floor((Date.now() - start + LEAD_MS) / 20));
+    while (frameIdx < aheadFrames) {
+      const offset = frameIdx * FRAME_BYTES;
+      const slice  = mulawBuf.slice(offset, offset + FRAME_BYTES);
+      const frame  = slice.length === FRAME_BYTES
+        ? slice
+        // Pad the final partial frame with 0xFF -- true mu-law SILENCE. 0x00
+        // decodes to a near-full-scale negative sample (-8159), so zero
+        // padding was stapling a loud ~20ms DC snap onto the end of every
+        // sentence -- the original "pop between sections" bug.
+        : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length, 0xff)]);
+      session.sendMedia(frame);
+      frameIdx++;
+    }
+    if (frameIdx < totalFrames) {
+      await new Promise(r => setTimeout(r, 100)); // top up the cushion ~10x/sec
+    }
+  }
+
+  // All frames are queued at Twilio; hold isSpeaking until they've actually
+  // PLAYED (wall-clock end of the buffer), unless something aborts first.
+  while (!session.llmAbort && session.isSpeaking && session.ws.readyState === WebSocket.OPEN) {
+    const remaining = (start + totalFrames * 20) - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(r => setTimeout(r, Math.min(remaining, 100)));
   }
 
   if (!session.llmAbort) {

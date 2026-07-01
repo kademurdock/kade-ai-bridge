@@ -326,7 +326,7 @@ async function buildListenTwiml(message, voice, callSid) {
 }
 
 // ── Health ─────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, users: users.size }));
+app.get('/health', (_req, res) => res.json({ ok: true, users: users.size, rev: (process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown').slice(0, 7) }));
 
 // Static opt-in / SMS consent disclosure image — used for Twilio toll-free verification.
 app.get('/optin.png', (_req, res) => {
