@@ -113,7 +113,7 @@ function extractSwitchTarget(text, agents) {
 function normalizeWords(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
 }
-function looksLikeEcho(heard, currentlySpeaking) {
+function looksLikeEcho(heard, currentlySpeaking, threshold = 0.6) {
   if (!heard || !currentlySpeaking) return false;
   const heardWords = normalizeWords(heard);
   // Require at least 2 words before ever suppressing on overlap -- a single
@@ -125,7 +125,7 @@ function looksLikeEcho(heard, currentlySpeaking) {
   const spokenSet = new Set(normalizeWords(currentlySpeaking));
   if (spokenSet.size === 0) return false;
   const overlap = heardWords.filter(w => spokenSet.has(w)).length;
-  return overlap / heardWords.length > 0.6;
+  return overlap / heardWords.length > threshold;
 }
 
 // ── SentenceStreamer ──────────────────────────────────────────────────────────
@@ -273,6 +273,7 @@ function bargeIn(session) {
   session.sendClear();
   session.llmAbort = true;
   session.isSpeaking = false;
+  session.lastSpokAt = Date.now(); // echo window measures from the real stop, not a stale timestamp
 }
 
 // ── Deepgram STT ──────────────────────────────────────────────────────────────
@@ -324,9 +325,16 @@ function openDeepgram(session) {
         // into session.history was the likely cause of a reported "loopy"/
         // repeating conversation feel -- the model ends up responding to a
         // garbled echo of its own last sentence.
+        // FIX (July 1 2026): the old gate dropped ANY utterance completing
+        // inside the 1200ms window regardless of content -- which is exactly
+        // when a caller answers a direct question, so real answers vanished
+        // and Kiana "forgot" she'd asked. Now the window only makes the echo
+        // CONTENT check stricter (0.35 overlap vs 0.6 outside it); an answer
+        // that doesn't resemble what she just said always gets through.
         const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
-        const isEcho = looksLikeEcho(utterance, session._currentSpokenText);
-        if (!echoWindow && !isEcho) handleUtterance(session, utterance);
+        const isEcho = looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        if (!isEcho) handleUtterance(session, utterance);
+        else console.log(`[voice-stream] echo-dropped: "${utterance.slice(0, 60)}"`);
       }
       return;
     }
@@ -335,8 +343,9 @@ function openDeepgram(session) {
       const utterance = session.finalBuf.trim();
       session.finalBuf = '';
       const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
-      const isEcho = looksLikeEcho(utterance, session._currentSpokenText);
-      if (!echoWindow && !isEcho) handleUtterance(session, utterance);
+      const isEcho = looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+      if (!isEcho) handleUtterance(session, utterance);
+      else console.log(`[voice-stream] echo-dropped (UtteranceEnd): "${utterance.slice(0, 60)}"`);
     }
   });
 
@@ -350,14 +359,24 @@ async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
   if (session.busy) {
-    if (!session.isSpeaking && !session.bargedIn) {
+    if (session.isSpeaking && !session.bargedIn) {
+      // Actively speaking with no barge-in registered: a "completed utterance"
+      // here is near-certainly room echo. Still the right call to drop.
+      console.log(`[voice-stream] busy+speaking, dropping: "${text.slice(0,50)}"`);
+    } else if (session.bargedIn) {
+      // FIX (July 1 2026): the caller already barged in (their interim speech
+      // stopped playback), and this is their COMPLETED utterance arriving while
+      // the aborted turn is still unwinding. The old code dropped it -- so the
+      // very answer that interrupted Kiana's question never reached the LLM.
+      // Queue it (merging with any earlier fragment) so the finally-block runs it.
+      console.log(`[voice-stream] queueing post-barge-in utterance: "${text.slice(0,50)}"`);
+      session._pending = session._pending ? `${session._pending} ${text}` : text;
+    } else {
       console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
       session.sendClear(); // flush any in-flight thinking-filler audio
       session.llmAbort = true;
       session.bargedIn = true;
       session._pending = text;
-    } else {
-      console.log(`[voice-stream] busy+speaking, dropping: "${text.slice(0,50)}"`);
     }
     return;
   }
@@ -542,7 +561,11 @@ async function playBuffer(session, mulawBuf) {
     const slice  = mulawBuf.slice(offset, offset + FRAME_BYTES);
     const frame  = slice.length === FRAME_BYTES
       ? slice
-      : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length)]);
+      // Pad the final partial frame with 0xFF -- true mu-law SILENCE. 0x00 in
+      // mu-law decodes to a near-full-scale NEGATIVE sample (-8159), so zero
+      // padding was stapling a loud ~20ms DC snap onto the end of every
+      // sentence -- the "pop between sections of audio" bug (July 1 2026).
+      : Buffer.concat([slice, Buffer.alloc(FRAME_BYTES - slice.length, 0xff)]);
     session.sendMedia(frame);
     frameIdx++;
     const wait = (start + frameIdx * 20) - Date.now();
