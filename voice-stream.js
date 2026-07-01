@@ -80,6 +80,31 @@ function extractSwitchTarget(text, agents) {
   return q ? findAgent(agents, q) : null;
 }
 
+// ── Self-echo detection for barge-in ───────────────────────────────────────────
+// On speakerphone, some of what Kiana is saying can bleed back into the
+// caller's mic and get transcribed by Deepgram as if the caller said it,
+// which used to trigger an instant false barge-in ("cutting her off"). This
+// checks whether most of what was just "heard" is actually just words she's
+// currently saying -- if so, it's almost certainly her own voice coming back,
+// not a real interruption, so barge-in is suppressed for that one check.
+function normalizeWords(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
+}
+function looksLikeEcho(heard, currentlySpeaking) {
+  if (!heard || !currentlySpeaking) return false;
+  const heardWords = normalizeWords(heard);
+  // Require at least 2 words before ever suppressing on overlap -- a single
+  // short word ("wait", "stop") is exactly the kind of real interruption we
+  // don't want to risk swallowing just because it happens to also appear in
+  // her current sentence. Multi-word fragments overlapping heavily are a much
+  // more reliable echo signal.
+  if (heardWords.length < 2) return false;
+  const spokenSet = new Set(normalizeWords(currentlySpeaking));
+  if (spokenSet.size === 0) return false;
+  const overlap = heardWords.filter(w => spokenSet.has(w)).length;
+  return overlap / heardWords.length > 0.6;
+}
+
 // ── SentenceStreamer ──────────────────────────────────────────────────────────
 class SentenceStreamer extends EventEmitter {
   constructor() {
@@ -255,9 +280,15 @@ function openDeepgram(session) {
       const alt  = msg.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (!text) return;
-      if (session.isSpeaking && !session.bargedIn && Date.now() - session.speakStartedAt > 800) {
-        session.bargedIn = true;
-        bargeIn(session);
+      const graceOk = Date.now() - session.speakStartedAt > 1000;
+      if (session.isSpeaking && !session.bargedIn && graceOk) {
+        if (looksLikeEcho(text, session._currentSpokenText)) {
+          // Almost certainly her own voice coming back through the mic --
+          // ignore this check, keep listening for a real interruption.
+        } else {
+          session.bargedIn = true;
+          bargeIn(session);
+        }
       }
       if (msg.is_final) session.finalBuf += (session.finalBuf ? ' ' : '') + text;
       if (msg.speech_final && session.finalBuf) {
@@ -377,6 +408,7 @@ async function streamReply(session, userText) {
             await new Promise(r => setTimeout(r, 100));
           }
         }
+        session._currentSpokenText = sentence; // for echo detection, see looksLikeEcho
         await playBuffer(session, mulawBuf);
       }
     });
@@ -447,6 +479,7 @@ async function synthesize(text, voice) {
 async function speak(session, text, voice) {
   try {
     const buf = await synthesize(text, voice || session.voice);
+    session._currentSpokenText = text; // for echo detection, see looksLikeEcho
     await playBuffer(session, buf);
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
 }
@@ -517,10 +550,13 @@ const FILLER_PHRASES = [
   'Mm, let me think.',
 ];
 
+// Kept as short as it can possibly be -- this plays on EVERY call, not just
+// first-timers (anyone might have someone new in the room with them), so it
+// can't be allowed to get old or eat up call time.
 const ORIENTATION_LINES = [
-  "Quick heads up before we get going -- I turn your voice into text and think through what you say, so there can be a couple seconds of quiet between us sometimes. That's normal, I'm still here.",
-  "One quick thing first -- there's sometimes a few seconds of pause while I work out what to say back. Don't worry, I haven't gone anywhere.",
-  "Just so you know -- I listen, turn it into text, and think it over, so a short pause between us is normal. Stick with me.",
+  "Quick note -- a little sound means I'm thinking, still here.",
+  "Heads up -- you'll hear a small sound while I think. Still on the line.",
+  "One thing -- a little sound plays while I think it over. I'm here.",
 ];
 
 // Lazy per-voice cache so a given filler phrase is only synthesized once per
@@ -643,17 +679,21 @@ async function sendFillerClip(session, ctx, buf) {
   return true;
 }
 
+// NOTE (July 1 2026): this used to also speak a live-synthesized filler
+// phrase ("hold on a sec"...) before the typing loop, via getFillerClip()
+// above. Pulled that call out of the hot path: it fired a SECOND concurrent
+// TTS request at almost exactly the moment we're impatiently waiting on the
+// real reply's first sentence, and that concurrent request competing for the
+// same TTS proxy/upstream is the most likely cause of a reported "buffering,
+// packet-loss-like" stutter on real calls -- and since the real sentence
+// usually won that race anyway, the filler phrase was rarely even heard.
+// The typing-sound clip below needs zero network calls (already decoded in
+// memory at boot), so it can't cause that contention and starts instantly.
+// getFillerClip/_fillerCache/FILLER_PHRASES are left in place, unused, in
+// case a lower-risk way to bring the spoken line back is worth revisiting
+// later (e.g. only after confirming proxy headroom under real concurrent load).
 async function runThinkingFiller(session, ctx) {
   if (ctx.firstAudioReady || session.llmAbort) return;
-  const phraseBuf = await getFillerClip(session.voice).catch((e) => {
-    console.error('[voice-stream] filler phrase synth error:', e.message);
-    return null;
-  });
-  if (ctx.firstAudioReady || session.llmAbort || session.ws.readyState !== WebSocket.OPEN) return;
-  if (phraseBuf) {
-    ctx.fillerStarted = true;
-    await playBuffer(session, phraseBuf);
-  }
   while (!ctx.firstAudioReady && !session.llmAbort && session.ws.readyState === WebSocket.OPEN) {
     ctx.fillerStarted = true;
     const clip = TYPING_CLIPS[Math.floor(Math.random() * TYPING_CLIPS.length)];
@@ -764,7 +804,6 @@ function attachMediaStreams(server, users, cfg) {
           ];
           const pool        = user ? knownGreetings : unknownGreetings;
           const greeting    = pool[Math.floor(Math.random() * pool.length)];
-          const isFirstCall = !session.cfg.seenCallNumbers?.has(from);
 
           // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
           // The ~8-12s between call connect and first Kiana word used to be
@@ -781,13 +820,12 @@ function attachMediaStreams(server, users, cfg) {
               if (session.ws.readyState === WebSocket.OPEN) {
                 await playBuffer(session, greetingBuf);
               }
-              // First-ever call from this number: one quick, low-key heads-up
-              // about the speech-to-text/thinking delay, then never again.
-              if (isFirstCall && session.ws.readyState === WebSocket.OPEN) {
+              // Every call, not just first-timers -- Keighty's call: whoever's
+              // in the room with the caller this time needs to hear it too,
+              // so it has to stay short rather than gated to a one-time thing.
+              if (session.ws.readyState === WebSocket.OPEN) {
                 const orientation = ORIENTATION_LINES[Math.floor(Math.random() * ORIENTATION_LINES.length)];
                 await speak(session, orientation, session.voice);
-                session.cfg.seenCallNumbers?.add(from);
-                session.cfg.saveSeenCall?.();
               }
             })
             .catch((err) => {
