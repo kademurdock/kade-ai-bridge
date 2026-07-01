@@ -295,8 +295,15 @@ function openDeepgram(session) {
         const utterance = session.finalBuf.trim();
         session.finalBuf = '';
         session.partialBuf = '';
-        const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 500);
-        if (!echoWindow) handleUtterance(session, utterance);
+        // Widened from 500ms and added a content check: a completed
+        // "utterance" that mostly repeats what Kiana just said is almost
+        // certainly trailing room echo, not a real reply, and letting it
+        // into session.history was the likely cause of a reported "loopy"/
+        // repeating conversation feel -- the model ends up responding to a
+        // garbled echo of its own last sentence.
+        const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
+        const isEcho = looksLikeEcho(utterance, session._currentSpokenText);
+        if (!echoWindow && !isEcho) handleUtterance(session, utterance);
       }
       return;
     }
@@ -304,8 +311,9 @@ function openDeepgram(session) {
     if (msg.type === 'UtteranceEnd' && session.finalBuf) {
       const utterance = session.finalBuf.trim();
       session.finalBuf = '';
-      const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 500);
-      if (!echoWindow) handleUtterance(session, utterance);
+      const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
+      const isEcho = looksLikeEcho(utterance, session._currentSpokenText);
+      if (!echoWindow && !isEcho) handleUtterance(session, utterance);
     }
   });
 
