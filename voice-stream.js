@@ -290,7 +290,7 @@ function openDeepgram(session) {
   const params = new URLSearchParams({
     encoding: 'mulaw', sample_rate: '8000', channels: '1',
     model: 'nova-2-phonecall', smart_format: 'true', interim_results: 'true',
-    utterance_end_ms: '1000', endpointing: '350', vad_events: 'true',
+    utterance_end_ms: '1000', endpointing: '500', vad_events: 'true', // 350->500ms July 1: 350 finalized on natural mid-sentence breaths (cut Kade off); +150ms per turn is the cost
   });
 
   const dg = new WebSocket(
