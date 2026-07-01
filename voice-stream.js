@@ -30,6 +30,29 @@ function fixPronunciation(t) {
   return t.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
 }
 
+// ── Voice-steering carry-forward (phone path) ────────────────────────────────
+// inworld-tts-proxy's applySteeringTags() carries a leading %%%direction%%% tag
+// forward across paragraph breaks -- but only WITHIN one input string. The phone
+// synthesizes each sentence as its own separate, stateless call to the proxy, so
+// that carry-forward can never fire here: only whichever single sentence Kiana
+// happens to open with a %%%tag%%% ever gets steered, every other sentence in the
+// same reply falls back to flat/default delivery. This mirrors the proxy's own
+// non-verbal/direction distinction and re-implements carry-forward at the
+// reply level, tracked across the separate per-sentence synthesize() calls.
+const NONVERBAL_TAGS = new Set(['laugh', 'breathe', 'clear throat', 'sigh', 'cough', 'yawn']);
+const STEERING_LEAD_RE = /^\s*%%%([\s\S]*?)%%%/;
+
+function applyDirectionCarry(sentence, dirState) {
+  const m = sentence.match(STEERING_LEAD_RE);
+  if (m) {
+    const dir = m[1].trim();
+    if (!NONVERBAL_TAGS.has(dir.toLowerCase())) dirState.active = dir;
+    return sentence; // already tagged -- send as-is
+  }
+  if (dirState.active) return `%%%${dirState.active}%%% ${sentence}`;
+  return sentence;
+}
+
 const PHONE_SUFFIX =
   '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
   'Talk the way you naturally would: warm, engaged, conversational. ' +
@@ -397,9 +420,15 @@ async function streamReply(session, userText) {
   maybeStartThinkingFiller(session, fillerCtx).catch((e) =>
     console.error('[voice-stream] thinking-filler error:', e.message));
 
+  // Tracks a leading %%%direction%%% tag across this one reply's sentences --
+  // see applyDirectionCarry() above. Scoped to this streamReply() call so it
+  // never bleeds into the next turn.
+  const dirState = { active: null };
+
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
-    const synthPromise = synthesize(sentence, session.voice).catch((e) => {
+    const synthInput = applyDirectionCarry(sentence, dirState);
+    const synthPromise = synthesize(synthInput, session.voice).catch((e) => {
       console.error('[voice-stream] synthesis prefetch error:', e.message);
       return null;
     });
