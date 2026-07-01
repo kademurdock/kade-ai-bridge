@@ -222,6 +222,12 @@ function streamPost(urlStr, headers, body) {
       method: 'POST',
       headers: { ...headers, 'Content-Length': payload.length },
     }, resolve);
+    // A hung upstream (the July 1 greeting bug: request out, no response,
+    // no error, ringback looping forever) must become a LOUD error instead
+    // of an eternal wait. 25s of socket inactivity -> destroy + reject.
+    req.setTimeout(25000, () => {
+      req.destroy(new Error(`no response from ${u.hostname} within 25s`));
+    });
     req.on('error', reject);
     req.write(payload);
     req.end();
@@ -518,6 +524,8 @@ async function synthesize(text, voice) {
   const cfg = global._vsConfig;
   const input = fixPronunciation(text).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
+  const t0 = Date.now();
+  console.log(`[voice-stream] synth request: ${input.length} chars, voice "${useVoice}"`);
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech?telephony=1`,
     { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
@@ -526,7 +534,14 @@ async function synthesize(text, voice) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     res.on('data', c => chunks.push(c));
-    res.on('end', () => resolve(Buffer.concat(chunks)));
+    res.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      if (res.statusCode >= 400) {
+        return reject(new Error(`TTS proxy ${res.statusCode}: ${buf.toString('utf8').slice(0, 200)}`));
+      }
+      console.log(`[voice-stream] synth ok: ${buf.length} bytes in ${Date.now() - t0}ms`);
+      resolve(buf);
+    });
     res.on('error', reject);
   });
 }
@@ -905,26 +920,34 @@ function attachMediaStreams(server, users, cfg) {
           session._ringbackActive = true;
           playRingback(session).catch(console.error);
 
-          synthesize(greeting, session.voice)
+          // CRASH FIX (July 1 2026): these continuations used to close over the
+          // MUTABLE `session` variable, which the 'stop' handler nulls at
+          // hang-up. When a hung greeting synth finally errored after the
+          // caller gave up, the .catch dereferenced null and KILLED THE WHOLE
+          // PROCESS (voice-stream.js:925 TypeError -- also masked the real
+          // error, which was next in line to print). Capture the object.
+          const sess = session;
+          synthesize(greeting, sess.voice)
             .then(async (greetingBuf) => {
-              session._ringbackActive = false; // stop ring loop
-              session.sendClear();             // flush queued ring frames from Twilio buffer
+              sess._ringbackActive = false; // stop ring loop
+              if (sess.ws.readyState !== WebSocket.OPEN) return; // caller already gone
+              sess.sendClear();             // flush queued ring frames from Twilio buffer
               await new Promise(r => setTimeout(r, 120)); // brief gap after clear
-              if (session.ws.readyState === WebSocket.OPEN) {
-                await playBuffer(session, greetingBuf);
-              }
+              await playBuffer(sess, greetingBuf);
               // Every call, not just first-timers -- Keighty's call: whoever's
               // in the room with the caller this time needs to hear it too,
               // so it has to stay short rather than gated to a one-time thing.
-              if (session.ws.readyState === WebSocket.OPEN) {
+              if (sess.ws.readyState === WebSocket.OPEN) {
                 const orientation = ORIENTATION_LINES[Math.floor(Math.random() * ORIENTATION_LINES.length)];
-                await speak(session, orientation, session.voice);
+                await speak(sess, orientation, sess.voice);
               }
             })
             .catch((err) => {
-              session._ringbackActive = false;
               console.error('[voice-stream] greeting synthesis error:', err.message);
-              speak(session, 'Hey, give me just a second.', session.voice).catch(() => {});
+              sess._ringbackActive = false;
+              if (sess.ws.readyState === WebSocket.OPEN) {
+                speak(sess, 'Hey, give me just a second.', sess.voice).catch(() => {});
+              }
             });
 
           break;

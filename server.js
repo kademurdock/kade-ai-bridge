@@ -41,6 +41,17 @@ const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
+// A phone bridge must not die because one async callback raced a hang-up.
+// Unhandled rejections get logged loudly and the process stays up; genuinely
+// unknown exceptions still exit(1) so Railway restarts us into a clean state.
+process.on('unhandledRejection', (err) => {
+  console.error('[bridge] UNHANDLED REJECTION (process kept alive):', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[bridge] UNCAUGHT EXCEPTION (exiting for clean restart):', err);
+  process.exit(1);
+});
+
 const TTS_PROXY_URL      = 'https://inworld-tts-proxy-production.up.railway.app';
 const DEFAULT_PHONE_VOICE = process.env.DEFAULT_PHONE_VOICE || 'Kiana (Comedian)';
 const PHONE_BRIEF = 'SYSTEM NOTE (not from the caller): You are on a live phone call. ' +
