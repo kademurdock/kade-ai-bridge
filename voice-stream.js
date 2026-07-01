@@ -535,7 +535,15 @@ async function playBuffer(session, mulawBuf) {
 // real reply is ready to play. Cut instantly via the same `clear` mechanism
 // barge-in already uses, so there's never an audio collision with the real
 // reply or with the caller talking over it.
-const THINK_DELAY_MS = 3000;
+// Trimmed hard per Keighty's ask -- as low as reasonably goes without the
+// sound firing-then-instantly-cutting on essentially every single turn.
+// Heads up on the honest floor here: Deepgram itself already waits ~1-1.5s
+// of real silence before it'll even confirm she's done talking (utterance_end_ms
+// + endpointing in openDeepgram) -- that happens BEFORE this timer starts, and
+// isn't touched here since shrinking it risks cutting her off mid-sentence.
+// So total gap from "she stops talking" to "sound starts" is roughly that
+// ~1-1.5s floor plus this value, not this value alone.
+const THINK_DELAY_MS = 500;
 
 const FILLER_PHRASES = [
   'Mm, hold on a sec.',
