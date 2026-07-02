@@ -13,7 +13,7 @@
 
 const express  = require('express');
 const http     = require('http');
-const { attachMediaStreams } = require('./voice-stream');
+const { attachMediaStreams, synthesize: vsSynthesize } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
 const crypto   = require('crypto');
@@ -894,6 +894,24 @@ app.post('/outbound-call', async (req, res) => {
     return res.status(429).json({ error: 'Platform-wide daily outbound limit reached. Try again tomorrow.' });
   }
 
+  // Compose + PRE-SYNTHESIZE the greeting while we still have time: Twilio
+  // takes several seconds to dial anyway, and having the audio ready means
+  // the callee hears the disclosure the instant they answer — no ringback,
+  // no dead air, no synth race with their "Hello?" (July 2 2026 rework).
+  const outVoice = voice || users.get(e164)?.voice || DEFAULT_PHONE_VOICE;
+  const who = calleeName ? `Hi, is this ${calleeName}?` : 'Hi!';
+  const greetingText =
+    `${who} This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
+    `${userName || 'a Kade-AI user'} — quick note, this call may be recorded. ` +
+    `I'm calling because ${String(purpose).slice(0, 300)}.`;
+  let greetingBuf = null;
+  try {
+    greetingBuf = await vsSynthesize(greetingText, outVoice);
+    console.log(`[outbound] greeting pre-synthesized: ${greetingBuf.length} bytes`);
+  } catch (e) {
+    console.warn('[outbound] greeting pre-synth failed (will synth live):', e.message);
+  }
+
   try {
     const call = await twilioClient.calls.create({
       to: e164,
@@ -919,7 +937,9 @@ app.post('/outbound-call', async (req, res) => {
       to: e164,
       agentId: agentId || DEFAULT_AGENT,
       agentName: agentName || DEFAULT_AGENT_NAME,
-      voice: voice || null,
+      voice: outVoice,
+      greeting: greetingText,
+      greetingBuf,
       startedAt: Date.now(),
       transcript: null,
       recordingSid: null,

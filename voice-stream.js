@@ -68,12 +68,16 @@ const PHONE_SUFFIX =
 // greeting (AI + on whose behalf + recording notice + latency heads-up) and a
 // per-turn mission block so the agent stays on task. The agent ends the call
 // itself by finishing a reply with the exact token [END CALL].
+// Kade's spec (July 2 2026): SHORT. Who I am, who I'm calling for (the
+// anti-prank line -- always names the requesting user, agents can't remove
+// it), recording note, purpose, go. No latency disclaimer -- phone turns
+// stream fast now. The greeting is normally PRE-SYNTHESIZED by server.js at
+// dial time (ctx.greetingBuf) so it plays the instant the callee answers.
 function buildOutboundGreeting(ctx, agentName) {
-  const who = ctx.calleeName ? `Hi, is this ${ctx.calleeName}?` : 'Hi there!';
+  const who = ctx.calleeName ? `Hi, is this ${ctx.calleeName}?` : 'Hi!';
   return (
-    `${who} This is ${agentName} — an A I assistant calling on behalf of ${ctx.userName}. ` +
-    `Quick heads up: this call may be recorded, and I can take a couple seconds between replies, so bear with me. ` +
-    `I'm calling because ${ctx.purpose}. Is now an okay time?`
+    `${who} This is ${agentName}, an A I assistant calling for ${ctx.userName} — ` +
+    `quick note, this call may be recorded. I'm calling because ${ctx.purpose}.`
   );
 }
 
@@ -84,7 +88,9 @@ function buildOutboundSuffix(ctx) {
     `Mission: ${ctx.purpose}. You already introduced yourself as an AI and gave the recording notice. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
     `payments or commitments beyond the mission. If voicemail answered, leave ONE short message covering ` +
-    `the mission, then end. When the mission is done, clearly impossible, or the person wants to stop: ` +
+    `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
+    `numbers, names), say them back out loud once before the goodbye so the transcript captures them for ${ctx.userName}. ` +
+    `When the mission is done, clearly impossible, or the person wants to stop: ` +
     `say a natural goodbye and finish your reply with the exact token [END CALL] ]`
   );
 }
@@ -337,6 +343,10 @@ class CallSession {
 
 // ── Barge-in ──────────────────────────────────────────────────────────────────
 function bargeIn(session) {
+  // Outbound disclosure must finish: the callee's reflexive "Hello?" on
+  // answering must not kill the who-is-calling/recording line (July 2 2026 --
+  // this was the "clips playing on top of each other" bug on Kade's test call).
+  if (session._greetingLock) return;
   if (!session.isSpeaking) return;
   console.log(`[voice-stream] BARGE-IN ${session.streamSid}`);
   session.sendClear();
@@ -424,9 +434,26 @@ function openDeepgram(session) {
 }
 
 // ── Handle utterance ──────────────────────────────────────────────────────────
+function releaseGreetingLock(session) {
+  if (!session._greetingLock) return;
+  session._greetingLock = false;
+  if (session._pending) {
+    const next = session._pending;
+    session._pending = null;
+    handleUtterance(session, next);
+  }
+}
+
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
+  if (session._greetingLock) {
+    // Callee spoke while the outbound greeting was playing (usually "Hello?").
+    // Hold it; releaseGreetingLock() replays it the moment the greeting ends.
+    console.log(`[voice-stream] holding utterance during greeting: "${text.slice(0, 50)}"`);
+    session._pending = session._pending ? `${session._pending} ${text}` : text;
+    return;
+  }
   if (session.busy) {
     if (session.isSpeaking && !session.bargedIn) {
       // Actively speaking with no barge-in registered: a "completed utterance"
@@ -1029,43 +1056,58 @@ function attachMediaStreams(server, users, cfg) {
           ];
           const pick     = (arr) => arr[Math.floor(Math.random() * arr.length)];
           const greeting = outboundCtx
-            ? buildOutboundGreeting(outboundCtx, session.agentName)
+            ? (outboundCtx.greeting || buildOutboundGreeting(outboundCtx, session.agentName))
             : `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
-          // Seed history so the agent knows what it already said on pickup.
-          if (outboundCtx) session.history.push({ role: 'assistant', content: greeting });
+          // Seed history so the agent knows what it already said on pickup,
+          // and lock barge-in until the disclosure finishes playing.
+          if (outboundCtx) {
+            session.history.push({ role: 'assistant', content: greeting });
+            session._greetingLock = true;
+          }
 
-          // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
-          // The ~8-12s between call connect and first Kiana word used to be
-          // total silence. Now: play US ring tone (440+480 Hz) immediately,
-          // then the instant greeting audio is ready, clear it and speak.
-          session._ringbackActive = true;
-          playRingback(session).catch(console.error);
-
-          // CRASH FIX (July 1 2026): these continuations used to close over the
-          // MUTABLE `session` variable, which the 'stop' handler nulls at
-          // hang-up. When a hung greeting synth finally errored after the
-          // caller gave up, the .catch dereferenced null and KILLED THE WHOLE
-          // PROCESS (voice-stream.js:925 TypeError -- also masked the real
-          // error, which was next in line to print). Capture the object.
+          // ── Greeting playback ────────────────────────────────────────────
+          // INBOUND: ringback covers the synth wait (caller expects ringing).
+          // OUTBOUND (July 2 2026 rework after Kade's broken test call): the
+          // callee just ANSWERED — fake ringback in their ear is wrong, and
+          // was half of the "clips on top of each other" mess. No ringback;
+          // the greeting is normally pre-synthesized at dial time
+          // (ctx.greetingBuf) so it starts the moment the stream opens.
+          //
+          // CRASH FIX (July 1 2026): these continuations used to close over
+          // the MUTABLE `session` variable, which the 'stop' handler nulls at
+          // hang-up. Capture the object.
           const sess = session;
-          synthesize(greeting, sess.voice, sess.rate)
-            .then(async (greetingBuf) => {
+          const playGreeting = async (greetingBuf) => {
+            if (!outboundCtx) {
               sess._ringbackActive = false; // stop ring loop
-              if (sess.ws.readyState !== WebSocket.OPEN) return; // caller already gone
-              sess.sendClear();             // flush queued ring frames from Twilio buffer
-              await new Promise(r => setTimeout(r, 120)); // brief gap after clear
-              await playBuffer(sess, greetingBuf);
-              // Orientation line is now INSIDE greetingBuf (before the
-              // invite) -- no separate speak() here, no trailing-silence
-              // bait, nothing for barge-in to skip.
-            })
-            .catch((err) => {
-              console.error('[voice-stream] greeting synthesis error:', err.message);
-              sess._ringbackActive = false;
-              if (sess.ws.readyState === WebSocket.OPEN) {
-                speak(sess, 'Hey, give me just a second.', sess.voice).catch(() => {});
-              }
-            });
+              if (sess.ws.readyState !== WebSocket.OPEN) return;
+              sess.sendClear();             // flush queued ring frames
+              await new Promise(r => setTimeout(r, 120));
+            }
+            if (sess.ws.readyState !== WebSocket.OPEN) return;
+            await playBuffer(sess, greetingBuf);
+            releaseGreetingLock(sess);
+          };
+          const greetingFailed = (err) => {
+            console.error('[voice-stream] greeting playback/synthesis error:', err.message);
+            sess._ringbackActive = false;
+            releaseGreetingLock(sess);
+            if (sess.ws.readyState === WebSocket.OPEN) {
+              speak(sess, 'Hey, give me just a second.', sess.voice).catch(() => {});
+            }
+          };
+
+          if (outboundCtx && outboundCtx.greetingBuf) {
+            playGreeting(outboundCtx.greetingBuf).catch(greetingFailed);
+          } else {
+            if (!outboundCtx) {
+              session._ringbackActive = true;
+              playRingback(session).catch(console.error);
+            }
+            synthesize(greeting, sess.voice, sess.rate).then(playGreeting).catch(greetingFailed);
+          }
+          // Safety: the lock must never outlive a stuck playback.
+          setTimeout(() => releaseGreetingLock(sess), 20000);
 
           break;
         }
@@ -1116,4 +1158,4 @@ function attachMediaStreams(server, users, cfg) {
   return wss;
 }
 
-module.exports = { attachMediaStreams };
+module.exports = { attachMediaStreams, synthesize };
