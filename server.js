@@ -1026,7 +1026,7 @@ app.post('/outbound-call', async (req, res) => {
     t = t.replace(/\s+/g, ' ').trim();
     if (!t) return "I'm calling on their behalf";
     const endPunct = /[.?!]$/.test(t) ? '' : '.';
-    if (/^(?:to\s+)?(?:ask|find out|check|see|confirm|verify|make sure)\b/i.test(t)) {
+    if (/^(?:to\s+)?(?:ask|find out|check|see|confirm|verify|make sure|place|order|book|schedule|cancel|request|remind|tell|invite|wish|set up|pick up|drop off|let)\b/i.test(t)) {
       t = t.replace(/^to\s+/i, '');
       return `I'm calling to ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
     }
