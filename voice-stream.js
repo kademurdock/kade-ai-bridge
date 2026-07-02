@@ -677,6 +677,10 @@ async function streamReply(session, userText) {
   );
 
   session.llmAbort = false;
+  // KADE July 2 2026 (round 5): endCallRequested is per-TURN, not per-session.
+  // It used to stick across turns once set, so a second streamReply could
+  // re-request the hang-up (seen live: double "agent requested hang-up").
+  session.endCallRequested = false;
   const streamer = new SentenceStreamer();
   let fullReply = '';
   let playChain = Promise.resolve();
@@ -791,11 +795,23 @@ async function streamReply(session, userText) {
   if (fullReply) {
     session.history.push({ role: 'assistant', content: fullReply.replace(/\[END CALL\]/gi, '').trim() });
   }
+  const turnWasAborted = session.llmAbort;
   session.llmAbort = false;
   if (session.endCallRequested && session.outbound && session.cfg.endCall) {
-    console.log(`[voice-stream] agent requested hang-up for ${session.callSid}`);
-    const sid = session.callSid;
-    setTimeout(() => session.cfg.endCall(sid), 1500); // let the goodbye audio drain
+    if (turnWasAborted) {
+      // KADE July 2 2026 (round 5, live pizza-call bug): a barge-in landing at
+      // the same moment as the goodbye reply flushed the goodbye audio
+      // (llmAbort skips the playChain) but the hang-up still fired -- the
+      // callee heard typing sounds, then a dead line, no goodbye at all.
+      // If the goodbye never played, DON'T hang up: the barge-in utterance
+      // becomes a normal next turn and the agent can wrap up properly.
+      console.log(`[voice-stream] hang-up IGNORED (goodbye turn was aborted before it played) for ${session.callSid}`);
+      session.endCallRequested = false;
+    } else {
+      console.log(`[voice-stream] agent requested hang-up for ${session.callSid}`);
+      const sid = session.callSid;
+      setTimeout(() => session.cfg.endCall(sid), 1500); // let the goodbye audio drain
+    }
   }
 }
 
