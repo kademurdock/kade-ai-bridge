@@ -63,6 +63,32 @@ const PHONE_SUFFIX =
   'Don\'t do this every turn — only when it genuinely fits. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
+// ── Outbound-call context (July 1 2026) ──────────────────────────────────────
+// An outbound call is the same pipeline with a scripted, disclosure-first
+// greeting (AI + on whose behalf + recording notice + latency heads-up) and a
+// per-turn mission block so the agent stays on task. The agent ends the call
+// itself by finishing a reply with the exact token [END CALL].
+function buildOutboundGreeting(ctx, agentName) {
+  const who = ctx.calleeName ? `Hi, is this ${ctx.calleeName}?` : 'Hi there!';
+  return (
+    `${who} This is ${agentName} — an A I assistant calling on behalf of ${ctx.userName}. ` +
+    `Quick heads up: this call may be recorded, and I can take a couple seconds between replies, so bear with me. ` +
+    `I'm calling because ${ctx.purpose}. Is now an okay time?`
+  );
+}
+
+function buildOutboundSuffix(ctx) {
+  return (
+    `\n\n[OUTBOUND CALL CONTEXT — you (${ctx.agentName}) placed this call to ` +
+    `${ctx.calleeName || 'the person who answered'} on behalf of ${ctx.userName}, a Kade-AI user. ` +
+    `Mission: ${ctx.purpose}. You already introduced yourself as an AI and gave the recording notice. ` +
+    `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
+    `payments or commitments beyond the mission. If voicemail answered, leave ONE short message covering ` +
+    `the mission, then end. When the mission is done, clearly impossible, or the person wants to stop: ` +
+    `say a natural goodbye and finish your reply with the exact token [END CALL] ]`
+  );
+}
+
 const PHONE_VOICES = [
   'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
   'Amy', 'Hannah', 'Kiana (Comedian)', 'Zadiana', 'Honey', 'Sadie',
@@ -486,7 +512,7 @@ async function streamReply(session, userText) {
   while (session.history.length > 60) session.history.shift();
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX }
+      ? { ...m, content: m.content + PHONE_SUFFIX + (session.outboundSuffix || '') }
       : m
   );
 
@@ -510,6 +536,11 @@ async function streamReply(session, userText) {
 
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
+    if (/\[END CALL\]/i.test(sentence)) {
+      session.endCallRequested = true;
+      sentence = sentence.replace(/\[END CALL\]/gi, '').trim();
+      if (sentence.length < 2) return; // token-only fragment, nothing to speak
+    }
     const synthInput = applyDirectionCarry(sentence, dirState);
     const synthPromise = synthesize(synthInput, session.voice, session.rate).catch((e) => {
       console.error('[voice-stream] synthesis prefetch error:', e.message);
@@ -573,8 +604,15 @@ async function streamReply(session, userText) {
   if (!session.llmAbort) streamer.end();
   await playChain;
   fillerCtx.firstAudioReady = true; // safety: stop the filler loop even on an empty/aborted reply
-  if (fullReply) session.history.push({ role: 'assistant', content: fullReply });
+  if (fullReply) {
+    session.history.push({ role: 'assistant', content: fullReply.replace(/\[END CALL\]/gi, '').trim() });
+  }
   session.llmAbort = false;
+  if (session.endCallRequested && session.outbound && session.cfg.endCall) {
+    console.log(`[voice-stream] agent requested hang-up for ${session.callSid}`);
+    const sid = session.callSid;
+    setTimeout(() => session.cfg.endCall(sid), 1500); // let the goodbye audio drain
+  }
 }
 
 // ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
@@ -933,7 +971,17 @@ function attachMediaStreams(server, users, cfg) {
           const from   = params.from || 'unknown';
           const user   = users.get(from);
           session = new CallSession(streamSid, callSid, from, user, ws, global._vsConfig);
-          console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}`);
+          const outboundCtx = params.outbound === '1' && global._vsConfig.getOutboundCtx
+            ? global._vsConfig.getOutboundCtx(callSid)
+            : null;
+          if (outboundCtx) {
+            session.outbound  = true;
+            session.agentId   = outboundCtx.agentId   || session.agentId;
+            session.agentName = outboundCtx.agentName || session.agentName;
+            if (outboundCtx.voice) session.voice = outboundCtx.voice;
+            session.outboundSuffix = buildOutboundSuffix(outboundCtx);
+          }
+          console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
 
           session.dgWs = openDeepgram(session);
 
@@ -980,7 +1028,11 @@ function attachMediaStreams(server, users, cfg) {
             `I'm all ears — go ahead.`,
           ];
           const pick     = (arr) => arr[Math.floor(Math.random() * arr.length)];
-          const greeting = `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
+          const greeting = outboundCtx
+            ? buildOutboundGreeting(outboundCtx, session.agentName)
+            : `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
+          // Seed history so the agent knows what it already said on pickup.
+          if (outboundCtx) session.history.push({ role: 'assistant', content: greeting });
 
           // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
           // The ~8-12s between call connect and first Kiana word used to be
@@ -1030,6 +1082,9 @@ function attachMediaStreams(server, users, cfg) {
         case 'stop': {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           if (session) {
+            if (session.outbound && global._vsConfig.onCallEnd) {
+              try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
+            }
             session._ringbackActive = false;
             session.llmAbort = true;
             session.isSpeaking = false;
@@ -1043,6 +1098,9 @@ function attachMediaStreams(server, users, cfg) {
 
     ws.on('close', () => {
       if (session) {
+        if (session.outbound && global._vsConfig.onCallEnd) {
+          try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
+        }
         session._ringbackActive = false;
         session.llmAbort = true;
         session.isSpeaking = false;

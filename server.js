@@ -804,66 +804,147 @@ app.post('/voice-ws', (req, res) => {
 });
 
 
-// ── Outbound calls (staged — enable with ENABLE_OUTBOUND=true Railway env var) ──
+// ── Outbound calling v2 (July 1 2026 — per-user spend, recording, caps) ──────
 //
+// Trigger path: a user asks an agent in chat -> the fork's kade_phone_call tool
+// POSTs here with that user's LibreChat identity -> we dial out, run the normal
+// Media-Streams pipeline, cap duration server-side, record for QA, and once the
+// call completes we fetch Twilio's actual price and post a usage event to the
+// fork so the cost lands on THAT user's Feed-the-Server page.
+//
+// Money/safety rails, all env-tunable:
+//   ENABLE_OUTBOUND=true            master switch (503 otherwise)
+//   OUTBOUND_TIME_LIMIT_SEC=900     Twilio hard-kills the call at this age
+//   OUTBOUND_DAILY_LIMIT=4          calls per platform user per UTC day
+//   OUTBOUND_GLOBAL_DAILY_LIMIT=20  everyone combined per UTC day
+//   OUTBOUND_DEST_COOLDOWN_MIN=10   same destination can't be redialed sooner
+//   OUTBOUND_RECORD=1               dual-channel recording (0 = off)
+// US/Canada 10-digit numbers only; premium (900/976) and our own number blocked.
+// The scripted greeting always discloses: AI + on whose behalf + may be recorded.
+
+const ENABLE_OUTBOUND = !!process.env.ENABLE_OUTBOUND;
+const OUTBOUND_TIME_LIMIT_SEC     = parseInt(process.env.OUTBOUND_TIME_LIMIT_SEC || '900', 10);
+const OUTBOUND_DAILY_LIMIT        = parseInt(process.env.OUTBOUND_DAILY_LIMIT || '4', 10);
+const OUTBOUND_GLOBAL_DAILY_LIMIT = parseInt(process.env.OUTBOUND_GLOBAL_DAILY_LIMIT || '20', 10);
+const OUTBOUND_DEST_COOLDOWN_MS   = parseInt(process.env.OUTBOUND_DEST_COOLDOWN_MIN || '10', 10) * 60 * 1000;
+const OUTBOUND_RECORD    = process.env.OUTBOUND_RECORD !== '0';
+const FORK_USAGE_URL     = (process.env.FORK_USAGE_URL || LIBRECHAT_URL).replace(/\/$/, '');
+const USAGE_EVENT_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
+const OUR_NUMBER         = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
+const RECORDING_USD_PER_MIN = 0.0025; // Twilio recording rate; call-leg price comes from Twilio itself
+
+const OUTBOUND_LOG_FILE   = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outbound-calls.json');
+const OUTBOUND_DAILY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outbound-daily.json');
+
+function loadJsonFile(file, fallback) {
+  try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  return fallback;
+}
+function saveJsonFile(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data)); }
+  catch (e) { console.error(`[outbound] could not save ${path.basename(file)}:`, e.message); }
+}
+
+const outboundLog  = loadJsonFile(OUTBOUND_LOG_FILE, []); // finalized call records (capped at 500)
+const outboundMeta = new Map();                           // callSid -> live call context
+const lastDialed   = new Map();                           // e164 -> ts of last outbound dial
+
+function todayUTC() { return new Date().toISOString().slice(0, 10); }
+function getDaily() {
+  const d = loadJsonFile(OUTBOUND_DAILY_FILE, {});
+  if (d.date !== todayUTC()) return { date: todayUTC(), byUser: {}, total: 0 };
+  return d;
+}
+
+function normalizeUsPhone(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  const ten = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+  if (ten.length !== 10) return null;
+  if (/^(900|976)/.test(ten)) return null;              // premium-rate
+  if (!/^[2-9]\d{2}[2-9]\d{6}$/.test(ten)) return null; // NANP shape (also rejects x11 area codes)
+  const e164 = `+1${ten}`;
+  if (e164 === OUR_NUMBER) return null;
+  return e164;
+}
+
 // POST /outbound-call
-// Body (JSON): { "to": "+14175551234", "secret": "<BRIDGE_SECRET>", "agentId"?: "agent_xxx" }
-// Initiates an outbound Twilio call to the given number, routing through the
-// existing Media Streams pipeline (/voice-ws) so the caller gets the full
-// streaming Kiana experience. The agent defaults to whoever is registered for
-// that number, or Kiana if unknown.
-//
-// To enable: set Railway env var ENABLE_OUTBOUND=true on kade-ai-bridge.
-// To disable: remove or set ENABLE_OUTBOUND= (empty) — the endpoint returns 503.
+// Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
-  if (!process.env.ENABLE_OUTBOUND) {
-    return res.status(503).json({ error: 'Outbound calls not enabled. Set ENABLE_OUTBOUND=true to activate.' });
-  }
-  const { to, agentId, agentName, secret } = req.body;
+  if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
+  const { to, secret, userId, userName, purpose, calleeName, agentId, agentName, voice } = req.body || {};
   if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
-  if (!to) return res.status(400).json({ error: 'to (phone number) required' });
   if (!twilioClient) return res.status(500).json({ error: 'Twilio not configured' });
+  if (!userId) return res.status(400).json({ error: 'userId required — whose spend page does this call bill to?' });
+  if (!purpose || String(purpose).trim().length < 3) {
+    return res.status(400).json({ error: 'purpose required — a short plain-language reason for the call' });
+  }
+  const e164 = normalizeUsPhone(to);
+  if (!e164) return res.status(400).json({ error: 'to must be a valid, non-premium US/Canada 10-digit number' });
 
-  const digits = String(to).replace(/\D/g, '');
-  const e164   = digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
-  const ourNum = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
-
-  // Ensure the callee is registered so the bridge knows their name/agent.
-  // If they already have a record, leave it alone.  If agentId is passed
-  // explicitly, use that; otherwise fall back to DEFAULT_AGENT (Kiana).
-  if (!users.has(e164)) {
-    users.set(e164, {
-      name: 'there',
-      agentId:   agentId   || DEFAULT_AGENT,
-      agentName: agentName || DEFAULT_AGENT_NAME,
-    });
-    saveUsers();
-    console.log(`[bridge] Auto-registered ${e164} for outbound call`);
+  const last = lastDialed.get(e164);
+  if (last && Date.now() - last < OUTBOUND_DEST_COOLDOWN_MS) {
+    const waitMin = Math.ceil((OUTBOUND_DEST_COOLDOWN_MS - (Date.now() - last)) / 60000);
+    return res.status(429).json({ error: `That number was called very recently. Try again in about ${waitMin} minute(s).` });
+  }
+  const daily = getDaily();
+  if ((daily.byUser[userId] || 0) >= OUTBOUND_DAILY_LIMIT) {
+    return res.status(429).json({ error: `Daily outbound limit reached (${OUTBOUND_DAILY_LIMIT} calls per person per day).` });
+  }
+  if (daily.total >= OUTBOUND_GLOBAL_DAILY_LIMIT) {
+    return res.status(429).json({ error: 'Platform-wide daily outbound limit reached. Try again tomorrow.' });
   }
 
   try {
     const call = await twilioClient.calls.create({
-      to:   e164,
-      from: ourNum,
-      // When Twilio connects, it hits /voice-ws-outbound which returns the
-      // same <Connect><Stream> TwiML as /voice-ws, but passes the callee's
-      // number so the WebSocket handler can look them up as the "caller."
-      url:    `${PUBLIC_URL}/voice-ws-outbound?userPhone=${encodeURIComponent(e164)}`,
+      to: e164,
+      from: OUR_NUMBER,
+      url: `${PUBLIC_URL}/voice-ws-outbound?userPhone=${encodeURIComponent(e164)}`,
       method: 'POST',
-      statusCallback:       `${PUBLIC_URL}/voice-status`,
+      timeLimit: OUTBOUND_TIME_LIMIT_SEC,
+      record: OUTBOUND_RECORD,
+      ...(OUTBOUND_RECORD ? {
+        recordingChannels: 'dual',
+        recordingStatusCallback: `${PUBLIC_URL}/recording-status`,
+        recordingStatusCallbackMethod: 'POST',
+      } : {}),
+      statusCallback: `${PUBLIC_URL}/voice-status`,
       statusCallbackMethod: 'POST',
     });
-    console.log(`[bridge] Outbound call initiated: ${call.sid} → ${e164}`);
-    res.json({ ok: true, callSid: call.sid, to: e164 });
+    outboundMeta.set(call.sid, {
+      callSid: call.sid,
+      userId,
+      userName: userName || 'a Kade-AI user',
+      purpose: String(purpose).slice(0, 500),
+      calleeName: calleeName || null,
+      to: e164,
+      agentId: agentId || DEFAULT_AGENT,
+      agentName: agentName || DEFAULT_AGENT_NAME,
+      voice: voice || null,
+      startedAt: Date.now(),
+      transcript: null,
+      recordingSid: null,
+      recordingUrl: null,
+      finalized: false,
+    });
+    lastDialed.set(e164, Date.now());
+    daily.byUser[userId] = (daily.byUser[userId] || 0) + 1;
+    daily.total += 1;
+    saveJsonFile(OUTBOUND_DAILY_FILE, daily);
+    console.log(`[outbound] call ${call.sid} -> ${e164} for user ${userId} (${daily.byUser[userId]}/${OUTBOUND_DAILY_LIMIT} today)`);
+    res.json({
+      ok: true, callSid: call.sid, to: e164,
+      timeLimitMin: Math.round(OUTBOUND_TIME_LIMIT_SEC / 60),
+      callsLeftToday: OUTBOUND_DAILY_LIMIT - daily.byUser[userId],
+    });
   } catch (err) {
-    console.error('[bridge] Outbound call failed:', err.message);
+    console.error('[outbound] call create failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// TwiML for outbound Media Streams calls.
-// The user's phone number comes from the query param (Twilio doesn't put it in
-// From for outbound calls — our To becomes their From in the WS session).
+// TwiML for outbound Media Streams calls. The callee's number rides a query
+// param (our To becomes their From in the WS session); outbound=1 tells
+// voice-stream.js to run the outbound greeting + mission context.
 app.post('/voice-ws-outbound', (req, res) => {
   const userPhone = req.query.userPhone || req.body.To || 'unknown';
   const callSid   = req.body.CallSid || '';
@@ -871,17 +952,169 @@ app.post('/voice-ws-outbound', (req, res) => {
   const connect   = twiml.connect();
   const wsHost    = process.env.RAILWAY_PUBLIC_DOMAIN || 'kade-ai-bridge-production.up.railway.app';
   const stream    = connect.stream({ url: `wss://${wsHost}/ws/media` });
-  stream.parameter({ name: 'from',    value: userPhone });
-  stream.parameter({ name: 'callSid', value: callSid });
+  stream.parameter({ name: 'from',     value: userPhone });
+  stream.parameter({ name: 'callSid',  value: callSid });
+  stream.parameter({ name: 'outbound', value: '1' });
   res.type('text/xml').send(twiml.toString());
 });
 
-// Call status callback (logs only — no action taken).
+// Call status callback — finalizes outbound calls once they end.
 app.post('/voice-status', (req, res) => {
-  const { CallSid, CallStatus, To, From } = req.body;
-  console.log(`[bridge] Call status: sid=${CallSid} ${From}→${To} status=${CallStatus}`);
+  const { CallSid, CallStatus, To, From, CallDuration } = req.body;
+  console.log(`[bridge] Call status: sid=${CallSid} ${From}->${To} status=${CallStatus}${CallDuration ? ` dur=${CallDuration}s` : ''}`);
+  const meta = outboundMeta.get(CallSid);
+  if (meta && !meta.finalized && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(CallStatus)) {
+    meta.finalized = true;
+    meta.finalStatus = CallStatus;
+    meta.durationSec = parseInt(CallDuration || '0', 10);
+    // Give Twilio ~45s to compute price and land recording callbacks first.
+    setTimeout(() => finalizeOutboundCall(CallSid).catch((e) =>
+      console.error('[outbound] finalize error:', e.message)), 45000);
+  }
   res.status(200).end();
 });
+
+// Recording status callback — stashes the recording pointer for QA review.
+app.post('/recording-status', (req, res) => {
+  const { CallSid, RecordingSid, RecordingUrl, RecordingDuration } = req.body;
+  const meta = outboundMeta.get(CallSid);
+  if (meta) {
+    meta.recordingSid = RecordingSid || meta.recordingSid;
+    meta.recordingUrl = RecordingUrl || meta.recordingUrl;
+    meta.recordingDurationSec = parseInt(RecordingDuration || '0', 10) || meta.recordingDurationSec;
+  } else {
+    // Finalize may have already run — patch the saved record instead.
+    const rec = outboundLog.find((r) => r.callSid === CallSid);
+    if (rec) {
+      rec.recordingSid = RecordingSid;
+      rec.recordingUrl = RecordingUrl;
+      saveJsonFile(OUTBOUND_LOG_FILE, outboundLog);
+    }
+  }
+  console.log(`[outbound] recording for ${CallSid}: ${RecordingSid || 'n/a'}`);
+  res.status(200).end();
+});
+
+async function finalizeOutboundCall(callSid) {
+  const meta = outboundMeta.get(callSid);
+  if (!meta) return;
+  let price = null;
+  let duration = meta.durationSec || 0;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const call = await twilioClient.calls(callSid).fetch();
+      duration = parseInt(call.duration, 10) || duration;
+      if (call.price != null) { price = Math.abs(parseFloat(call.price)); break; }
+    } catch (e) { console.warn(`[outbound] price fetch ${attempt}/3 failed:`, e.message); }
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 30000));
+  }
+  const minutes = duration > 0 ? duration / 60 : 0;
+  // Fallback estimate if Twilio hasn't priced the call yet (~1.4 cents/min).
+  const callUSD = price != null ? price : Math.ceil(minutes) * 0.014;
+  const recUSD  = meta.recordingSid ? minutes * RECORDING_USD_PER_MIN : 0;
+  const costUSD = Math.round((callUSD + recUSD) * 10000) / 10000;
+
+  const record = {
+    callSid,
+    at: new Date(meta.startedAt).toISOString(),
+    userId: meta.userId,
+    userName: meta.userName,
+    to: meta.to,
+    calleeName: meta.calleeName,
+    purpose: meta.purpose,
+    agentId: meta.agentId,
+    agentName: meta.agentName,
+    status: meta.finalStatus || 'completed',
+    durationSec: duration,
+    twilioPriceUSD: price,
+    costUSD,
+    recordingSid: meta.recordingSid,
+    recordingUrl: meta.recordingUrl,
+    transcript: meta.transcript || null,
+  };
+  outboundLog.push(record);
+  while (outboundLog.length > 500) outboundLog.shift();
+  saveJsonFile(OUTBOUND_LOG_FILE, outboundLog);
+  outboundMeta.delete(callSid);
+  console.log(`[outbound] finalized ${callSid}: status=${record.status} ${duration}s $${costUSD}`);
+
+  // Land the spend on the user's Feed-the-Server page via the fork.
+  if (USAGE_EVENT_SECRET && meta.userId && duration > 0) {
+    const body = {
+      secret: USAGE_EVENT_SECRET,
+      userId: meta.userId,
+      service: 'phone',
+      quantity: Math.round(minutes * 10) / 10,
+      unit: 'minutes',
+      costUSD,
+      metadata: {
+        callSid,
+        to: meta.to.replace(/\d(?=\d{4})/g, '*'),
+        direction: 'outbound',
+        agent: meta.agentName,
+        purpose: meta.purpose.slice(0, 120),
+      },
+    };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await axios.post(`${FORK_USAGE_URL}/api/kade/usage-event`, body, {
+          headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000,
+        });
+        console.log(`[outbound] usage event posted for user ${meta.userId}: $${costUSD}`);
+        break;
+      } catch (e) {
+        console.warn(`[outbound] usage post ${attempt}/3 failed:`, e.message);
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 15000));
+      }
+    }
+  }
+}
+
+// Admin: list outbound calls. ?full=1 includes transcripts.
+app.get('/outbound/calls', (req, res) => {
+  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const full = req.query.full === '1';
+  const rows = [...outboundLog].reverse().slice(0, 50).map((r) =>
+    full ? r : { ...r, transcript: r.transcript ? `${r.transcript.length} turns (add &full=1)` : null });
+  res.json({ count: outboundLog.length, calls: rows });
+});
+
+// Admin: stream a call recording as mp3 (proxies Twilio auth so a plain
+// browser link works — needed for QA listening).
+app.get('/outbound/recording/:callSid', async (req, res) => {
+  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const rec = outboundLog.find((r) => r.callSid === req.params.callSid) || outboundMeta.get(req.params.callSid);
+  if (!rec || !rec.recordingUrl) return res.status(404).json({ error: 'No recording for that call (yet?)' });
+  try {
+    const r = await axios.get(`${rec.recordingUrl}.mp3`, {
+      responseType: 'stream',
+      auth: { username: TWILIO_SID, password: TWILIO_TOKEN },
+      timeout: 20000,
+    });
+    res.set('Content-Type', 'audio/mpeg');
+    r.data.pipe(res);
+  } catch (e) {
+    res.status(502).json({ error: `Could not fetch recording: ${e.message}` });
+  }
+});
+
+// Hooks for voice-stream.js
+function getOutboundCtx(callSid) { return outboundMeta.get(callSid) || null; }
+function onCallEnd(callSid, history) {
+  const meta = outboundMeta.get(callSid);
+  if (meta) {
+    meta.transcript = (history || []).map((m) => ({
+      role: m.role,
+      content: String(m.content || '').slice(0, 2000),
+    }));
+  }
+}
+async function endCall(callSid) {
+  try {
+    await twilioClient.calls(callSid).update({ status: 'completed' });
+    console.log(`[outbound] agent ended call ${callSid}`);
+  } catch (e) { console.warn('[outbound] endCall failed:', e.message); }
+}
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
@@ -898,6 +1131,9 @@ attachMediaStreams(server, users, {
   saveUsers,
   seenCallNumbers,
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
+  getOutboundCtx,
+  onCallEnd,
+  endCall,
 });
 
 server.listen(port, () => {
