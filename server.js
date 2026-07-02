@@ -883,6 +883,14 @@ const OUTBOUND_TIME_LIMIT_SEC     = parseInt(process.env.OUTBOUND_TIME_LIMIT_SEC
 const OUTBOUND_DAILY_LIMIT        = parseInt(process.env.OUTBOUND_DAILY_LIMIT || '4', 10);
 const OUTBOUND_GLOBAL_DAILY_LIMIT = parseInt(process.env.OUTBOUND_GLOBAL_DAILY_LIMIT || '20', 10);
 const OUTBOUND_DEST_COOLDOWN_MS   = parseInt(process.env.OUTBOUND_DEST_COOLDOWN_MIN || '10', 10) * 60 * 1000;
+// KADE July 2 2026: per-user outbound DESTINATION allowlist (kid/family accounts).
+// OUTBOUND_USER_ALLOWLIST is JSON: { "<librechat userId>": "registry" | ["+14175551234", "registry"] }
+// "registry" = any phone number currently registered on this bridge (i.e. family).
+// Users absent from the map keep the existing unrestricted behavior.
+const OUTBOUND_USER_ALLOWLIST = (() => {
+  try { return JSON.parse(process.env.OUTBOUND_USER_ALLOWLIST || '{}'); }
+  catch (e) { console.error('[outbound] OUTBOUND_USER_ALLOWLIST is not valid JSON — treating as empty:', e.message); return {}; }
+})();
 const OUTBOUND_RECORD    = process.env.OUTBOUND_RECORD !== '0';
 const FORK_USAGE_URL     = (process.env.FORK_USAGE_URL || LIBRECHAT_URL).replace(/\/$/, '');
 const USAGE_EVENT_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
@@ -948,6 +956,23 @@ app.post('/outbound-call', async (req, res) => {
   }
   const e164 = normalizeUsPhone(to);
   if (!e164) return res.status(400).json({ error: 'to must be a valid, non-premium US/Canada 10-digit number' });
+
+  // Per-user destination allowlist (see OUTBOUND_USER_ALLOWLIST above).
+  const allowRule = OUTBOUND_USER_ALLOWLIST[String(userId)];
+  if (allowRule) {
+    const rules = Array.isArray(allowRule) ? allowRule : [allowRule];
+    const allowed = new Set();
+    for (const r of rules) {
+      if (r === 'registry') { for (const num of users.keys()) allowed.add(num); }
+      else { const n = normalizeUsPhone(r); if (n) allowed.add(n); }
+    }
+    if (!allowed.has(e164)) {
+      console.log(`[outbound] BLOCKED by allowlist: user ${userId} tried ${e164}`);
+      return res.status(403).json({
+        error: 'This account can only call approved family numbers. That number is not on the approved list.',
+      });
+    }
+  }
 
   const last = lastDialed.get(e164);
   if (last && Date.now() - last < OUTBOUND_DEST_COOLDOWN_MS) {
