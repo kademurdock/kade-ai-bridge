@@ -1033,6 +1033,17 @@ app.post('/outbound-call', async (req, res) => {
     if (/\?$/.test(t) || /^(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|what|when|where|who|why|how)\b/i.test(t)) {
       return `I've got a quick question — ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
     }
+    // KADE July 2 2026 (round 5): a NOUN-PHRASE purpose ("fun test call from her
+    // big sister...") glued onto "because" reads broken. If none of the first
+    // few words is a verb-ish token, the text has no clause — frame with
+    // "about" instead. Clauses ("she wants...", "Skylee asked...") still get
+    // "because".
+    const firstWords = t.split(/\s+/).slice(0, 3);
+    const VERBISH = /^(?:is|are|was|were|am|be|has|have|had|do|does|did|want|wants|wanted|need|needs|needed|ask|asks|asked|say|says|said|told|tell|tells|think|thinks|thought|hope|hopes|hoped|wonder|wonders|wondered|would|will|should|can|could|may|might|must|let|lets|got|get|gets|there's|it's|she's|he's|i'm|we're|they're|you're)$/i;
+    const hasEarlyVerb = firstWords.some((w) => VERBISH.test(w.replace(/[^a-z']/gi, '')));
+    if (!hasEarlyVerb) {
+      return `I'm calling about ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
+    }
     return `I'm calling because ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
   };
   // First name only when speaking (Kade's ask: "calling for Kade", not
