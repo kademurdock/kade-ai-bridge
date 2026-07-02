@@ -737,6 +737,9 @@ async function streamReply(session, userText) {
   // never bleeds into the next turn.
   const dirState = { active: null };
 
+  let sentCount = 0;              // spoken sentences this turn (ramble hint)
+  let rambleHintQueued = false;   // once per turn
+
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
     if (/\[END CALL\]/i.test(sentence)) {
@@ -749,8 +752,30 @@ async function streamReply(session, userText) {
       console.error('[voice-stream] synthesis prefetch error:', e.message);
       return null;
     });
+    const sentenceIndex = ++sentCount;
+    // Self-interrupt hint: the arrival of sentence N+1 proves the turn is
+    // still going -- play the hint right before it. Prefetch now so the hint
+    // never stalls the sentence pipeline.
+    let ramblePromise = null;
+    if (
+      RAMBLE_HINT_AFTER > 0 &&
+      sentenceIndex === RAMBLE_HINT_AFTER + 1 &&
+      !rambleHintQueued &&
+      !session.outbound &&
+      !session.endCallRequested
+    ) {
+      rambleHintQueued = true;
+      ramblePromise = getRambleClip(session.voice, session.rate).catch((e) => {
+        console.error('[voice-stream] ramble-hint synth error:', e.message);
+        return null;
+      });
+    }
     playChain = playChain.then(async () => {
       if (session.llmAbort) return;
+      if (ramblePromise) {
+        const hintBuf = await ramblePromise;
+        if (hintBuf && !session.llmAbort) await playBuffer(session, hintBuf);
+      }
       const mulawBuf = await synthPromise;
       if (mulawBuf && !session.llmAbort) {
         if (!fillerCtx.firstAudioReady) {
@@ -1018,6 +1043,96 @@ async function getFillerClip(voice) {
   if (_fillerCache.has(key)) return _fillerCache.get(key);
   const buf = await synthesize(FILLER_PHRASES[idx], voice);
   _fillerCache.set(key, buf);
+  return buf;
+}
+
+// ── WISHLIST (July 2 2026, Kade's go): LLM-generated inbound greetings ───────
+// Instead of the canned opener pool, ask the AGENT ITSELF for a one-line
+// pickup opener at call start. Inbound only: ringback is already covering the
+// setup wait, so the extra LLM round-trip hides under ringing the caller
+// expects. Hard timeout + canned fallback: the canned path is byte-identical
+// to the old behavior, so a slow/failed LLM call can never make pickup WORSE.
+// Outbound calls keep their scripted two-phase disclosure greeting untouched.
+const PHONE_LLM_GREETING = process.env.PHONE_LLM_GREETING !== '0';
+const GREETING_LLM_TIMEOUT_MS = parseInt(process.env.PHONE_GREETING_TIMEOUT_MS || '4500', 10);
+
+async function fetchLlmOpener(session, user) {
+  const name = user?.name;
+  const instruction = name
+    ? `[PHONE CALL SYSTEM NOTE] ${name} is calling you on the phone right now and you are picking up. Reply with ONLY your pickup line: one short, fresh, in-character opener greeting ${name} by name (work your own name in too). Hard rules: 16 words max, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.`
+    : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, in-character opener introducing yourself by name and noting you do not recognize the number. Hard rules: 20 words max, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
+
+  const attempt = (async () => {
+    const res = await streamPost(
+      `${session.cfg.proxyUrl}/librechat/ask-stream`,
+      {
+        Authorization: `Bearer ${session.cfg.proxySecret}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+        Accept: 'text/event-stream',
+      },
+      { agentId: session.agentId, messages: [{ role: 'user', content: instruction }] }
+    );
+    let text = '';
+    await new Promise((resolve, reject) => {
+      let buf = '';
+      res.on('data', (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') { resolve(); return; }
+          try {
+            const d = JSON.parse(raw);
+            if (d.error) { reject(new Error(d.error)); return; }
+            if (d.token) text += d.token;
+          } catch {}
+        }
+      });
+      res.on('end', resolve);
+      res.on('error', reject);
+    });
+    // Sanitize: single spoken line, no markdown/quotes, no stage brackets.
+    text = text.replace(/\[END CALL\]/gi, ' ')
+      .replace(/["*_#`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text.length < 4 || text.length > 220) return null;
+    return text;
+  })();
+
+  const timeout = new Promise((resolve) =>
+    setTimeout(() => resolve(null), GREETING_LLM_TIMEOUT_MS));
+  try {
+    return await Promise.race([attempt, timeout]);
+  } catch (e) {
+    console.warn('[voice-stream] LLM opener failed, using canned:', e.message);
+    return null;
+  }
+}
+
+// ── WISHLIST (July 2 2026, Kade's go): self-interrupt hint ───────────────────
+// If a single reply runs long, the agent audibly offers a way out. Mechanical
+// and deterministic (PHONE_SUFFIX already nudges style; this is the backstop):
+// right before the (N+1)th sentence of one turn plays, a short cached clip in
+// the agent's own voice invites the caller to jump in. Once per turn, inbound
+// calls only (outbound mission calls keep their professional register).
+// PHONE_RAMBLE_HINT_AFTER=0 disables.
+const RAMBLE_HINT_AFTER = parseInt(process.env.PHONE_RAMBLE_HINT_AFTER || '5', 10);
+const RAMBLE_HINTS = [
+  'Am I rambling? Jump in whenever.',
+  'By the way, you can cut me off any time.',
+  'Feel free to jump in, by the way.',
+];
+const _rambleCache = new Map();
+async function getRambleClip(voice, rate) {
+  const idx = Math.floor(Math.random() * RAMBLE_HINTS.length);
+  const key = `${voice}::${typeof rate === 'number' ? rate : 'd'}::${idx}`;
+  if (_rambleCache.has(key)) return _rambleCache.get(key);
+  const buf = await synthesize(RAMBLE_HINTS[idx], voice, rate);
+  _rambleCache.set(key, buf);
   return buf;
 }
 
@@ -1380,7 +1495,23 @@ function attachMediaStreams(server, users, cfg) {
           } else {
             session._ringbackActive = true;
             playRingback(session).catch(console.error);
-            synthesize(greeting, sess.voice, sess.rate).then(playGreeting).catch(greetingFailed);
+            // WISHLIST: novel per-call opener from the agent itself; the
+            // canned `greeting` composed above is the untouched fallback.
+            (async () => {
+              let text = greeting;
+              if (PHONE_LLM_GREETING) {
+                const opener = await fetchLlmOpener(sess, user);
+                if (opener) {
+                  text = `${opener} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
+                  // Seed history (like outbound already does) so the agent
+                  // knows what it said on pickup and won't repeat itself.
+                  sess.history.push({ role: 'assistant', content: text });
+                  console.log(`[voice-stream] LLM opener: "${opener.slice(0, 80)}"`);
+                }
+              }
+              const buf = await synthesize(text, sess.voice, sess.rate);
+              await playGreeting(buf);
+            })().catch(greetingFailed);
           }
           // Safety: the lock must never outlive a stuck playback.
           setTimeout(() => {
