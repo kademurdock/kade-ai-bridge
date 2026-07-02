@@ -91,6 +91,9 @@ function buildOutboundSuffix(ctx) {
     `\n\n[OUTBOUND CALL CONTEXT — you (${ctx.agentName}) placed this call to ` +
     `${ctx.calleeName || 'the person who answered'} on behalf of ${ctx.userName}, a Kade-AI user. ` +
     `Mission: ${ctx.purpose}. IMPORTANT: you have ALREADY greeted this person out loud, confirmed who they are, introduced yourself as an AI, and given the recording notice — every word of that is in the conversation above. NEVER greet again, never re-introduce yourself, never restart the conversation (no fresh \"hey!\", \"hi there!\", or \"what's up\"). You are MID-conversation: respond directly to their last words and move the mission forward. ` +
+    `If the answerer already identified themselves or their business ("Pizza Hut, can I help you?"), do NOT ask who they are — get on with it. ` +
+    `If they just said "hello" and you were not given a name, you may briefly confirm you reached the right place. ` +
+    `Match the register of the call: businesses and strangers get professional, clean language — no profanity, no slang tics — unless the moment genuinely invites humor. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
     `payments or commitments beyond the mission. If voicemail answered, leave ONE short message covering ` +
     `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
@@ -157,13 +160,71 @@ function extractRateCommand(text) {
   return null;
 }
 
-function findAgent(agents, query) {
+// ── Fuzzy agent matching (July 2 2026, Kade's fix request) ────────────────────
+// Deepgram never transcribes made-up names right ("Zadiana" arrives as
+// "Zadi Anna", "sadie ana", "zodiana"...). Exact/substring matching was
+// useless for exactly the agents Kade cares most about. Fold both sides
+// phonetically (z/s, c/k, ph/f, vowels loosened, doubles collapsed, spaces
+// stripped) and accept close edit distances.
+function phoneticFold(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .replace(/ph/g, 'f')
+    .replace(/ck/g, 'k')
+    .replace(/[cq]/g, 'k')
+    .replace(/z/g, 's')
+    .replace(/y/g, 'i')
+    .replace(/(.)\1+/g, '$1');
+}
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+function fuzzyFindAgent(agents, query) {
   if (!query || !agents.length) return null;
   const lq = query.toLowerCase().trim();
-  return agents.find(a => a.name.toLowerCase() === lq)
+  // exact / substring first (cheap, precise)
+  const exact = agents.find(a => a.name.toLowerCase() === lq)
       || agents.find(a => lq.includes(a.name.toLowerCase()))
-      || agents.find(a => a.name.toLowerCase().includes(lq))
-      || null;
+      || agents.find(a => a.name.toLowerCase().includes(lq));
+  if (exact) return { agent: exact, confidence: 1 };
+  const fq = phoneticFold(query);
+  if (fq.length < 2) return null;
+  let best = null, bestDist = Infinity;
+  for (const a of agents) {
+    const fn = phoneticFold(a.name);
+    if (!fn) continue;
+    const d = editDistance(fq, fn);
+    if (d < bestDist) { bestDist = d; best = a; }
+  }
+  if (!best) return null;
+  const fn = phoneticFold(best.name);
+  const maxLen = Math.max(fq.length, fn.length);
+  // short names must be near-exact; longer names tolerate ~1/3 mangling
+  const limit = maxLen <= 4 ? 1 : Math.floor(maxLen / 3);
+  if (bestDist <= limit) return { agent: best, confidence: 1 - bestDist / maxLen };
+  // close-but-not-sure: return as a low-confidence guess (caller may confirm)
+  if (bestDist <= Math.ceil(maxLen / 2)) return { agent: best, confidence: 0.4 };
+  return null;
+}
+function findAgent(agents, query) {
+  const r = fuzzyFindAgent(agents, query);
+  return r && r.confidence >= 0.6 ? r.agent : null;
 }
 
 function extractSwitchTarget(text, agents) {
@@ -172,6 +233,13 @@ function extractSwitchTarget(text, agents) {
   );
   const q = m ? m[1].trim() : (text.trim().split(/\s+/).length <= 2 ? text.trim() : null);
   return q ? findAgent(agents, q) : null;
+}
+
+// Bare "switch agents"-style request with no (matchable) name: the caller
+// wants the two-step flow — ask WHO, then match their answer by itself.
+function isBareSwitchRequest(text) {
+  return /^(?:can (?:you|we) )?(?:please )?(?:switch|change)(?:\s+(?:the\s+)?(?:agents?|characters?|to someone else))?[.!?]?$/i.test(text.trim())
+      || /^(?:i(?:'d| would)? (?:like|want) to )?(?:talk|speak) to some(?:one|body) else[.!?]?$/i.test(text.trim());
 }
 
 // ── Self-echo detection for barge-in ───────────────────────────────────────────
@@ -528,14 +596,60 @@ async function handleUtterance(session, text) {
       return;
     }
     const agents = await session.cfg.getAgents();
-    const target = extractSwitchTarget(text, agents);
-    if (target && target.id !== session.agentId) {
-      session.agentId   = target.id;
-      session.agentName = target.name;
+    const applySwitch = async (agent) => {
+      session.agentId   = agent.id;
+      session.agentName = agent.name;
       session.history   = [];
       const u = session.cfg.users.get(session.from);
-      if (u) { u.agentId = target.id; u.agentName = target.name; session.cfg.saveUsers(); }
-      await speak(session, `Switching to ${target.name}! What's on your mind?`, session.voice);
+      if (u) { u.agentId = agent.id; u.agentName = agent.name; session.cfg.saveUsers(); }
+      await speak(session, `Switching to ${agent.name}! What's on your mind?`, session.voice);
+    };
+    // ── Two-step agent switching (July 2 2026, Kade's request) ──────────────
+    // "switch agents" → "who would you like?" → the answer is matched BY
+    // ITSELF (fuzzy), which survives STT manglings like "Zadi Anna".
+    if (session._awaitAgentConfirm) {
+      const guess = session._awaitAgentConfirm;
+      session._awaitAgentConfirm = null;
+      if (/\b(yes|yeah|yep|yup|sure|right|correct|that one|she is|he is|it is)\b/i.test(text)) {
+        await applySwitch(guess);
+        return;
+      }
+      if (/\b(no|nope|nah|wrong|not)\b/i.test(text)) {
+        session._awaitAgentPick = true;
+        await speak(session, 'Okay — who would you like, then? Just say the name.', session.voice);
+        return;
+      }
+      // neither yes nor no: treat it as a fresh name attempt
+      session._awaitAgentPick = true;
+    }
+    if (session._awaitAgentPick) {
+      session._awaitAgentPick = false;
+      if (/\b(never ?mind|cancel|forget it|stay|no one|nobody)\b/i.test(text)) {
+        await speak(session, `No problem — still ${session.agentName}. Go ahead.`, session.voice);
+        return;
+      }
+      const r = fuzzyFindAgent(agents, text);
+      if (r && r.confidence >= 0.6) {
+        await applySwitch(r.agent);
+        return;
+      }
+      if (r && r.agent) {
+        session._awaitAgentConfirm = r.agent;
+        await speak(session, `Did you mean ${r.agent.name}? Yes or no.`, session.voice);
+        return;
+      }
+      await speak(session, "I couldn't match that name. Say just the name one more time, or say never mind.", session.voice);
+      session._awaitAgentPick = true;
+      return;
+    }
+    if (isBareSwitchRequest(text)) {
+      session._awaitAgentPick = true;
+      await speak(session, 'Sure — who would you like to talk to?', session.voice);
+      return;
+    }
+    const target = extractSwitchTarget(text, agents);
+    if (target && target.id !== session.agentId) {
+      await applySwitch(target);
       return;
     }
     await streamReply(session, text);

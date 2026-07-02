@@ -225,14 +225,70 @@ async function getAgents() {
   return _agentCache;
 }
 
-function findAgent(agents, query) {
-  if (!query || !agents.length) return null;
-  const q = query.toLowerCase().trim();
-  return agents.find(a => a.name.toLowerCase() === q)
-      || agents.find(a => q.includes(a.name.toLowerCase()))
-      || agents.find(a => a.name.toLowerCase().includes(q))
-      || null;
+// Fuzzy matching (July 2 2026): same code as voice-stream.js — STT/typos
+// mangle invented names, so exact matching alone fails on the names that
+// matter most.
+function phoneticFold(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .replace(/ph/g, 'f')
+    .replace(/ck/g, 'k')
+    .replace(/[cq]/g, 'k')
+    .replace(/z/g, 's')
+    .replace(/y/g, 'i')
+    .replace(/(.)\1+/g, '$1');
 }
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+function fuzzyFindAgent(agents, query) {
+  if (!query || !agents.length) return null;
+  const lq = query.toLowerCase().trim();
+  // exact / substring first (cheap, precise)
+  const exact = agents.find(a => a.name.toLowerCase() === lq)
+      || agents.find(a => lq.includes(a.name.toLowerCase()))
+      || agents.find(a => a.name.toLowerCase().includes(lq));
+  if (exact) return { agent: exact, confidence: 1 };
+  const fq = phoneticFold(query);
+  if (fq.length < 2) return null;
+  let best = null, bestDist = Infinity;
+  for (const a of agents) {
+    const fn = phoneticFold(a.name);
+    if (!fn) continue;
+    const d = editDistance(fq, fn);
+    if (d < bestDist) { bestDist = d; best = a; }
+  }
+  if (!best) return null;
+  const fn = phoneticFold(best.name);
+  const maxLen = Math.max(fq.length, fn.length);
+  // short names must be near-exact; longer names tolerate ~1/3 mangling
+  const limit = maxLen <= 4 ? 1 : Math.floor(maxLen / 3);
+  if (bestDist <= limit) return { agent: best, confidence: 1 - bestDist / maxLen };
+  // close-but-not-sure: return as a low-confidence guess (caller may confirm)
+  if (bestDist <= Math.ceil(maxLen / 2)) return { agent: best, confidence: 0.4 };
+  return null;
+}
+function findAgent(agents, query) {
+  const r = fuzzyFindAgent(agents, query);
+  return r && r.confidence >= 0.6 ? r.agent : null;
+}
+
 
 function extractSwitchTarget(text, agents) {
   const m = text.match(
@@ -871,7 +927,19 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName, agentId, agentName, voice } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice } = req.body || {};
+  // KADE July 2 2026: the model sometimes fills calleeName with junk like
+  // "whoever it is" or "the person" — which produced the live gem
+  // "Hi, is this whoever it is?". A name is only a name if it looks like one.
+  const JUNK_NAME = /\b(whoever|whomever|someone|somebody|anyone|anybody|unknown|the (?:person|people|business|store|restaurant|place|company|owner|manager|front desk)|them|they|it is|n\/a|none|no name|not sure|idk)\b/i;
+  const calleeName = (() => {
+    const n = String(rawCalleeName || '').trim();
+    if (!n) return null;
+    if (n.length > 40) return null;
+    if (JUNK_NAME.test(n)) return null;
+    if (!/^[a-z][a-z .,'-]*$/i.test(n)) return null;
+    return n;
+  })();
   if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   if (!twilioClient) return res.status(500).json({ error: 'Twilio not configured' });
   if (!userId) return res.status(400).json({ error: 'userId required — whose spend page does this call bill to?' });
@@ -1120,6 +1188,48 @@ async function finalizeOutboundCall(callSid) {
     }
   }
 }
+
+// Agent-facing (July 2 2026, Kade: "she stopped instead of reporting back"):
+// result of a USER'S OWN outbound call — latest by default, or by callSid.
+// Scoped to the requesting user's id so nobody can read anyone else's calls.
+app.post('/outbound/result', (req, res) => {
+  const { secret, userId, callSid } = req.body || {};
+  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+
+  const live = [...outboundMeta.values()]
+    .filter((m) => m.userId === userId && (!callSid || m.callSid === callSid))
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  const done = [...outboundLog]
+    .reverse()
+    .find((r) => r.userId === userId && (!callSid || r.callSid === callSid));
+
+  // A live call is only "the" call if it's newer than the newest finished one.
+  if (live && (!done || live.startedAt > Date.parse(done.at))) {
+    return res.json({
+      found: true,
+      status: 'in-progress',
+      callSid: live.callSid,
+      to: live.to,
+      calleeName: live.calleeName,
+      purpose: live.purpose,
+      startedSecondsAgo: Math.round((Date.now() - live.startedAt) / 1000),
+      note: 'Call is still going — check again in a minute for the transcript.',
+    });
+  }
+  if (!done) return res.json({ found: false, note: 'No outbound calls found for this user.' });
+  res.json({
+    found: true,
+    status: done.status,
+    callSid: done.callSid,
+    at: done.at,
+    to: done.to,
+    calleeName: done.calleeName,
+    purpose: done.purpose,
+    durationSec: done.durationSec,
+    transcript: (done.transcript || []).slice(-40),
+  });
+});
 
 // Admin: list outbound calls. ?full=1 includes transcripts.
 app.get('/outbound/calls', (req, res) => {
