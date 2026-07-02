@@ -86,6 +86,40 @@ function extractVoiceSwitch(text) {
   return m ? findVoice((m[1] || m[2]).trim()) : null;
 }
 
+// ── Speaking-rate voice commands ("speak faster", "slow down") ────────────────
+// Kade's ask (2026-07-01): control the pace mid-call by just saying so.
+// Kept deliberately conservative: only short utterances that are clearly
+// commands, so "is a cheetah faster than a horse and a car and a bike" never
+// changes the pace. Inworld's synthesis range is 0.5-1.5.
+const RATE_STEP = 0.15;
+const RATE_MIN  = 0.5;
+const RATE_MAX  = 1.5;
+// The proxy's default speaking rate (its TTS_SPEAKING_RATE env, 1.1 today) --
+// used as the baseline for the FIRST faster/slower step of a call. Override
+// with PHONE_BASE_RATE if the proxy default ever changes.
+const BASE_RATE = parseFloat(process.env.PHONE_BASE_RATE || '1.1');
+
+function extractRateCommand(text) {
+  const t = (text || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  const words = t.split(' ').length;
+  if (words > 8) return null;
+  if (/\b(normal|regular|default) (speed|pace)\b/.test(t) || /\bspeak normally\b/.test(t)) {
+    return 'normal';
+  }
+  const fast =
+    /\b(?:speak|talk|go|say it)\s+(?:a\s+)?(?:bit\s+|little\s+)?(?:faster|quicker)\b/.test(t) ||
+    /\bspeed\s+up\b/.test(t) ||
+    (words <= 3 && /\bfaster\b/.test(t));
+  const slow =
+    /\b(?:speak|talk|go|say it)\s+(?:a\s+)?(?:bit\s+|little\s+)?slower\b/.test(t) ||
+    /\bslow\s+down\b/.test(t) ||
+    (words <= 3 && /\bslower\b/.test(t));
+  if (fast && !slow) return 'faster';
+  if (slow && !fast) return 'slower';
+  return null;
+}
+
 function findAgent(agents, query) {
   if (!query || !agents.length) return null;
   const lq = query.toLowerCase().trim();
@@ -245,6 +279,9 @@ class CallSession {
     this.agentId     = user?.agentId   || cfg.defaultAgent;
     this.agentName   = user?.agentName || cfg.defaultAgentName;
     this.voice       = user?.voice     || cfg.defaultVoice;
+    // Speaking rate (Kade 2026-07-01): null = proxy default. Adjusted live by
+    // saying "speak faster" / "slow down" etc.; persisted per caller like voice.
+    this.rate        = typeof user?.rate === 'number' ? user.rate : null;
     this.history     = [];
     this.isSpeaking     = false;
     this.speakStartedAt = 0;
@@ -389,6 +426,27 @@ async function handleUtterance(session, text) {
   console.log(`[voice-stream] utterance: "${text.slice(0, 80)}"`);
   session.busy = true;
   try {
+    const rateCmd = extractRateCommand(text);
+    if (rateCmd) {
+      const cur = session.rate ?? BASE_RATE;
+      const next =
+        rateCmd === 'normal'
+          ? null
+          : Math.round(
+              Math.min(RATE_MAX, Math.max(RATE_MIN, cur + (rateCmd === 'faster' ? RATE_STEP : -RATE_STEP))) * 100,
+            ) / 100;
+      session.rate = next;
+      const u = session.cfg.users.get(session.from);
+      if (u) { u.rate = next; session.cfg.saveUsers(); }
+      // The confirmation itself plays at the NEW rate -- instant, audible proof.
+      const line =
+        rateCmd === 'normal' ? 'Back to my normal pace. Go ahead.'
+        : rateCmd === 'faster'
+          ? (next >= RATE_MAX ? "That's as fast as I go! Go ahead." : 'Okay -- a little faster. Go ahead.')
+          : (next <= RATE_MIN ? "That's my slowest. Go ahead." : 'Okay -- a little slower. Go ahead.');
+      await speak(session, line, session.voice);
+      return;
+    }
     const newVoice = extractVoiceSwitch(text);
     if (newVoice) {
       session.voice = newVoice;
@@ -453,7 +511,7 @@ async function streamReply(session, userText) {
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
     const synthInput = applyDirectionCarry(sentence, dirState);
-    const synthPromise = synthesize(synthInput, session.voice).catch((e) => {
+    const synthPromise = synthesize(synthInput, session.voice, session.rate).catch((e) => {
       console.error('[voice-stream] synthesis prefetch error:', e.message);
       return null;
     });
@@ -520,16 +578,18 @@ async function streamReply(session, userText) {
 }
 
 // ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
-async function synthesize(text, voice) {
+async function synthesize(text, voice, rate) {
   const cfg = global._vsConfig;
   const input = fixPronunciation(text).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
   const t0 = Date.now();
-  console.log(`[voice-stream] synth request: ${input.length} chars, voice "${useVoice}"`);
+  console.log(`[voice-stream] synth request: ${input.length} chars, voice "${useVoice}"${typeof rate === 'number' ? `, rate ${rate}` : ''}`);
+  const body = { model: cfg.ttsModel, input, voice: useVoice };
+  if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech?telephony=1`,
     { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-    { model: cfg.ttsModel, input, voice: useVoice }
+    body
   );
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -549,7 +609,7 @@ async function synthesize(text, voice) {
 // ── Speak (one-shot, not streamed) ────────────────────────────────────────────
 async function speak(session, text, voice) {
   try {
-    const buf = await synthesize(text, voice || session.voice);
+    const buf = await synthesize(text, voice || session.voice, session.rate);
     session._currentSpokenText = text; // for echo detection, see looksLikeEcho
     await playBuffer(session, buf);
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
@@ -936,7 +996,7 @@ function attachMediaStreams(server, users, cfg) {
           // PROCESS (voice-stream.js:925 TypeError -- also masked the real
           // error, which was next in line to print). Capture the object.
           const sess = session;
-          synthesize(greeting, sess.voice)
+          synthesize(greeting, sess.voice, sess.rate)
             .then(async (greetingBuf) => {
               sess._ringbackActive = false; // stop ring loop
               if (sess.ws.readyState !== WebSocket.OPEN) return; // caller already gone
