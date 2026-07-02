@@ -919,15 +919,23 @@ app.post('/outbound-call', async (req, res) => {
   if (!outVoice) outVoice = findVoice(agentName || DEFAULT_AGENT_NAME);
   if (!outVoice) outVoice = voice || DEFAULT_PHONE_VOICE;
   console.log(`[outbound] voice resolved: "${outVoice}"${outRate ? ` rate ${outRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
-  const who = calleeName ? `Hi, is this ${calleeName}?` : 'Hi!';
-  const greetingText =
-    `${who} This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
+  // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
+  // is JUST "Hi — is this X?" — the stream layer waits for their answer before
+  // part 2 (disclosure + purpose). Unknown callee: one combined line.
+  const introText =
+    `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
     `${userName || 'a Kade-AI user'}. This call may be recorded. ` +
     `I'm calling because ${String(purpose).slice(0, 300)}.`;
+  const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
+  const greeting2Text = calleeName ? introText : null;
   let greetingBuf = null;
+  let greeting2Buf = null;
   try {
-    greetingBuf = await vsSynthesize(greetingText, outVoice, outRate ?? undefined);
-    console.log(`[outbound] greeting pre-synthesized: ${greetingBuf.length} bytes`);
+    [greetingBuf, greeting2Buf] = await Promise.all([
+      vsSynthesize(greetingText, outVoice, outRate ?? undefined),
+      greeting2Text ? vsSynthesize(greeting2Text, outVoice, outRate ?? undefined) : Promise.resolve(null),
+    ]);
+    console.log(`[outbound] greeting pre-synthesized: part1 ${greetingBuf.length} bytes${greeting2Buf ? `, part2 ${greeting2Buf.length} bytes` : ''}`);
   } catch (e) {
     console.warn('[outbound] greeting pre-synth failed (will synth live):', e.message);
   }
@@ -961,6 +969,8 @@ app.post('/outbound-call', async (req, res) => {
       rate: outRate,
       greeting: greetingText,
       greetingBuf,
+      greeting2: greeting2Text,
+      greeting2Buf,
       startedAt: Date.now(),
       transcript: null,
       recordingSid: null,

@@ -73,19 +73,24 @@ const PHONE_SUFFIX =
 // it), recording note, purpose, go. No latency disclaimer -- phone turns
 // stream fast now. The greeting is normally PRE-SYNTHESIZED by server.js at
 // dial time (ctx.greetingBuf) so it plays the instant the callee answers.
-function buildOutboundGreeting(ctx, agentName) {
-  const who = ctx.calleeName ? `Hi, is this ${ctx.calleeName}?` : 'Hi!';
-  return (
-    `${who} This is ${agentName}, an A I assistant calling for ${ctx.userName} — ` +
-    `quick note, this call may be recorded. I'm calling because ${ctx.purpose}.`
-  );
+// TWO-PHASE GREETING (July 2 2026, Kade's fix request): the old greeting
+// asked "is this X?" and then bulldozed on without waiting for the answer.
+// Now, when we know who we're calling: part 1 = the question, ALONE. We wait
+// for their answer (or 6s for voicemail/silence), consume it as confirmation,
+// THEN part 2 = the disclosure + purpose. Unknown callee: one combined line.
+function buildOutboundGreetingParts(ctx, agentName) {
+  const intro =
+    `This is ${agentName}, an A I assistant calling for ${ctx.userName} — ` +
+    `quick note, this call may be recorded. I'm calling because ${ctx.purpose}.`;
+  if (ctx.calleeName) return { part1: `Hi — is this ${ctx.calleeName}?`, part2: intro };
+  return { part1: `Hi! ${intro}`, part2: null };
 }
 
 function buildOutboundSuffix(ctx) {
   return (
     `\n\n[OUTBOUND CALL CONTEXT — you (${ctx.agentName}) placed this call to ` +
     `${ctx.calleeName || 'the person who answered'} on behalf of ${ctx.userName}, a Kade-AI user. ` +
-    `Mission: ${ctx.purpose}. You already introduced yourself as an AI and gave the recording notice. ` +
+    `Mission: ${ctx.purpose}. IMPORTANT: you have ALREADY greeted this person out loud, confirmed who they are, introduced yourself as an AI, and given the recording notice — every word of that is in the conversation above. NEVER greet again, never re-introduce yourself, never restart the conversation (no fresh \"hey!\", \"hi there!\", or \"what's up\"). You are MID-conversation: respond directly to their last words and move the mission forward. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
     `payments or commitments beyond the mission. If voicemail answered, leave ONE short message covering ` +
     `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
@@ -455,6 +460,17 @@ async function handleUtterance(session, text) {
     console.log(`[voice-stream] holding utterance during greeting: "${text.slice(0, 50)}"`);
     session._pending = session._pending ? `${session._pending} ${text}` : text;
     if (session._startGreeting) session._startGreeting();
+    return;
+  }
+  if (session._confirmPhase) {
+    // Their answer to "Hi — is this X?". Consume it as the confirmation and
+    // play the pre-synthesized disclosure; it never becomes a standalone LLM
+    // turn, but it lives in history so the agent has the exchange in context.
+    session._confirmPhase = false;
+    if (session._confirmTimer) { clearTimeout(session._confirmTimer); session._confirmTimer = null; }
+    session.history.push({ role: 'user', content: text });
+    console.log(`[voice-stream] outbound confirm consumed: "${text.slice(0, 50)}"`);
+    if (session._playGreetingPart2) session._playGreetingPart2();
     return;
   }
   if (session.busy) {
@@ -1059,8 +1075,14 @@ function attachMediaStreams(server, users, cfg) {
             `I'm all ears — go ahead.`,
           ];
           const pick     = (arr) => arr[Math.floor(Math.random() * arr.length)];
+          if (outboundCtx && !outboundCtx.greeting) {
+            // Older ctx without pre-composed parts: compose here (no pre-synth).
+            const gp = buildOutboundGreetingParts(outboundCtx, session.agentName);
+            outboundCtx.greeting = gp.part1;
+            if (!outboundCtx.greeting2) outboundCtx.greeting2 = gp.part2;
+          }
           const greeting = outboundCtx
-            ? (outboundCtx.greeting || buildOutboundGreeting(outboundCtx, session.agentName))
+            ? outboundCtx.greeting
             : `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
           // Seed history so the agent knows what it already said on pickup,
           // and lock barge-in until the disclosure finishes playing.
@@ -1090,8 +1112,46 @@ function attachMediaStreams(server, users, cfg) {
             }
             if (sess.ws.readyState !== WebSocket.OPEN) return;
             await playBuffer(sess, greetingBuf);
-            releaseGreetingLock(sess);
+            if (outboundCtx && outboundCtx.greeting2) enterConfirmWait();
+            else releaseGreetingLock(sess);
           };
+          // ── Two-phase outbound greeting machinery (July 2 2026) ──────────
+          // After part 1 ("Hi — is this X?") actually WAIT for the answer.
+          // Their reply is consumed by handleUtterance's _confirmPhase branch,
+          // which calls _playGreetingPart2. 6s of silence (voicemail, shy
+          // callee) plays part 2 anyway so the disclosure always happens.
+          const playPart2 = () => {
+            if (sess._part2Started) return;
+            sess._part2Started = true;
+            sess._confirmPhase = false;
+            if (sess._confirmTimer) { clearTimeout(sess._confirmTimer); sess._confirmTimer = null; }
+            sess._greetingLock = true; // disclosure must finish uninterrupted
+            (async () => {
+              if (sess.ws.readyState !== WebSocket.OPEN) return;
+              const buf = outboundCtx.greeting2Buf
+                || await synthesize(outboundCtx.greeting2, sess.voice, sess.rate);
+              if (sess.ws.readyState !== WebSocket.OPEN) return;
+              sess.history.push({ role: 'assistant', content: outboundCtx.greeting2 });
+              await playBuffer(sess, buf);
+            })()
+              .catch((e) => console.error('[voice-stream] part-2 greeting error:', e.message))
+              .finally(() => releaseGreetingLock(sess));
+          };
+          const enterConfirmWait = () => {
+            sess._greetingLock = false;
+            sess._confirmPhase = true;
+            if (sess._pending) {
+              // They answered WHILE part 1 was still playing — that pending
+              // text is their real answer (the pickup "Hello?" was already
+              // dropped when the greeting started). Use it now.
+              const t = sess._pending;
+              sess._pending = null;
+              handleUtterance(sess, t);
+              return;
+            }
+            sess._confirmTimer = setTimeout(playPart2, 6000);
+          };
+          sess._playGreetingPart2 = playPart2;
           const greetingFailed = (err) => {
             console.error('[voice-stream] greeting playback/synthesis error:', err.message);
             sess._ringbackActive = false;
@@ -1111,6 +1171,9 @@ function attachMediaStreams(server, users, cfg) {
             const startGreeting = () => {
               if (sess._greetingStarted) return;
               sess._greetingStarted = true;
+              // Their reflexive "Hello?" on pickup triggered us — it is the
+              // start cue, not an answer to a question nobody asked yet.
+              sess._pending = null;
               const p = outboundCtx.greetingBuf
                 ? playGreeting(outboundCtx.greetingBuf)
                 : synthesize(greeting, sess.voice, sess.rate).then(playGreeting);
@@ -1124,7 +1187,13 @@ function attachMediaStreams(server, users, cfg) {
             synthesize(greeting, sess.voice, sess.rate).then(playGreeting).catch(greetingFailed);
           }
           // Safety: the lock must never outlive a stuck playback.
-          setTimeout(() => releaseGreetingLock(sess), 20000);
+          setTimeout(() => {
+            // Safety valve: nothing in the greeting machinery may brick the
+            // call. Two-phase adds a confirm wait, so the window is wider.
+            if (sess._confirmTimer) { clearTimeout(sess._confirmTimer); sess._confirmTimer = null; }
+            if (sess._confirmPhase && !sess._part2Started) { sess._playGreetingPart2?.(); return; }
+            releaseGreetingLock(sess);
+          }, 35000);
 
           break;
         }
