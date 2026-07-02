@@ -225,6 +225,39 @@ async function getAgents() {
   return _agentCache;
 }
 
+// ── Agent TTS cache (July 2 2026) ────────────────────────────────────────────
+// INBOUND calls used to ignore the agent's builder-set voice entirely
+// (CallSession fell back to the platform default — Skylee heard "Kiana's"
+// voice when calling Lilly). Outbound got the agent-record lookup in the
+// July 2 rework; this cache gives inbound the same data with ZERO latency at
+// call time. Refreshed at boot, on /register, and every 15 minutes for every
+// distinct agentId in the registry. Works for PRIVATE agents too (the proxy's
+// admin session can read them — verified live with Lilly).
+const agentTtsCache = new Map(); // agentId -> { voiceId, rate }
+async function refreshAgentTts(agentId) {
+  if (!agentId) return;
+  try {
+    const r = await axios.get(`${PROXY_URL}/librechat/agent?id=${encodeURIComponent(agentId)}`, {
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      timeout: 15000,
+    });
+    const tts = r.data?.tts || {};
+    agentTtsCache.set(agentId, {
+      voiceId: tts.voiceId || null,
+      rate: typeof tts.speakingRate === 'number' ? tts.speakingRate : null,
+    });
+    console.log(`[bridge] Agent TTS cached: ${agentId} -> voice ${tts.voiceId || '(none)'} rate ${tts.speakingRate ?? '(default)'}`);
+  } catch (e) {
+    console.error(`[bridge] Agent TTS lookup failed for ${agentId}:`, e.message);
+  }
+}
+function refreshAllAgentTts() {
+  const ids = new Set([...users.values()].map((u) => u.agentId).filter(Boolean));
+  for (const id of ids) refreshAgentTts(id);
+}
+setTimeout(refreshAllAgentTts, 5000);          // boot (give users load a beat)
+setInterval(refreshAllAgentTts, 15 * 60 * 1000); // builder voice changes land within 15 min
+
 // Fuzzy matching (July 2 2026): same code as voice-stream.js — STT/typos
 // mangle invented names, so exact matching alone fails on the names that
 // matter most.
@@ -422,6 +455,7 @@ app.post('/register', (req, res) => {
   if (lcPass)  record.lcPass  = lcPass;
   users.set(e164, record);
   saveUsers();
+  refreshAgentTts(record.agentId); // pick up the agent's builder voice for inbound calls
   console.log(`[bridge] Admin registered ${e164} → ${agentId || DEFAULT_AGENT} (${name})`);
   res.json({ ok: true, phone: e164 });
 });
@@ -1380,6 +1414,7 @@ attachMediaStreams(server, users, {
   defaultAgent:     DEFAULT_AGENT,
   defaultAgentName: DEFAULT_AGENT_NAME,
   getAgents,
+  getAgentTts: (id) => agentTtsCache.get(id) || null,
   saveUsers,
   seenCallNumbers,
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),

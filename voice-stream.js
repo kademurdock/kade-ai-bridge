@@ -383,10 +383,15 @@ class CallSession {
     this.cfg         = cfg;
     this.agentId     = user?.agentId   || cfg.defaultAgent;
     this.agentName   = user?.agentName || cfg.defaultAgentName;
-    this.voice       = user?.voice     || cfg.defaultVoice;
+    // Voice resolution (July 2 2026): caller's explicit spoken-command choice
+    // wins, then the AGENT's builder-set voice (bridge-side cache, zero call-
+    // time latency), then the platform default. Same order as outbound.
+    const agentTts   = (cfg.getAgentTts && cfg.getAgentTts(this.agentId)) || null;
+    this.voice       = user?.voice || agentTts?.voiceId || cfg.defaultVoice;
     // Speaking rate (Kade 2026-07-01): null = proxy default. Adjusted live by
     // saying "speak faster" / "slow down" etc.; persisted per caller like voice.
-    this.rate        = typeof user?.rate === 'number' ? user.rate : null;
+    this.rate        = typeof user?.rate === 'number' ? user.rate
+      : (typeof agentTts?.rate === 'number' ? agentTts.rate : null);
     this.history     = [];
     this.isSpeaking     = false;
     this.speakStartedAt = 0;
