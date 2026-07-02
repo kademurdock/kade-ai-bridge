@@ -661,6 +661,11 @@ const FILLER_PHRASES = [
 // Kept as short as it can possibly be -- this plays on EVERY call, not just
 // first-timers (anyone might have someone new in the room with them), so it
 // can't be allowed to get old or eat up call time.
+// PLACEMENT (July 1 2026, per Kade): woven into the MIDDLE of the single
+// greeting utterance, BEFORE the invitation to speak -- never as a separate
+// after-the-invite line. The old shape (invite, ~1s synth-gap of silence,
+// then "by the way...") baited callers into talking and then talked over
+// them, and barge-in usually killed the notice entirely.
 const ORIENTATION_LINES = [
   "Quick note -- a little sound means I'm thinking, still here.",
   "Heads up -- you'll hear a small sound while I think. Still on the line.",
@@ -874,44 +879,48 @@ function attachMediaStreams(server, users, cfg) {
 
           const name      = user?.name || 'there';
           const agentName = session.agentName;
-          const knownGreetings = [
-            `Hey ${name}! It's ${agentName}. What's going on?`,
-            `${name}! Good to hear from you. What's up?`,
-            `Hey, ${name}! ${agentName} here. Talk to me.`,
-            `Oh it's ${name}! ${agentName} is in. What do you need?`,
-            `${name}! What's the move? I'm listening.`,
-            `Hey ${name}, ${agentName} picked up. Go ahead.`,
-            `It's ${agentName} — hey ${name}! What's good?`,
-            `${name}! Caught me at a good time. What's on your mind?`,
-            `Hey ${name}! What can I do for you today?`,
-            `${name}, hey! Go ahead, I'm all ears.`,
-            `There you are, ${name}! What's up?`,
-            `Hey ${name} — ${agentName} speaking. What's happening?`,
-            `Hi ${name}! What's on the agenda?`,
-            `${name}! Glad you called. What's going on?`,
-            `Hey ${name}, it's ${agentName}. Talk to me, what's up?`,
-            `Oh hey, ${name}! Perfect timing. What do you need?`,
-            `${name}! ${agentName} here, ready when you are.`,
-            `Hey there, ${name}! What's the word?`,
-            `${name}, hey! I'm here, go ahead.`,
-            `Hi ${name} — ${agentName} picking up. What's up?`,
-            `Hey ${name}! Good timing — what's going on?`,
-            `${name}! What can I help with?`,
+          // GREETING RESTRUCTURE (July 1 2026, Kade's fix request): ONE
+          // synthesized utterance ordered opener -> typing-sound orientation
+          // -> invitation-to-speak LAST. Openers deliberately contain NO
+          // invitation so the caller is never invited to talk and then
+          // talked over. Single synth also removes the second TTS round-trip
+          // (the old post-greeting orientation gap WAS that synth latency).
+          const knownOpeners = [
+            `Hey ${name}! It's ${agentName}.`,
+            `${name}! Good to hear from you.`,
+            `Hey, ${name}! ${agentName} here.`,
+            `Oh it's ${name}! ${agentName} is in.`,
+            `Hey ${name}, ${agentName} picked up.`,
+            `It's ${agentName} — hey ${name}!`,
+            `${name}! Caught me at a good time.`,
+            `There you are, ${name}!`,
+            `Hey ${name} — ${agentName} speaking.`,
+            `${name}! Glad you called.`,
+            `Oh hey, ${name}! Perfect timing.`,
+            `Hey there, ${name}!`,
+            `Hi ${name} — ${agentName} picking up.`,
+            `Hey ${name}! Good timing.`,
           ];
-          const unknownGreetings = [
-            `Hey! I don't think we've met — I'm ${agentName}. Go ahead and talk, I'm listening.`,
-            `Hey there! New number, not sure who this is — I'm ${agentName}. What's up?`,
-            `Oh hey! You can register at kademurdock dot com slash signup so I know who you are. But go ahead, I'm ${agentName}.`,
-            `Hey! Didn't recognize the number — I'm ${agentName}. What can I do for you?`,
-            `Hi! Don't think we've talked before — I'm ${agentName}. What's on your mind?`,
-            `Hey, new caller! I'm ${agentName}. Go ahead, I'm listening.`,
-            `Hi there! I'm ${agentName} — haven't met you yet. What's up?`,
-            `Hey! I'm ${agentName}. Go ahead and tell me what's up — you can register later at kademurdock dot com slash signup if you want me to remember you.`,
-            `Hello! I'm ${agentName}, and this is a new number to me. What can I help with?`,
-            `Hey there! I'm ${agentName} — go ahead, I'm listening.`,
+          const unknownOpeners = [
+            `Hey! I don't think we've met — I'm ${agentName}.`,
+            `Hey there! New number, not sure who this is — I'm ${agentName}.`,
+            `Hey! Didn't recognize the number — I'm ${agentName}.`,
+            `Hi! Don't think we've talked before — I'm ${agentName}.`,
+            `Hey, new caller! I'm ${agentName}.`,
+            `Hello! I'm ${agentName}, and this is a new number to me.`,
+            `Hey there! I'm ${agentName} — you can register at kademurdock dot com slash signup so I remember you next time.`,
           ];
-          const pool        = user ? knownGreetings : unknownGreetings;
-          const greeting    = pool[Math.floor(Math.random() * pool.length)];
+          const INVITES = [
+            `So — what's up?`,
+            `Go ahead, I'm listening.`,
+            `Talk to me — what's going on?`,
+            `So, what's on your mind?`,
+            `Go ahead whenever you're ready.`,
+            `What can I do for you?`,
+            `I'm all ears — go ahead.`,
+          ];
+          const pick     = (arr) => arr[Math.floor(Math.random() * arr.length)];
+          const greeting = `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
 
           // ── Dead-air fix: ringback tone while greeting synthesizes ─────────
           // The ~8-12s between call connect and first Kiana word used to be
@@ -934,13 +943,9 @@ function attachMediaStreams(server, users, cfg) {
               sess.sendClear();             // flush queued ring frames from Twilio buffer
               await new Promise(r => setTimeout(r, 120)); // brief gap after clear
               await playBuffer(sess, greetingBuf);
-              // Every call, not just first-timers -- Keighty's call: whoever's
-              // in the room with the caller this time needs to hear it too,
-              // so it has to stay short rather than gated to a one-time thing.
-              if (sess.ws.readyState === WebSocket.OPEN) {
-                const orientation = ORIENTATION_LINES[Math.floor(Math.random() * ORIENTATION_LINES.length)];
-                await speak(sess, orientation, sess.voice);
-              }
+              // Orientation line is now INSIDE greetingBuf (before the
+              // invite) -- no separate speak() here, no trailing-silence
+              // bait, nothing for barge-in to skip.
             })
             .catch((err) => {
               console.error('[voice-stream] greeting synthesis error:', err.message);
