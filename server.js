@@ -898,15 +898,35 @@ app.post('/outbound-call', async (req, res) => {
   // takes several seconds to dial anyway, and having the audio ready means
   // the callee hears the disclosure the instant they answer — no ringback,
   // no dead air, no synth race with their "Hello?" (July 2 2026 rework).
-  const outVoice = voice || users.get(e164)?.voice || DEFAULT_PHONE_VOICE;
+  //
+  // Voice belongs to the AGENT placing the call, never the callee's saved
+  // inbound preference (Kade's round-2 catch: Zadiana called in Kiana's
+  // voice). Priority: the agent record's builder-set tts.voiceId ->
+  // an Inworld voice matching the agent's name (e.g. the "Zadiana" voice) ->
+  // explicit voice param -> platform default. Same for speaking rate.
+  let outVoice = null;
+  let outRate = null;
+  try {
+    const ar = await axios.get(
+      `${PROXY_URL}/librechat/agent?id=${encodeURIComponent(agentId || DEFAULT_AGENT)}`,
+      { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 },
+    );
+    outVoice = ar.data?.tts?.voiceId || null;
+    outRate = typeof ar.data?.tts?.speakingRate === 'number' ? ar.data.tts.speakingRate : null;
+  } catch (e) {
+    console.warn('[outbound] agent voice lookup failed (using fallbacks):', e.message);
+  }
+  if (!outVoice) outVoice = findVoice(agentName || DEFAULT_AGENT_NAME);
+  if (!outVoice) outVoice = voice || DEFAULT_PHONE_VOICE;
+  console.log(`[outbound] voice resolved: "${outVoice}"${outRate ? ` rate ${outRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
   const who = calleeName ? `Hi, is this ${calleeName}?` : 'Hi!';
   const greetingText =
     `${who} This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
-    `${userName || 'a Kade-AI user'} — quick note, this call may be recorded. ` +
+    `${userName || 'a Kade-AI user'}. This call may be recorded. ` +
     `I'm calling because ${String(purpose).slice(0, 300)}.`;
   let greetingBuf = null;
   try {
-    greetingBuf = await vsSynthesize(greetingText, outVoice);
+    greetingBuf = await vsSynthesize(greetingText, outVoice, outRate ?? undefined);
     console.log(`[outbound] greeting pre-synthesized: ${greetingBuf.length} bytes`);
   } catch (e) {
     console.warn('[outbound] greeting pre-synth failed (will synth live):', e.message);
@@ -938,6 +958,7 @@ app.post('/outbound-call', async (req, res) => {
       agentId: agentId || DEFAULT_AGENT,
       agentName: agentName || DEFAULT_AGENT_NAME,
       voice: outVoice,
+      rate: outRate,
       greeting: greetingText,
       greetingBuf,
       startedAt: Date.now(),

@@ -448,10 +448,13 @@ async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
   if (session._greetingLock) {
-    // Callee spoke while the outbound greeting was playing (usually "Hello?").
-    // Hold it; releaseGreetingLock() replays it the moment the greeting ends.
+    // Callee spoke while the greeting was pending or playing (usually their
+    // "Hello?" on pickup). Hold the text — releaseGreetingLock() replays it
+    // the moment the greeting ends — and if the greeting hasn't STARTED yet,
+    // their finished hello is exactly the cue to start it now.
     console.log(`[voice-stream] holding utterance during greeting: "${text.slice(0, 50)}"`);
     session._pending = session._pending ? `${session._pending} ${text}` : text;
+    if (session._startGreeting) session._startGreeting();
     return;
   }
   if (session.busy) {
@@ -1006,6 +1009,7 @@ function attachMediaStreams(server, users, cfg) {
             session.agentId   = outboundCtx.agentId   || session.agentId;
             session.agentName = outboundCtx.agentName || session.agentName;
             if (outboundCtx.voice) session.voice = outboundCtx.voice;
+            if (typeof outboundCtx.rate === 'number') session.rate = outboundCtx.rate;
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
@@ -1097,13 +1101,26 @@ function attachMediaStreams(server, users, cfg) {
             }
           };
 
-          if (outboundCtx && outboundCtx.greetingBuf) {
-            playGreeting(outboundCtx.greetingBuf).catch(greetingFailed);
+          if (outboundCtx) {
+            // Kade's round-2 catch: the greeting fired the millisecond the
+            // stream opened — before she could even get the phone to her ear.
+            // A human caller waits for "Hello?". So: start the greeting when
+            // the callee's first utterance completes (handleUtterance's
+            // greeting-lock branch calls _startGreeting), or after 2.5s of
+            // nothing, whichever comes first.
+            const startGreeting = () => {
+              if (sess._greetingStarted) return;
+              sess._greetingStarted = true;
+              const p = outboundCtx.greetingBuf
+                ? playGreeting(outboundCtx.greetingBuf)
+                : synthesize(greeting, sess.voice, sess.rate).then(playGreeting);
+              p.catch(greetingFailed);
+            };
+            sess._startGreeting = startGreeting;
+            setTimeout(startGreeting, 2500);
           } else {
-            if (!outboundCtx) {
-              session._ringbackActive = true;
-              playRingback(session).catch(console.error);
-            }
+            session._ringbackActive = true;
+            playRingback(session).catch(console.error);
             synthesize(greeting, sess.voice, sess.rate).then(playGreeting).catch(greetingFailed);
           }
           // Safety: the lock must never outlive a stuck playback.
