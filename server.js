@@ -990,10 +990,30 @@ app.post('/outbound-call', async (req, res) => {
   // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
   // is JUST "Hi — is this X?" — the stream layer waits for their answer before
   // part 2 (disclosure + purpose). Unknown callee: one combined line.
+  //
+  // Purpose framing (July 2 round 3, Kade's catch): the model fills `purpose`
+  // in whatever shape it likes — "is your refrigerator running?" produced
+  // "I'm calling because is your refrigerator running?". Frame by shape
+  // instead of blindly gluing onto "because".
+  const framePurpose = (p) => {
+    let t = String(p || '').slice(0, 300).trim().replace(/^["']+|["']+$/g, '');
+    t = t.replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '');
+    t = t.replace(/\s+/g, ' ').trim();
+    if (!t) return "I'm calling on their behalf";
+    const endPunct = /[.?!]$/.test(t) ? '' : '.';
+    if (/^(?:to\s+)?(?:ask|find out|check|see|confirm|verify|make sure)\b/i.test(t)) {
+      t = t.replace(/^to\s+/i, '');
+      return `I'm calling to ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
+    }
+    if (/\?$/.test(t) || /^(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|what|when|where|who|why|how)\b/i.test(t)) {
+      return `I've got a quick question — ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
+    }
+    return `I'm calling because ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
+  };
   const introText =
     `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
     `${userName || 'a Kade-AI user'}. This call may be recorded. ` +
-    `I'm calling because ${String(purpose).slice(0, 300)}.`;
+    framePurpose(purpose);
   const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
   const greeting2Text = calleeName ? introText : null;
   let greetingBuf = null;
@@ -1192,20 +1212,52 @@ async function finalizeOutboundCall(callSid) {
 // Agent-facing (July 2 2026, Kade: "she stopped instead of reporting back"):
 // result of a USER'S OWN outbound call — latest by default, or by callSid.
 // Scoped to the requesting user's id so nobody can read anyone else's calls.
-app.post('/outbound/result', (req, res) => {
-  const { secret, userId, callSid } = req.body || {};
+app.post('/outbound/result', async (req, res) => {
+  const { secret, userId, callSid, waitSec } = req.body || {};
   if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   if (!userId) return res.status(400).json({ error: 'userId required' });
 
-  const live = [...outboundMeta.values()]
-    .filter((m) => m.userId === userId && (!callSid || m.callSid === callSid))
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
-  const done = [...outboundLog]
-    .reverse()
-    .find((r) => r.userId === userId && (!callSid || r.callSid === callSid));
+  const findState = () => {
+    const live = [...outboundMeta.values()]
+      .filter((m) => m.userId === userId && (!callSid || m.callSid === callSid))
+      .sort((a, b) => b.startedAt - a.startedAt)[0];
+    const done = [...outboundLog]
+      .reverse()
+      .find((r) => r.userId === userId && (!callSid || r.callSid === callSid));
+    return { live, done };
+  };
 
-  // A live call is only "the" call if it's newer than the newest finished one.
+  // waitSec (July 2 round 3): the agent-side polling loop hit langgraph's
+  // recursion limit. Instead of making the MODEL poll, the bridge waits here
+  // (up to 55s) for the call to wrap. The transcript exists on the live meta
+  // from the moment the stream stops — finalization (Twilio pricing, 30-90s)
+  // doesn't have to block the report-back.
+  const deadline = Date.now() + Math.min(55, Math.max(0, parseInt(waitSec, 10) || 0)) * 1000;
+  let { live, done } = findState();
+  while (
+    live && (!done || live.startedAt > Date.parse(done.at)) &&
+    !live.finalized && !(live.transcript && live.transcript.length) &&
+    Date.now() < deadline
+  ) {
+    await new Promise((r) => setTimeout(r, 2500));
+    ({ live, done } = findState());
+  }
+
   if (live && (!done || live.startedAt > Date.parse(done.at))) {
+    // Call ended but finalize is still pricing it: the transcript is already
+    // on the meta — return it now, that's what report-back needs.
+    if (live.finalized || (live.transcript && live.transcript.length)) {
+      return res.json({
+        found: true,
+        status: live.finalStatus || 'completed',
+        callSid: live.callSid,
+        to: live.to,
+        calleeName: live.calleeName,
+        purpose: live.purpose,
+        durationSec: Math.round((Date.now() - live.startedAt) / 1000),
+        transcript: (live.transcript || []).slice(-40),
+      });
+    }
     return res.json({
       found: true,
       status: 'in-progress',
@@ -1214,7 +1266,7 @@ app.post('/outbound/result', (req, res) => {
       calleeName: live.calleeName,
       purpose: live.purpose,
       startedSecondsAgo: Math.round((Date.now() - live.startedAt) / 1000),
-      note: 'Call is still going — check again in a minute for the transcript.',
+      note: 'Call is still going.',
     });
   }
   if (!done) return res.json({ found: false, note: 'No outbound calls found for this user.' });
