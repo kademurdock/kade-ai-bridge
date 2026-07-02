@@ -63,6 +63,18 @@ const PHONE_SUFFIX =
   'Don\'t do this every turn — only when it genuinely fits. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
+// Identity grounding (July 2 2026): the person on the line, by registry name.
+// Overrides any platform-memory notion of who "the user" is (see callerName
+// note in CallSession).
+function callerLine(session) {
+  if (!session.callerName) return '';
+  return (
+    `\n[The person on this call is ${session.callerName}. That is who you are ` +
+    'talking to and who you address — regardless of what any memory or platform ' +
+    'note says about who the account user usually is.]'
+  );
+}
+
 // ── Outbound-call context (July 1 2026) ──────────────────────────────────────
 // An outbound call is the same pipeline with a scripted, disclosure-first
 // greeting (AI + on whose behalf + recording notice + latency heads-up) and a
@@ -383,6 +395,13 @@ class CallSession {
     this.cfg         = cfg;
     this.agentId     = user?.agentId   || cfg.defaultAgent;
     this.agentName   = user?.agentName || cfg.defaultAgentName;
+    // KADE July 2 2026: who is actually ON THE LINE (registry name, both
+    // directions — inbound caller or outbound callee). Used to ground the
+    // model's sense of who it's talking to: phone turns run through the
+    // proxy's ADMIN LibreChat session, whose platform memories describe Kade —
+    // without this, agents drifted into calling ANY caller "Kade" (live
+    // report: Lilly called Skylee "Kade" mid-call).
+    this.callerName  = user?.name || null;
     // Voice resolution (July 2 2026): caller's explicit spoken-command choice
     // wins, then the AGENT's builder-set voice (bridge-side cache, zero call-
     // time latency), then the platform default. Same order as outbound.
@@ -692,7 +711,7 @@ async function streamReply(session, userText) {
   while (session.history.length > 60) session.history.shift();
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + (session.outboundSuffix || '') }
+      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + (session.outboundSuffix || '') }
       : m
   );
 
