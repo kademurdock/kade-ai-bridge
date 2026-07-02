@@ -736,8 +736,25 @@ async function streamReply(session, userText) {
     { agentId: session.agentId, messages: outgoing }
   );
 
+  // HARD TURN DEADLINE (July 2 2026, round 4): the proxy's SSE keepalives
+  // (:ka every 10s) defeat streamPost's 25s socket-inactivity timeout, so a
+  // LibreChat turn that hangs WITHOUT erroring (seen live: the turn after a
+  // mid-generation barge-in) used to leave the caller in typing-sound limbo
+  // forever. Token progress resets the clock; pure keepalives don't.
+  const TURN_STALL_MS = parseInt(process.env.PHONE_TURN_STALL_MS || '45000', 10);
+  let turnTimedOut = false;
   await new Promise((resolve, reject) => {
     let buf = '';
+    let lastProgress = Date.now();
+    const stallCheck = setInterval(() => {
+      if (Date.now() - lastProgress > TURN_STALL_MS) {
+        turnTimedOut = true;
+        clearInterval(stallCheck);
+        console.warn(`[voice-stream] TURN STALLED ${Math.round(TURN_STALL_MS / 1000)}s with no tokens — giving up on this turn`);
+        res.destroy();
+        resolve();
+      }
+    }, 1000);
     res.on('data', (chunk) => {
       buf += chunk.toString();
       const lines = buf.split('\n');
@@ -745,18 +762,18 @@ async function streamReply(session, userText) {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const raw = line.slice(6).trim();
-        if (raw === '[DONE]') { resolve(); return; }
+        if (raw === '[DONE]') { clearInterval(stallCheck); resolve(); return; }
         try {
           const d = JSON.parse(raw);
-          if (d.error) { reject(new Error(d.error)); return; }
-          if (d.token) { fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
+          if (d.error) { clearInterval(stallCheck); reject(new Error(d.error)); return; }
+          if (d.token) { lastProgress = Date.now(); fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
         } catch {}
       }
     });
-    res.on('end', resolve);
-    res.on('error', reject);
+    res.on('end', () => { clearInterval(stallCheck); resolve(); });
+    res.on('error', (e) => { clearInterval(stallCheck); reject(e); });
     const checkAbort = setInterval(() => {
-      if (session.llmAbort) { clearInterval(checkAbort); res.destroy(); resolve(); }
+      if (session.llmAbort) { clearInterval(checkAbort); clearInterval(stallCheck); res.destroy(); resolve(); }
     }, 100);
     res.on('close', () => clearInterval(checkAbort));
   });
@@ -764,6 +781,13 @@ async function streamReply(session, userText) {
   if (!session.llmAbort) streamer.end();
   await playChain;
   fillerCtx.firstAudioReady = true; // safety: stop the filler loop even on an empty/aborted reply
+  if (!session.llmAbort && !fullReply.trim() && session.ws.readyState === WebSocket.OPEN) {
+    // Zero tokens (stall or empty turn): silence reads as a dead line. Own it.
+    const line = turnTimedOut
+      ? 'Sorry — I lost my train of thought there. Go ahead.'
+      : "Sorry, say that once more?";
+    try { await speak(session, line, session.voice); } catch {}
+  }
   if (fullReply) {
     session.history.push({ role: 'assistant', content: fullReply.replace(/\[END CALL\]/gi, '').trim() });
   }
@@ -1065,7 +1089,10 @@ async function sendFillerClip(session, ctx, buf) {
 // later (e.g. only after confirming proxy headroom under real concurrent load).
 async function runThinkingFiller(session, ctx) {
   if (ctx.firstAudioReady || session.llmAbort) return;
-  while (!ctx.firstAudioReady && !session.llmAbort && session.ws.readyState === WebSocket.OPEN) {
+  // Never type-fill longer than the turn deadline + grace: infinite typing
+  // sounds on a dead turn was a live bug (July 2 2026).
+  const fillerDeadline = Date.now() + 60000;
+  while (!ctx.firstAudioReady && !session.llmAbort && session.ws.readyState === WebSocket.OPEN && Date.now() < fillerDeadline) {
     ctx.fillerStarted = true;
     const clip = TYPING_CLIPS[Math.floor(Math.random() * TYPING_CLIPS.length)];
     const finishedClean = await sendFillerClip(session, ctx, clip);

@@ -1010,9 +1010,12 @@ app.post('/outbound-call', async (req, res) => {
     }
     return `I'm calling because ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
   };
+  // First name only when speaking (Kade's ask: "calling for Kade", not
+  // "calling for Kade Murdock"). Full name stays in records/transcripts.
+  const spokenUserName = String(userName || '').trim().split(/\s+/)[0] || 'a Kade-AI user';
   const introText =
     `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
-    `${userName || 'a Kade-AI user'}. This call may be recorded. ` +
+    `${spokenUserName}. This call may be recorded. ` +
     framePurpose(purpose);
   const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
   const greeting2Text = calleeName ? introText : null;
