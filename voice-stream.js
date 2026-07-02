@@ -111,7 +111,10 @@ function buildOutboundSuffix(ctx) {
     `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
     `numbers, names), say them back out loud once before the goodbye so the transcript captures them for ${ctx.userName}. ` +
     `When the mission is done, clearly impossible, or the person wants to stop: ` +
-    `say a natural goodbye and finish your reply with the exact token [END CALL] ]`
+    `say a natural goodbye and finish your reply with the exact token [END CALL] ]` +
+    // KADE July 2 2026 (briefings): extra mission material (e.g. today's
+    // headlines) provided at dial time — facts the agent may read from.
+    (ctx.context ? `\n\n[MISSION MATERIAL:\n${ctx.context}\n]` : '')
   );
 }
 

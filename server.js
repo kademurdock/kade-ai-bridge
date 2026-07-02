@@ -969,7 +969,7 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context } = req.body || {};
   // KADE July 2 2026: the model sometimes fills calleeName with junk like
   // "whoever it is" or "the person" — which produced the live gem
   // "Hi, is this whoever it is?". A name is only a name if it looks like one.
@@ -1122,6 +1122,10 @@ app.post('/outbound-call', async (req, res) => {
       userId,
       userName: userName || 'a Kade-AI user',
       purpose: String(purpose).slice(0, 500),
+      // KADE July 2 2026 (briefings): optional extra mission material (e.g.
+      // today's headlines) — too big for `purpose`, rides its own field and
+      // voice-stream appends it to the mission context.
+      context: String(context || '').slice(0, 4000) || null,
       calleeName: calleeName || null,
       to: e164,
       agentId: agentId || DEFAULT_AGENT,
@@ -1384,7 +1388,172 @@ app.get('/outbound/recording/:callSid', async (req, res) => {
   }
 });
 
+// ── Scheduled morning news briefings (July 2 2026, Kade's ask) ───────────────
+// Opt-in daily briefing CALL: at the subscriber's chosen Central time, the
+// bridge pulls free RSS headlines for their chosen categories and places an
+// outbound call through the normal machinery (same disclosure greeting, caps,
+// recording, and per-user billing to Feed the Server).
+//
+// Registry lives on the volume: briefings.json
+//   phone(E.164) -> { name, userId, userName, agentId, agentName,
+//                     time "HH:MM" (America/Chicago), categories [...],
+//                     enabled, lastRun "YYYY-MM-DD" }
+const BRIEFINGS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'briefings.json');
+const briefings = new Map(Object.entries(loadJsonFile(BRIEFINGS_FILE, {})));
+function saveBriefings() { saveJsonFile(BRIEFINGS_FILE, Object.fromEntries(briefings)); }
+
+const BRIEFING_FEEDS = {
+  national: ['https://feeds.npr.org/1001/rss.xml'],
+  world: ['https://feeds.bbci.co.uk/news/world/rss.xml', 'https://feeds.npr.org/1004/rss.xml'],
+  local: ['https://www.ozarksfirst.com/feed/', 'https://www.ky3.com/arc/outboundfeeds/rss/'],
+  tech: ['https://feeds.arstechnica.com/arstechnica/index'],
+  entertainment: ['https://variety.com/feed/'],
+  music: ['https://www.rollingstone.com/music/feed/', 'https://www.billboard.com/feed/'],
+  sports: ['https://www.espn.com/espn/rss/news'],
+};
+
+function briefingDecode(x) {
+  return String(x || '')
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
+
+async function fetchBriefingHeadlines(categories) {
+  const cats = (Array.isArray(categories) && categories.length ? categories : ['national', 'local'])
+    .map((c) => String(c).toLowerCase())
+    .filter((c) => BRIEFING_FEEDS[c]);
+  const out = [];
+  for (const cat of cats.length ? cats : ['national', 'local']) {
+    for (const url of BRIEFING_FEEDS[cat]) {
+      try {
+        const r = await axios.get(url, {
+          timeout: 12000, responseType: 'text',
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KadeAI-NewsReader/1.0)' },
+          maxContentLength: 3 * 1024 * 1024,
+        });
+        const blocks = String(r.data).match(/<item[\s>][\s\S]*?<\/item>|<entry[\s>][\s\S]*?<\/entry>/gi) || [];
+        const titles = [];
+        for (const b of blocks) {
+          const m = b.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+          const t = m && briefingDecode(m[1]);
+          if (t) titles.push(t);
+          if (titles.length >= 4) break;
+        }
+        if (titles.length) {
+          out.push(`${cat.toUpperCase()}: ${titles.join(' • ')}`);
+          break; // next category — this feed worked
+        }
+      } catch (e) {
+        console.warn(`[briefing] feed failed (${url}): ${e.message}`);
+      }
+    }
+  }
+  return out.join('\n');
+}
+
+// POST /briefing — create/update a subscription (admin, BRIDGE_SECRET).
+// Body: { secret, phone, time "HH:MM" CT, userId, categories?, name?,
+//         userName?, agentId?, agentName?, enabled? }
+app.post('/briefing', (req, res) => {
+  const { secret, phone, time, categories, name, userId, userName, agentId, agentName, enabled } = req.body || {};
+  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const e164 = normalizeUsPhone(phone);
+  if (!e164) return res.status(400).json({ error: 'phone must be a valid US/Canada number' });
+  if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(String(time || ''))) {
+    return res.status(400).json({ error: 'time must be "HH:MM" (24h, America/Chicago)' });
+  }
+  if (!userId) return res.status(400).json({ error: 'userId required — whose Feed the Server page do the calls bill to?' });
+  const reg = users.get(e164) || {};
+  const prev = briefings.get(e164) || {};
+  const sub = {
+    name: name || reg.name || prev.name || 'there',
+    userId: String(userId),
+    userName: userName || name || reg.name || prev.userName || 'a Kade-AI user',
+    agentId: agentId || reg.agentId || prev.agentId || DEFAULT_AGENT,
+    agentName: agentName || reg.agentName || prev.agentName || DEFAULT_AGENT_NAME,
+    time: String(time),
+    categories: Array.isArray(categories) && categories.length ? categories : prev.categories || ['national', 'local'],
+    enabled: enabled !== false,
+    lastRun: prev.lastRun || null,
+  };
+  briefings.set(e164, sub);
+  saveBriefings();
+  console.log(`[briefing] subscription saved: ${e164} at ${sub.time} CT (${sub.categories.join(',')}) via ${sub.agentName}`);
+  res.json({ ok: true, phone: e164, ...sub });
+});
+
+app.get('/briefings', (req, res) => {
+  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  res.json(Object.fromEntries(briefings));
+});
+
+app.delete('/briefing', (req, res) => {
+  const secret = req.query.secret || (req.body && req.body.secret);
+  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const e164 = normalizeUsPhone(req.query.phone || (req.body && req.body.phone));
+  if (!e164 || !briefings.has(e164)) return res.status(404).json({ error: 'No subscription for that phone' });
+  briefings.delete(e164);
+  saveBriefings();
+  res.json({ ok: true, removed: e164 });
+});
+
+async function fireBriefing(e164, sub, today) {
+  sub.lastRun = today;
+  saveBriefings();
+  try {
+    const headlines = await fetchBriefingHeadlines(sub.categories);
+    if (!headlines) {
+      console.warn(`[briefing] no headlines available for ${e164} — skipping today`);
+      return;
+    }
+    const firstName = String(sub.name).trim().split(/\s+/)[0];
+    const resp = await axios.post(`${PUBLIC_URL}/outbound-call`, {
+      secret: BRIDGE_SECRET,
+      to: e164,
+      userId: sub.userId,
+      userName: sub.userName,
+      calleeName: firstName,
+      agentId: sub.agentId,
+      agentName: sub.agentName,
+      purpose: `tell you today's news — the morning briefing you signed up for`,
+      context:
+        `THIS IS A SCHEDULED MORNING NEWS BRIEFING the callee subscribed to. ` +
+        `Deliver today's headlines conversationally, morning-radio style, in your own voice — short and lively, not a list recital. ` +
+        `They can ask you to expand on any story (only elaborate from what's below; never invent details). ` +
+        `When they're done (or after the rundown if they're quiet), say a warm goodbye and end with [END CALL].\n\n` +
+        `TODAY'S HEADLINES:\n${headlines}`,
+    }, { timeout: 30000 });
+    console.log(`[briefing] fired for ${e164}: call ${resp.data && resp.data.callSid}`);
+  } catch (e) {
+    console.error(`[briefing] failed for ${e164}: ${(e.response && JSON.stringify(e.response.data)) || e.message}`);
+  }
+}
+
+setInterval(() => {
+  if (!ENABLE_OUTBOUND || !twilioClient || briefings.size === 0) return;
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(now).reduce((o, p) => ((o[p.type] = p.value), o), {});
+    const today = `${parts.year}-${parts.month}-${parts.day}`;
+    const hhmm = `${parts.hour === '24' ? '00' : parts.hour}:${parts.minute}`;
+    for (const [e164, sub] of briefings) {
+      if (sub.enabled && sub.time === hhmm && sub.lastRun !== today) {
+        fireBriefing(e164, sub, today);
+      }
+    }
+  } catch (e) {
+    console.error('[briefing] scheduler tick error:', e.message);
+  }
+}, 60 * 1000);
+
 // Hooks for voice-stream.js
+
 function getOutboundCtx(callSid) { return outboundMeta.get(callSid) || null; }
 function onCallEnd(callSid, history) {
   const meta = outboundMeta.get(callSid);
