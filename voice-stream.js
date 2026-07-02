@@ -555,6 +555,16 @@ async function handleUtterance(session, text) {
       console.log(`[voice-stream] queueing post-barge-in utterance: "${text.slice(0,50)}"`);
       session._pending = session._pending ? `${session._pending} ${text}` : text;
     } else {
+      // KADE July 2 2026 (round 5, live pizza-call finding): a bare backchannel
+      // ("okay", "yeah", "mhm") spoken while the reply was still GENERATING
+      // (nothing playing yet) aborted and restarted the whole turn. Chained
+      // backchannels produced ~20s of typing-sound limbo on a live call even
+      // though every individual generation took only 2-3s (reframe logs).
+      // A human doesn't restart their sentence because the listener nodded.
+      if (BACKCHANNEL_RE.test(text.trim())) {
+        console.log(`[voice-stream] backchannel during generation, dropping: "${text.slice(0,50)}"`);
+        return;
+      }
       console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
       session.sendClear(); // flush any in-flight thinking-filler audio
       session.llmAbort = true;
@@ -667,6 +677,11 @@ async function handleUtterance(session, text) {
 }
 
 // ── Stream LLM reply ──────────────────────────────────────────────────────────
+// KADE July 2 2026 (round 5): bare acknowledgments that should NOT restart a
+// turn that's still generating. Strictly short/pure — anything with real
+// content still aborts and re-asks as before.
+const BACKCHANNEL_RE = /^(?:(?:okay|ok|kay|yeah|yea|yes|yep|yup|mhm|mm-?hmm?|uh-?huh|right|sure|alright|all right|gotcha|i see|cool)[,.!?\s]*){1,3}$/i;
+
 async function streamReply(session, userText) {
   session.history.push({ role: 'user', content: userText });
   while (session.history.length > 60) session.history.shift();
