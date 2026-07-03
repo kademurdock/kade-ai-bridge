@@ -765,14 +765,33 @@ async function streamReply(session, userText) {
     if (/\[END CALL\]/i.test(sentence)) {
       session.endCallRequested = true;
       sentence = sentence.replace(/\[END CALL\]/gi, '').trim();
-      if (sentence.length < 2) return; // token-only fragment, nothing to speak
     }
-    const synthInput = applyDirectionCarry(sentence, dirState);
-    const synthPromise = synthesize(synthInput, session.voice, session.rate).catch((e) => {
-      console.error('[voice-stream] synthesis prefetch error:', e.message);
-      return null;
-    });
-    const sentenceIndex = ++sentCount;
+    // Game Parlor phase 3: pull [sound:x] cues out of the sentence. The cue
+    // clips play IN the sentence chain (before this sentence's speech) so
+    // card sounds land where the action happens; the token itself is never
+    // sent to TTS. A sentence that was ONLY cue tokens still plays its
+    // sounds — it just has nothing to say.
+    const gameCues = [];
+    if (sentence.indexOf('[sound:') !== -1) {
+      GAME_SOUND_RE.lastIndex = 0;
+      sentence = sentence
+        .replace(GAME_SOUND_RE, (_m, c) => {
+          if (gameCues.length < MAX_CUES_PER_SENTENCE) gameCues.push(c.toLowerCase());
+          return ' ';
+        })
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+    }
+    const hasSpeech = sentence.length >= 2;
+    if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
+    const synthInput = hasSpeech ? applyDirectionCarry(sentence, dirState) : '';
+    const synthPromise = hasSpeech
+      ? synthesize(synthInput, session.voice, session.rate).catch((e) => {
+          console.error('[voice-stream] synthesis prefetch error:', e.message);
+          return null;
+        })
+      : Promise.resolve(null);
+    const sentenceIndex = hasSpeech ? ++sentCount : sentCount;
     // Self-interrupt hint: the arrival of sentence N+1 proves the turn is
     // still going -- play the hint right before it. Prefetch now so the hint
     // never stalls the sentence pipeline.
@@ -795,6 +814,19 @@ async function streamReply(session, userText) {
       if (ramblePromise) {
         const hintBuf = await ramblePromise;
         if (hintBuf && !session.llmAbort) await playBuffer(session, hintBuf);
+      }
+      for (const cue of gameCues) {
+        if (session.llmAbort) break;
+        const clip = pickGameClip(cue);
+        if (!clip) continue;
+        if (!fillerCtx.firstAudioReady) {
+          fillerCtx.firstAudioReady = true; // a table sound counts as first audio — stop the typing filler
+          if (fillerCtx.fillerStarted) {
+            session.sendClear();
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        await playBuffer(session, clip);
       }
       const mulawBuf = await synthPromise;
       if (mulawBuf && !session.llmAbort) {
@@ -1196,7 +1228,7 @@ function makeTypingBurst(durationMs) {
 const TYPING_PLACEHOLDER_CLIPS = Array.from({ length: 4 }, () => makeTypingBurst(2400 + Math.random() * 900));
 
 // Minimal RIFF/WAVE reader: 16-bit PCM, any channel count/sample rate -> mu-law 8kHz mono.
-function loadWavAsMulaw8k(filePath) {
+function loadWavAsMulaw8k(filePath, gain = 1) {
   const raw = fs.readFileSync(filePath);
   if (raw.toString('ascii', 0, 4) !== 'RIFF' || raw.toString('ascii', 8, 12) !== 'WAVE') {
     throw new Error('not a RIFF/WAVE file');
@@ -1204,9 +1236,11 @@ function loadWavAsMulaw8k(filePath) {
   let offset = 12, fmt = null, dataStart = -1, dataLen = 0;
   while (offset + 8 <= raw.length) {
     const id   = raw.toString('ascii', offset, offset + 4);
-    const size = raw.readUInt32LE(offset + 4);
+    // Some generators write a chunk size that overruns the actual file
+    // (seen live: one ElevenLabs clip). Clamp to what's really there.
+    const size = Math.min(raw.readUInt32LE(offset + 4), raw.length - offset - 8);
     const body = offset + 8;
-    if (id === 'fmt ') {
+    if (id === 'fmt ' && body + 16 <= raw.length) {
       fmt = {
         numChannels:   raw.readUInt16LE(body + 2),
         sampleRate:    raw.readUInt32LE(body + 4),
@@ -1237,9 +1271,55 @@ function loadWavAsMulaw8k(filePath) {
     const frac   = srcPos - i0;
     const s0     = mono[i0] || 0;
     const s1     = mono[Math.min(i0 + 1, frameCount - 1)] || 0;
-    out[i] = encodeUlaw(Math.max(-32768, Math.min(32767, Math.round(s0 + (s1 - s0) * frac))));
+    out[i] = encodeUlaw(Math.max(-32768, Math.min(32767, Math.round((s0 + (s1 - s0) * frac) * gain))));
   }
   return out;
+}
+
+// ── Game Parlor sound cues on the phone line (phase 3, July 3 2026) ──────────
+// The game engine emits [sound:x] tokens in tool results; the agent carries
+// them inline in its reply. On the web the chat client plays mp3s; here the
+// same cue names map to the master WAVs in assets/sounds/, pre-converted to
+// 8kHz mu-law at boot (exact same machinery as the typing-filler clips).
+// Files named name.wav / name_2.wav / name_3.wav are takes of one cue; a
+// take is picked at random per play. Cue clips are mastered near 0 dBFS
+// while speech sits at -20 dBFS RMS, so they load with a gain duck
+// (PHONE_SOUND_GAIN, default 0.4) to sit under the voice, not over it.
+const GAME_SOUND_RE = /\[sound:([a-z0-9_]+)\]/gi;
+const SOUND_ASSETS_DIR = path.join(__dirname, 'assets', 'sounds');
+const SOUND_GAIN = Math.max(0.05, Math.min(1, parseFloat(process.env.PHONE_SOUND_GAIN || '0.4')));
+const MAX_CUES_PER_SENTENCE = 4;
+
+function loadGameSoundClips() {
+  const bank = new Map(); // cue -> [mulawBuf, ...] (takes)
+  try {
+    if (!fs.existsSync(SOUND_ASSETS_DIR)) {
+      console.log('[voice-stream] no assets/sounds/ dir — game sound cues disabled on the phone');
+      return bank;
+    }
+    const files = fs.readdirSync(SOUND_ASSETS_DIR).filter((f) => f.toLowerCase().endsWith('.wav'));
+    for (const f of files) {
+      const cue = f.replace(/\.wav$/i, '').replace(/_\d+$/, '').toLowerCase();
+      try {
+        const buf = loadWavAsMulaw8k(path.join(SOUND_ASSETS_DIR, f), SOUND_GAIN);
+        if (!bank.has(cue)) bank.set(cue, []);
+        bank.get(cue).push(buf);
+      } catch (e) {
+        console.warn(`[voice-stream] skipping sound asset ${f}: ${e.message}`);
+      }
+    }
+    console.log(`[voice-stream] game sound bank: ${bank.size} cues from ${files.length} wav files (gain ${SOUND_GAIN})`);
+  } catch (e) {
+    console.warn('[voice-stream] game sound bank load failed:', e.message);
+  }
+  return bank;
+}
+const GAME_SOUND_BANK = loadGameSoundClips();
+
+function pickGameClip(cue) {
+  const takes = GAME_SOUND_BANK.get(cue);
+  if (!takes || !takes.length) return null; // unknown cue — stay silent, never break the call
+  return takes[Math.floor(Math.random() * takes.length)];
 }
 
 function loadTypingClips() {
