@@ -805,6 +805,11 @@ async function streamReply(session, userText) {
     // card sounds land where the action happens; the token itself is never
     // sent to TTS. A sentence that was ONLY cue tokens still plays its
     // sounds — it just has nothing to say.
+    // Game Parlor visuals (July 3 2026): [table:id] tokens are for the chat
+    // client's table widget only — on the phone they must simply vanish.
+    if (sentence.indexOf('[table:') !== -1) {
+      sentence = sentence.replace(/\[table:[a-z0-9]{1,12}\]/gi, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+    }
     const gameCues = [];
     if (sentence.indexOf('[sound:') !== -1) {
       GAME_SOUND_RE.lastIndex = 0;

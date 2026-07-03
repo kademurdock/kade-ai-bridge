@@ -506,7 +506,7 @@ app.post('/sms', async (req, res) => {
   try {
     const reply = await askAgent(user.agentId, history, body);
     // Game Parlor cue tokens are for audio surfaces; never show them in a text
-    let outText = reply.replace(/\[sound:[a-z0-9_]+\]/gi, '').replace(/[ \t]{2,}/g, ' ').trim();
+    let outText = reply.replace(/\[(?:sound:[a-z0-9_]+|table:[a-z0-9]{1,12})\]/gi, '').replace(/[ \t]{2,}/g, ' ').trim();
     if (isFirstText) {
       outText += "\n\n(Quick heads up: replies can take a few seconds -- reading your message and thinking it through, not stuck.)";
       seenSmsNumbers.add(from);
