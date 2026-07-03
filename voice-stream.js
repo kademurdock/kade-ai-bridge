@@ -504,6 +504,45 @@ function bargeIn(session) {
   session.llmAbort = true;
   session.isSpeaking = false;
   session.lastSpokAt = Date.now(); // echo window measures from the real stop, not a stale timestamp
+  armBargeRecovery(session);
+}
+
+// ── False-barge-in recovery (KADE July 3 2026 night, "she died mid-blackjack") ──
+// Live failure: a barge-in fired during a blackjack reply (probably a table-
+// sound clip or breath bleeding into the mic — Deepgram produced an interim
+// but never a FINAL), playback was killed, and since no utterance ever
+// arrived, no new turn started. Dead air until Kade gave up and hung up.
+// Net: if a barge-in is not followed by real words within a few seconds,
+// the agent speaks up instead of waiting forever. If the caller IS mid-
+// sentence (finalBuf accumulating), re-check later rather than talk over her.
+const BARGE_RECOVERY_MS = parseInt(process.env.PHONE_BARGE_RECOVERY_MS || '6000', 10);
+const BARGE_RECOVERY_LINES = [
+  'Sorry -- go ahead. I\'m listening.',
+  'You cut out on me -- what was that?',
+  'I stopped for you -- go ahead.',
+];
+function armBargeRecovery(session) {
+  if (BARGE_RECOVERY_MS <= 0) return;
+  if (session._bargeRecoveryTimer) clearTimeout(session._bargeRecoveryTimer);
+  const armedAt = Date.now();
+  session._bargeAt = armedAt;
+  const check = () => {
+    session._bargeRecoveryTimer = null;
+    if (session.ws.readyState !== WebSocket.OPEN) return;
+    // A real utterance landed (handleUtterance clears the timer, but belt+
+    // suspenders) or a new turn is running/speaking: nothing to recover.
+    if (session.busy || session.isSpeaking) return;
+    if ((session._lastUtteranceAt || 0) >= armedAt) return;
+    if (session.finalBuf) {
+      // She IS talking, the final just hasn't closed yet -- check again.
+      session._bargeRecoveryTimer = setTimeout(check, 3000);
+      return;
+    }
+    console.log('[voice-stream] barge-in got no follow-up utterance -- recovering');
+    const line = BARGE_RECOVERY_LINES[Math.floor(Math.random() * BARGE_RECOVERY_LINES.length)];
+    speak(session, line, session.voice).catch(() => {});
+  };
+  session._bargeRecoveryTimer = setTimeout(check, BARGE_RECOVERY_MS);
 }
 
 // ── Deepgram STT ──────────────────────────────────────────────────────────────
@@ -541,6 +580,7 @@ function openDeepgram(session) {
           // ignore this check, keep listening for a real interruption.
         } else {
           session.bargedIn = true;
+          console.log(`[voice-stream] barge-in trigger: "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
           bargeIn(session);
         }
       }
@@ -608,6 +648,8 @@ function releaseGreetingLock(session) {
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
+  session._lastUtteranceAt = Date.now();
+  if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
   if (session._greetingLock) {
     // Callee spoke while the greeting was pending or playing (usually their
     // "Hello?" on pickup). Hold the text — releaseGreetingLock() replays it
@@ -1733,7 +1775,8 @@ function attachMediaStreams(server, users, cfg) {
             session._ringbackActive = false;
             session.llmAbort = true;
             session.isSpeaking = false;
-            if (session.dgWs) { try { session.dgWs.close(); } catch {} }
+            if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
+        if (session.dgWs) { try { session.dgWs.close(); } catch {} }
           }
           session = null;
           break;
@@ -1749,6 +1792,7 @@ function attachMediaStreams(server, users, cfg) {
         session._ringbackActive = false;
         session.llmAbort = true;
         session.isSpeaking = false;
+        if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
         session = null;
       }
