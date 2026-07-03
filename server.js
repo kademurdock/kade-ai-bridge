@@ -323,12 +323,38 @@ function findAgent(agents, query) {
 }
 
 
+// Padding stripper + widened patterns, mirrored from voice-stream.js (July 3
+// 2026): polite phrasings ("Can you switch to Kiana?") must switch, not fall
+// through to the LLM.
+function stripSwitchPadding(text) {
+  let t = (text || '').trim();
+  const lead = /^(?:hey|hi|hello|yo|okay|ok|oh|um|uh|so|well|now|actually|please)[,.!?\s]+/i;
+  for (let i = 0; i < 4 && lead.test(t); i++) t = t.replace(lead, '');
+  t = t.replace(/^(?:can|could|would|will|do)\s+(?:you|we)\s+(?:please\s+)?/i, '');
+  t = t.replace(/^please\s+/i, '');
+  return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
+}
+
 function extractSwitchTarget(text, agents) {
-  const m = text.match(
-    /^(?:switch(?:\s+to)?|change(?:\s+to)?|talk(?:\s+to)?|give me|i want(?:\s+to(?:\s+talk(?:\s+to)?)?)?)\s+(.+)/i
-  );
-  const query = m ? m[1].trim() : (text.trim().split(/\s+/).length <= 2 ? text.trim() : null);
-  return query ? findAgent(agents, query) : null;
+  const t = stripSwitchPadding(text);
+  const patterns = [
+    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
+    /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
+    /^give\s+me\s+(.+)$/i,
+    /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
+  ];
+  let q = null;
+  for (const re of patterns) { const m = t.match(re); if (m) { q = m[1].trim(); break; } }
+  // Bare name: unchanged from the original matcher — raw short utterances
+  // only. (Stripping padding here backfired in regression tests: "Now what?"
+  // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
+  // substring pass already handles "Kiana please".)
+  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
+  if (!q) {
+    const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
+    if (m) q = stripSwitchPadding(m[1]);
+  }
+  return q ? findAgent(agents, q) : null;
 }
 
 // ── AI call ────────────────────────────────────────────────────────────────────

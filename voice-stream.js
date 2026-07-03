@@ -256,11 +256,43 @@ function findAgent(agents, query) {
   return r && r.confidence >= 0.6 ? r.agent : null;
 }
 
+// Strip conversational padding so switch commands survive politeness (Kade's
+// July 3 report: "Can you switch to Kiana?" fell through to the LLM and
+// Zadiana answered IN CHARACTER — slightly offended — instead of switching.
+// The old matcher was anchored to the utterance start, so any polite lead-in
+// defeated it, including the help page's own documented phrasing "can I talk
+// to Zadiana?").
+function stripSwitchPadding(text) {
+  let t = (text || '').trim();
+  const lead = /^(?:hey|hi|hello|yo|okay|ok|oh|um|uh|so|well|now|actually|please)[,.!?\s]+/i;
+  for (let i = 0; i < 4 && lead.test(t); i++) t = t.replace(lead, '');
+  t = t.replace(/^(?:can|could|would|will|do)\s+(?:you|we)\s+(?:please\s+)?/i, '');
+  t = t.replace(/^please\s+/i, '');
+  return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
+}
+
 function extractSwitchTarget(text, agents) {
-  const m = text.match(
-    /^(?:switch(?:\s+to)?|change(?:\s+to)?|talk(?:\s+to)?|give me|i want(?:\s+to(?:\s+talk(?:\s+to)?)?)?)\s+(.+)/i
-  );
-  const q = m ? m[1].trim() : (text.trim().split(/\s+/).length <= 2 ? text.trim() : null);
+  const t = stripSwitchPadding(text);
+  const patterns = [
+    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
+    /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
+    /^give\s+me\s+(.+)$/i,
+    /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
+  ];
+  let q = null;
+  for (const re of patterns) { const m = t.match(re); if (m) { q = m[1].trim(); break; } }
+  // Bare name: unchanged from the original matcher — raw short utterances
+  // only. (Stripping padding here backfired in regression tests: "Now what?"
+  // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
+  // substring pass already handles "Kiana please".)
+  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
+  if (!q) {
+    // Last-ditch: an explicit switch verb ANYWHERE — covers the vocative case
+    // ("Zadiana, switch me to Kiana"). findAgent's confidence gate keeps this
+    // from false-firing on ordinary sentences.
+    const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
+    if (m) q = stripSwitchPadding(m[1]);
+  }
   return q ? findAgent(agents, q) : null;
 }
 
@@ -373,9 +405,11 @@ function makeToneBuf(durationMs, freq1, freq2, amplitude) {
   return buf;
 }
 
-// Pre-generate once at module load: 1s ring ON, 500ms silence OFF.
-const RING_ON  = makeToneBuf(1000, 440, 480, 0.45);
-const RING_OFF = Buffer.alloc(4000, 0xFF); // 500ms μ-law silence
+// Pre-generate once at module load. REAL US ringback cadence (Kade's catch,
+// July 3 2026): 2s of tone, 4s of silence. The old 1s-on/0.5s-off loop
+// sounded like a fast "boop, boop" — nothing like an actual phone ringing.
+const RING_ON  = makeToneBuf(2000, 440, 480, 0.45);
+const RING_OFF = Buffer.alloc(32000, 0xFF); // 4s μ-law silence (8000 samples/s)
 
 // ── HTTP(S) helper ────────────────────────────────────────────────────────────
 function streamPost(urlStr, headers, body) {
@@ -696,7 +730,7 @@ async function handleUtterance(session, text) {
       session._awaitAgentPick = true;
       return;
     }
-    if (isBareSwitchRequest(text)) {
+    if (isBareSwitchRequest(stripSwitchPadding(text))) {
       session._awaitAgentPick = true;
       await speak(session, 'Sure — who would you like to talk to?', session.voice);
       return;
@@ -1397,7 +1431,7 @@ async function maybeStartThinkingFiller(session, ctx) {
 }
 
 // ── Ringback loop ─────────────────────────────────────────────────────────────
-// Plays US ring tone (440+480 Hz, 1s on / 500ms off) until _ringbackActive=false.
+// Plays US ring tone (440+480 Hz, 2s on / 4s off) until _ringbackActive=false.
 // Does NOT touch session.isSpeaking — totally independent of the barge-in system.
 async function playRingback(session) {
   async function sendBuf(buf) {
