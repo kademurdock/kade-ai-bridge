@@ -445,7 +445,7 @@ app.get('/media/:id', (req, res) => {
 
 // ── Admin: register / list users ───────────────────────────────────────────────
 app.post('/register', (req, res) => {
-  const { phone, name, agentId, agentName, lcEmail, lcPass, secret } = req.body;
+  const { phone, name, agentId, agentName, lcEmail, lcPass, secret, accountType } = req.body;
   if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const digits = phone.replace(/\D/g, '');
@@ -453,6 +453,7 @@ app.post('/register', (req, res) => {
   const record = { name: name || 'Friend', agentId: agentId || DEFAULT_AGENT, agentName: agentName || DEFAULT_AGENT_NAME };
   if (lcEmail) record.lcEmail = lcEmail;
   if (lcPass)  record.lcPass  = lcPass;
+  if (accountType === 'child') record.accountType = 'child'; // KADE July 3 2026
   users.set(e164, record);
   saveUsers();
   refreshAgentTts(record.agentId); // pick up the agent's builder voice for inbound calls
@@ -808,9 +809,12 @@ app.post('/signup', (req, res) => {
   if (digits.length < 10) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
   const e164 = digits.startsWith('1') ? '+' + digits : '+1' + digits;
   const record = { name: name.trim(), agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME };
+  // KADE July 3 2026: child accounts (711 signup code) carry the flag onto their
+  // phone registration so calls get the same invisible clean note as the site.
+  if (req.body.accountType === 'child') record.accountType = 'child';
   users.set(e164, record);
   saveUsers();
-  console.log('[bridge] Self-registered ' + e164 + ' as "' + name.trim() + '"');
+  console.log('[bridge] Self-registered ' + e164 + ' as "' + name.trim() + '"' + (record.accountType === 'child' ? ' (child account)' : ''));
   res.json({ ok: true, phone: e164 });
 });
 

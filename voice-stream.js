@@ -66,6 +66,20 @@ const PHONE_SUFFIX =
 // Identity grounding (July 2 2026): the person on the line, by registry name.
 // Overrides any platform-memory notion of who "the user" is (see callerName
 // note in CallSession).
+// KADE July 3 2026: invisible under-15 note for child-registered callers.
+// Mirrors the site-side note (agents/build.js in the fork): same personality,
+// clean content, never acknowledged.
+function childLine(session) {
+  if (!session.childCaller) return '';
+  return (
+    '\n[AUDIENCE NOTE — invisible, never mention or hint at it: the person on this ' +
+    'call is under 15. Same personality, same humor, but keep content clean: no ' +
+    'profanity, nothing sexual, no drug or alcohol talk, no graphic violence, nothing ' +
+    'genuinely disturbing. Never get preachy or babyish; never act like you are filtering. ' +
+    'If it heads somewhere adult, steer smoothly elsewhere in character.]'
+  );
+}
+
 function callerLine(session) {
   if (!session.callerName) return '';
   return (
@@ -405,6 +419,9 @@ class CallSession {
     // without this, agents drifted into calling ANY caller "Kade" (live
     // report: Lilly called Skylee "Kade" mid-call).
     this.callerName  = user?.name || null;
+    // KADE July 3 2026: child-registered numbers get the invisible under-15
+    // clean note on every phone turn (same nerf the site applies).
+    this.childCaller = user?.accountType === 'child';
     // Voice resolution (July 2 2026): caller's explicit spoken-command choice
     // wins, then the AGENT's builder-set voice (bridge-side cache, zero call-
     // time latency), then the platform default. Same order as outbound.
@@ -714,7 +731,7 @@ async function streamReply(session, userText) {
   while (session.history.length > 60) session.history.shift();
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + (session.outboundSuffix || '') }
+      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + childLine(session) + (session.outboundSuffix || '') }
       : m
   );
 
@@ -796,58 +813,72 @@ async function streamReply(session, userText) {
     });
   });
 
-  const res = await streamPost(
-    `${session.cfg.proxyUrl}/librechat/ask-stream`,
-    {
-      Authorization: `Bearer ${session.cfg.proxySecret}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0',
-      Accept: 'text/event-stream',
-    },
-    { agentId: session.agentId, messages: outgoing }
-  );
-
   // HARD TURN DEADLINE (July 2 2026, round 4): the proxy's SSE keepalives
   // (:ka every 10s) defeat streamPost's 25s socket-inactivity timeout, so a
   // LibreChat turn that hangs WITHOUT erroring (seen live: the turn after a
   // mid-generation barge-in) used to leave the caller in typing-sound limbo
   // forever. Token progress resets the clock; pure keepalives don't.
+  //
+  // AUTO-RETRY (July 3 2026, Kade's ask): a stall that produced ZERO tokens is
+  // retried once, silently — the hang usually becomes a normal (late) answer
+  // instead of the grace line. History is passed wholesale each attempt, so a
+  // retry is a clean re-ask. Never retried: partial replies (audio already
+  // played) or barge-ins. PHONE_STALL_RETRIES=0 restores old behavior.
   const TURN_STALL_MS = parseInt(process.env.PHONE_TURN_STALL_MS || '45000', 10);
+  const STALL_RETRIES = parseInt(process.env.PHONE_STALL_RETRIES || '1', 10);
   let turnTimedOut = false;
-  await new Promise((resolve, reject) => {
-    let buf = '';
-    let lastProgress = Date.now();
-    const stallCheck = setInterval(() => {
-      if (Date.now() - lastProgress > TURN_STALL_MS) {
-        turnTimedOut = true;
-        clearInterval(stallCheck);
-        console.warn(`[voice-stream] TURN STALLED ${Math.round(TURN_STALL_MS / 1000)}s with no tokens — giving up on this turn`);
-        res.destroy();
-        resolve();
-      }
-    }, 1000);
-    res.on('data', (chunk) => {
-      buf += chunk.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const raw = line.slice(6).trim();
-        if (raw === '[DONE]') { clearInterval(stallCheck); resolve(); return; }
-        try {
-          const d = JSON.parse(raw);
-          if (d.error) { clearInterval(stallCheck); reject(new Error(d.error)); return; }
-          if (d.token) { lastProgress = Date.now(); fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
-        } catch {}
-      }
+  for (let attempt = 0; attempt <= STALL_RETRIES; attempt++) {
+    turnTimedOut = false;
+    const res = await streamPost(
+      `${session.cfg.proxyUrl}/librechat/ask-stream`,
+      {
+        Authorization: `Bearer ${session.cfg.proxySecret}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+        Accept: 'text/event-stream',
+      },
+      { agentId: session.agentId, messages: outgoing }
+    );
+    await new Promise((resolve, reject) => {
+      let buf = '';
+      let lastProgress = Date.now();
+      const stallCheck = setInterval(() => {
+        if (Date.now() - lastProgress > TURN_STALL_MS) {
+          turnTimedOut = true;
+          clearInterval(stallCheck);
+          console.warn(`[voice-stream] TURN STALLED ${Math.round(TURN_STALL_MS / 1000)}s with no tokens (attempt ${attempt + 1}/${STALL_RETRIES + 1})`);
+          res.destroy();
+          resolve();
+        }
+      }, 1000);
+      res.on('data', (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') { clearInterval(stallCheck); resolve(); return; }
+          try {
+            const d = JSON.parse(raw);
+            if (d.error) { clearInterval(stallCheck); reject(new Error(d.error)); return; }
+            if (d.token) { lastProgress = Date.now(); fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
+          } catch {}
+        }
+      });
+      res.on('end', () => { clearInterval(stallCheck); resolve(); });
+      res.on('error', (e) => { clearInterval(stallCheck); reject(e); });
+      const checkAbort = setInterval(() => {
+        if (session.llmAbort) { clearInterval(checkAbort); clearInterval(stallCheck); res.destroy(); resolve(); }
+      }, 100);
+      res.on('close', () => clearInterval(checkAbort));
     });
-    res.on('end', () => { clearInterval(stallCheck); resolve(); });
-    res.on('error', (e) => { clearInterval(stallCheck); reject(e); });
-    const checkAbort = setInterval(() => {
-      if (session.llmAbort) { clearInterval(checkAbort); clearInterval(stallCheck); res.destroy(); resolve(); }
-    }, 100);
-    res.on('close', () => clearInterval(checkAbort));
-  });
+    if (!turnTimedOut) break; // finished (or errored) normally
+    if (fullReply.trim() || session.llmAbort) break; // partial audio played or caller took over — never re-run
+    if (attempt < STALL_RETRIES) {
+      console.warn('[voice-stream] zero-token stall — silently retrying the turn');
+    }
+  }
 
   if (!session.llmAbort) streamer.end();
   await playChain;
