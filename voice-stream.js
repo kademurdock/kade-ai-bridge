@@ -561,8 +561,16 @@ function openDeepgram(session) {
         // and Kiana "forgot" she'd asked. Now the window only makes the echo
         // CONTENT check stricter (0.35 overlap vs 0.6 outside it); an answer
         // that doesn't resemble what she just said always gets through.
-        const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
-        const isEcho = looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        // KADE July 3 2026 (the "call went dead" bug): echo is PHYSICALLY
+        // IMPOSSIBLE once the speaker has been silent a few seconds, but this
+        // check used to run forever -- "I'm testing the line", spoken ~10s
+        // after playback ended, overlapped Kiana's last (testing-themed)
+        // sentence 4/4 words and was silently eaten TWICE; the call looked
+        // dead and ended. Outside a hard 3s window, NOTHING is echo.
+        const sinceSpoke = Date.now() - session.lastSpokAt;
+        const echoPossible = session.isSpeaking || sinceSpoke < 3000;
+        const echoWindow = session.isSpeaking || sinceSpoke < 1200;
+        const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
         if (!isEcho) handleUtterance(session, utterance);
         else console.log(`[voice-stream] echo-dropped: "${utterance.slice(0, 60)}"`);
       }
@@ -572,8 +580,10 @@ function openDeepgram(session) {
     if (msg.type === 'UtteranceEnd' && session.finalBuf) {
       const utterance = session.finalBuf.trim();
       session.finalBuf = '';
-      const echoWindow = session.isSpeaking || (Date.now() - session.lastSpokAt < 1200);
-      const isEcho = looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+      const sinceSpoke = Date.now() - session.lastSpokAt;
+      const echoPossible = session.isSpeaking || sinceSpoke < 3000; // see speech_final note
+      const echoWindow = session.isSpeaking || sinceSpoke < 1200;
+      const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
       if (!isEcho) handleUtterance(session, utterance);
       else console.log(`[voice-stream] echo-dropped (UtteranceEnd): "${utterance.slice(0, 60)}"`);
     }
@@ -690,6 +700,26 @@ async function handleUtterance(session, text) {
       session.history   = [];
       const u = session.cfg.users.get(session.from);
       if (u) { u.agentId = agent.id; u.agentName = agent.name; session.cfg.saveUsers(); }
+      // KADE July 3 2026 bug report: the VOICE must follow the agent. This
+      // used to keep the OLD agent's voice until hang-up-and-call-back
+      // (Zadiana -> Kiana switch kept speaking in Zadiana's voice). Same
+      // resolution order as the CallSession constructor: caller's explicit
+      // spoken voice choice, then the new agent's builder voice, then default.
+      let agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
+      if (!agentTts && session.cfg.refreshAgentTts) {
+        // The TTS cache only pre-warms agents someone has as a DEFAULT; a
+        // mid-call switch target can miss. One bounded live lookup.
+        try {
+          await Promise.race([
+            session.cfg.refreshAgentTts(agent.id),
+            new Promise((r) => setTimeout(r, 4000)),
+          ]);
+        } catch {}
+        agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
+      }
+      session.voice = (u && u.voice) || (agentTts && agentTts.voiceId) || session.cfg.defaultVoice;
+      session.rate  = (u && typeof u.rate === 'number') ? u.rate
+        : (agentTts && typeof agentTts.rate === 'number' ? agentTts.rate : null);
       await speak(session, `Switching to ${agent.name}! What's on your mind?`, session.voice);
     };
     // ── Two-step agent switching (July 2 2026, Kade's request) ──────────────
@@ -839,10 +869,14 @@ async function streamReply(session, userText) {
       RAMBLE_HINT_AFTER > 0 &&
       sentenceIndex === RAMBLE_HINT_AFTER + 1 &&
       !rambleHintQueued &&
+      !session._rambleHintPlayed && // KADE July 3: once per CALL -- it fired
+                                    // every long turn (each blackjack deal!)
+                                    // and drove her nuts; greeting covers it
       !session.outbound &&
       !session.endCallRequested
     ) {
       rambleHintQueued = true;
+      session._rambleHintPlayed = true;
       ramblePromise = getRambleClip(session.voice, session.rate).catch((e) => {
         console.error('[voice-stream] ramble-hint synth error:', e.message);
         return null;
@@ -1133,10 +1167,13 @@ const FILLER_PHRASES = [
 // after-the-invite line. The old shape (invite, ~1s synth-gap of silence,
 // then "by the way...") baited callers into talking and then talked over
 // them, and barge-in usually killed the notice entirely.
+// KADE July 3 2026: per her ask, the greeting now ALSO covers interrupting,
+// so the recurring in-turn "you can cut me off" hint could be demoted to
+// once per call (see RAMBLE_HINT section).
 const ORIENTATION_LINES = [
-  "Quick note -- a little sound means I'm thinking, still here.",
-  "Heads up -- you'll hear a small sound while I think. Still on the line.",
-  "One thing -- a little sound plays while I think it over. I'm here.",
+  "Real quick -- when I'm thinking, you'll hear a little typing sound. I'm still here, and you can interrupt me any time.",
+  "Quick note -- a typing sound just means I'm thinking. Still with you, and feel free to cut in whenever.",
+  "One thing -- you'll hear a little typing while I think. I'm still on the line, and you can jump in any time.",
 ];
 
 // Lazy per-voice cache so a given filler phrase is only synthesized once per

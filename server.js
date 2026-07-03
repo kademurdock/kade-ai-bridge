@@ -1615,6 +1615,7 @@ attachMediaStreams(server, users, {
   defaultAgentName: DEFAULT_AGENT_NAME,
   getAgents,
   getAgentTts: (id) => agentTtsCache.get(id) || null,
+  refreshAgentTts,            // July 3 2026: mid-call switch targets may not be cached
   saveUsers,
   seenCallNumbers,
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
