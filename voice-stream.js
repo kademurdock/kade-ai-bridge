@@ -296,6 +296,42 @@ function extractSwitchTarget(text, agents) {
   return q ? findAgent(agents, q) : null;
 }
 
+// ── Deep-think voice command (July 4 2026, Kade's reasoning-switch plan) ─────
+// Phone turns run reasoning effort:'none' by default (reframe-proxy's
+// [PHONE CALL marker branch). Saying "think hard" / "deep think on" flips a
+// per-CALL mode: while on, every turn carries a fresh timestamped
+// "[DEEP THINK <ms>]" marker, which reframe-proxy honors over the phone
+// none-override (effort high for that turn). "Back to quick answers" turns
+// it off. Command-only utterances get a one-line spoken confirm; a "think
+// hard..." embedded in a real question flips the mode on SILENTLY and that
+// same turn already runs deep.
+function deepThinkCommandOf(text) {
+  const t = stripSwitchPadding(text).replace(/[.!?]+$/, '').trim();
+  const on = [
+    /^(?:turn|switch)?\s*(?:on\s+)?deep\s*think(?:ing)?(?:\s*mode)?(?:\s+on)?$/i,
+    /^(?:really\s+)?think\s+(?:hard(?:er)?|deeply|carefully)(?:\s+(?:about|on)\s+(?:this|that|it|things|everything))?(?:\s+from\s+now\s+on)?$/i,
+    /^put\s+(?:on\s+)?your\s+thinking\s+cap(?:\s+on)?$/i,
+    /^take\s+your\s+time\s+and\s+think$/i,
+  ];
+  const off = [
+    /^(?:(?:turn|switch)\s+)?(?:off\s+deep\s*think(?:ing)?(?:\s*mode)?|deep\s*think(?:ing)?(?:\s*mode)?\s+off)$/i,
+    /^(?:go\s+)?back\s+to\s+(?:quick|fast|normal)\s+(?:answers|replies|mode|thinking)$/i,
+    /^quick\s+answers$/i,
+    /^stop\s+thinking\s+so\s+hard$/i,
+    /^no\s+more\s+deep\s+think(?:ing)?$/i,
+  ];
+  // "off" first: "deep thinking off" also matches the permissive ON pattern's
+  // shape if checked first.
+  for (const re of off) if (re.test(t)) return 'off';
+  for (const re of on) if (re.test(t)) return 'on';
+  return null;
+}
+// Embedded ask ("think hard about whether I should move") — mode on, no
+// confirm, the question itself proceeds as the turn.
+function mentionsDeepThink(text) {
+  return /\b(?:think\s+(?:really\s+)?(?:hard|deeply|carefully)|deep\s*think(?:ing)?(?:\s+mode)?\s+on|put\s+(?:on\s+)?your\s+thinking\s+cap)\b/i.test(text || '');
+}
+
 // Bare "switch agents"-style request with no (matchable) name: the caller
 // wants the two-step flow — ask WHO, then match their answer by itself.
 function isBareSwitchRequest(text) {
@@ -802,6 +838,22 @@ async function handleUtterance(session, text) {
       session._awaitAgentPick = true;
       return;
     }
+    const dtCmd = deepThinkCommandOf(text);
+    if (dtCmd === 'on') {
+      session.deepThink = true;
+      await speak(session, "Okay — I'll really think things through from here on. Answers will take a little longer. Go ahead.", session.voice);
+      return;
+    }
+    if (dtCmd === 'off') {
+      session.deepThink = false;
+      await speak(session, 'Okay — back to quick answers. Go ahead.', session.voice);
+      return;
+    }
+    if (!session.deepThink && mentionsDeepThink(text)) {
+      // e.g. "think hard about whether we should move" — run THIS and later
+      // turns deep, no spoken confirm (the question is the turn).
+      session.deepThink = true;
+    }
     if (isBareSwitchRequest(stripSwitchPadding(text))) {
       session._awaitAgentPick = true;
       await speak(session, 'Sure — who would you like to talk to?', session.voice);
@@ -835,9 +887,14 @@ const BACKCHANNEL_RE = /^(?:(?:okay|ok|kay|yeah|yea|yes|yep|yup|mhm|mm-?hmm?|uh-
 async function streamReply(session, userText) {
   session.history.push({ role: 'user', content: userText });
   while (session.history.length > 60) session.history.shift();
+  // Deep-think mode: stamp THIS turn with a FRESH timestamped marker —
+  // reframe-proxy only honors a fresh one (≤10 min), and it strips every
+  // copy before the model sees it. Suffix-only, like PHONE_SUFFIX: the clean
+  // text stays in session.history.
+  const deepSuffix = session.deepThink ? ` [DEEP THINK ${Date.now()}]` : '';
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + childLine(session) + (session.outboundSuffix || '') }
+      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + childLine(session) + (session.outboundSuffix || '') + deepSuffix }
       : m
   );
 
