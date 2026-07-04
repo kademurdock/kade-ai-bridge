@@ -494,9 +494,11 @@ class CallSession {
     this.childCaller = user?.accountType === 'child';
     // Voice resolution (July 2 2026): caller's explicit spoken-command choice
     // wins, then the AGENT's builder-set voice (bridge-side cache, zero call-
-    // time latency), then the platform default. Same order as outbound.
+    // time latency), then (July 4 2026, outbound parity) an Inworld voice
+    // matching the agent's NAME, then the platform default.
     const agentTts   = (cfg.getAgentTts && cfg.getAgentTts(this.agentId)) || null;
-    this.voice       = user?.voice || agentTts?.voiceId || cfg.defaultVoice;
+    const nameVoice  = (cfg.findVoice && cfg.findVoice(this.agentName)) || null;
+    this.voice       = user?.voice || agentTts?.voiceId || nameVoice || cfg.defaultVoice;
     // Speaking rate (Kade 2026-07-01): null = proxy default. Adjusted live by
     // saying "speak faster" / "slow down" etc.; persisted per caller like voice.
     this.rate        = typeof user?.rate === 'number' ? user.rate
@@ -780,22 +782,37 @@ async function handleUtterance(session, text) {
       if (u) { u.agentId = agent.id; u.agentName = agent.name; session.cfg.saveUsers(); }
       // KADE July 3 2026 bug report: the VOICE must follow the agent. This
       // used to keep the OLD agent's voice until hang-up-and-call-back
-      // (Zadiana -> Kiana switch kept speaking in Zadiana's voice). Same
-      // resolution order as the CallSession constructor: caller's explicit
-      // spoken voice choice, then the new agent's builder voice, then default.
+      // (Zadiana -> Kiana switch kept speaking in Zadiana's voice).
+      //
+      // KADE July 4 2026 ("agents STILL don't switch voices"): the July 3 fix
+      // raced the live lookup against a 4s timer -- but the librechat proxy
+      // paces its LibreChat calls 4s apart (LIBRECHAT_MIN_GAP_MS), and the
+      // getAgents() list fetch earlier in THIS SAME TURN often burns a call,
+      // so the lookup queued behind a 4s gap and could never win. Live-caught
+      // 16:51 July 4: Zadiana's Voice 14 lookup completed AFTER the race
+      // timed out -- she spoke in Fucia. Now: kick the lookup off, cover the
+      // wait with a spoken line in the OLD voice (its playback eats most of
+      // the pacing gap), then allow 12s total. Also re-look-up when a cached
+      // entry has NO voice and is stale (>10 min), and fall back to a voice
+      // matching the agent's NAME before the default (outbound parity).
       let agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
-      if (!agentTts && session.cfg.refreshAgentTts) {
+      const staleNoVoice = agentTts && !agentTts.voiceId
+        && !(typeof agentTts.at === 'number' && Date.now() - agentTts.at < 10 * 60 * 1000);
+      if ((!agentTts || staleNoVoice) && session.cfg.refreshAgentTts) {
         // The TTS cache only pre-warms agents someone has as a DEFAULT; a
-        // mid-call switch target can miss. One bounded live lookup.
+        // mid-call switch target can miss.
+        const lookup = session.cfg.refreshAgentTts(agent.id).catch(() => {});
+        try { await speak(session, `One sec -- getting ${agent.name} on the line.`, session.voice); } catch {}
         try {
           await Promise.race([
-            session.cfg.refreshAgentTts(agent.id),
-            new Promise((r) => setTimeout(r, 4000)),
+            lookup,
+            new Promise((r) => setTimeout(r, 12000)),
           ]);
         } catch {}
         agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
       }
-      session.voice = (u && u.voice) || (agentTts && agentTts.voiceId) || session.cfg.defaultVoice;
+      const nameVoice = (session.cfg.findVoice && session.cfg.findVoice(agent.name)) || null;
+      session.voice = (u && u.voice) || (agentTts && agentTts.voiceId) || nameVoice || session.cfg.defaultVoice;
       session.rate  = (u && typeof u.rate === 'number') ? u.rate
         : (agentTts && typeof agentTts.rate === 'number' ? agentTts.rate : null);
       await speak(session, `Switching to ${agent.name}! What's on your mind?`, session.voice);

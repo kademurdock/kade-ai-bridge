@@ -245,6 +245,7 @@ async function refreshAgentTts(agentId) {
     agentTtsCache.set(agentId, {
       voiceId: tts.voiceId || null,
       rate: typeof tts.speakingRate === 'number' ? tts.speakingRate : null,
+      at: Date.now(), // July 4 2026: lets voice-stream retry stale no-voice entries
     });
     console.log(`[bridge] Agent TTS cached: ${agentId} -> voice ${tts.voiceId || '(none)'} rate ${tts.speakingRate ?? '(default)'}`);
   } catch (e) {
@@ -1616,6 +1617,7 @@ attachMediaStreams(server, users, {
   getAgents,
   getAgentTts: (id) => agentTtsCache.get(id) || null,
   refreshAgentTts,            // July 3 2026: mid-call switch targets may not be cached
+  findVoice,                  // July 4 2026: name-match fallback (outbound parity) for switches
   saveUsers,
   seenCallNumbers,
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
