@@ -85,6 +85,8 @@ const GAME_SUFFIX =
   'Round numbers and scores come ONLY from the NEWEST tool result, never ' +
   'from earlier conversation — earlier rounds are history, not the score.]';
 const GAME_ACTIVE_MS = 10 * 60 * 1000;
+// Bigger synth units = better prosody (context batching, July 4 2026).
+const TTS_CHUNK_TARGET = parseInt(process.env.PHONE_TTS_CHUNK || '320', 10);
 // July 4 2026 round 2 ("Still having problems", 17:24 call): arming only on
 // [table:]/[sound:] tokens misses the game REQUEST itself — "let's play
 // cards against reality" got a setup interview instead of a deal, and the
@@ -1002,7 +1004,7 @@ async function streamReply(session, userText) {
   let sentCount = 0;              // spoken sentences this turn (ramble hint)
   let rambleHintQueued = false;   // once per turn
 
-  streamer.on('sentence', (sentence) => {
+  const processUnit = (sentence) => {
     if (session.llmAbort) return;
     if (/\[END CALL\]/i.test(sentence)) {
       session.endCallRequested = true;
@@ -1096,6 +1098,37 @@ async function streamReply(session, userText) {
         await playBuffer(session, mulawBuf);
       }
     });
+  };
+
+  // TTS context batching (July 4 2026 — Kade: "make the chunks bigger; it
+  // can't remember it sounds like it's listing games"). Per-sentence synth
+  // gives the voice ZERO prosodic context: every clip is a cold start, so
+  // lists lose their listing rhythm. Sentence 1 still ships alone (fast
+  // first audio); after that, sentences accumulate to ~PHONE_TTS_CHUNK
+  // chars (default 320) and synth as ONE passage. Sentences carrying
+  // [sound:]/[table:] tokens flush the batch and pass through solo so cue
+  // timing survives; a sentence opening with a %%%direction%%% tag starts
+  // its own chunk so the tag stays in leading position for the TTS proxy.
+  let _chunkBuf = '';
+  let _firstShipped = false;
+  const flushChunk = () => {
+    if (_chunkBuf) { const c = _chunkBuf; _chunkBuf = ''; processUnit(c); }
+  };
+  streamer.on('sentence', (sentence) => {
+    if (session.llmAbort) return;
+    if (!_firstShipped) { _firstShipped = true; processUnit(sentence); return; }
+    if (sentence.indexOf('[sound:') !== -1 || sentence.indexOf('[table:') !== -1 || /\[END CALL\]/i.test(sentence)) {
+      flushChunk();
+      processUnit(sentence);
+      return;
+    }
+    if (/^\s*%%%/.test(sentence)) {
+      flushChunk();
+      _chunkBuf = sentence;
+      return;
+    }
+    _chunkBuf = _chunkBuf ? `${_chunkBuf} ${sentence}` : sentence;
+    if (_chunkBuf.length >= TTS_CHUNK_TARGET) flushChunk();
   });
 
   // HARD TURN DEADLINE (July 2 2026, round 4): the proxy's SSE keepalives
@@ -1165,7 +1198,7 @@ async function streamReply(session, userText) {
     }
   }
 
-  if (!session.llmAbort) streamer.end();
+  if (!session.llmAbort) { streamer.end(); flushChunk(); }
   await playChain;
   fillerCtx.firstAudioReady = true; // safety: stop the filler loop even on an empty/aborted reply
   if (!session.llmAbort && !fullReply.trim() && session.ws.readyState === WebSocket.OPEN) {
