@@ -63,6 +63,21 @@ const PHONE_SUFFIX =
   'Don\'t do this every turn — only when it genuinely fits. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
+// KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
+// Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
+// toolMode=false: the model adjudicated the game itself instead of passing
+// the move to the engine (reasoning:none + an UNO-flavored platform memory
+// primed it to ask "five what?"). The engine is the referee — remind the
+// model of that on every turn while a table is live. Detection: any [table:]
+// or [sound:] token seen in this call within the last 10 minutes.
+const GAME_SUFFIX =
+  '\n[GAME IN PROGRESS on this call. The game tool is the ONLY referee: pass ' +
+  "the caller's move to the game tool VERBATIM every time — a bare number " +
+  'like "five" means card/slot five in THIS game, not a card from any other ' +
+  'game. Never guess, adjudicate, or restate game state from memory; call ' +
+  'the tool and speak from what it returns.]';
+const GAME_ACTIVE_MS = 10 * 60 * 1000;
+
 // Identity grounding (July 2 2026): the person on the line, by registry name.
 // Overrides any platform-memory notion of who "the user" is (see callerName
 // note in CallSession).
@@ -909,9 +924,11 @@ async function streamReply(session, userText) {
   // copy before the model sees it. Suffix-only, like PHONE_SUFFIX: the clean
   // text stays in session.history.
   const deepSuffix = session.deepThink ? ` [DEEP THINK ${Date.now()}]` : '';
+  const gameSuffix = (typeof session.lastGameTokenAt === 'number'
+    && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS) ? GAME_SUFFIX : '';
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + callerLine(session) + childLine(session) + (session.outboundSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + (session.outboundSuffix || '') + deepSuffix }
       : m
   );
 
@@ -954,10 +971,12 @@ async function streamReply(session, userText) {
     // Game Parlor visuals (July 3 2026): [table:id] tokens are for the chat
     // client's table widget only — on the phone they must simply vanish.
     if (sentence.indexOf('[table:') !== -1) {
+      session.lastGameTokenAt = Date.now(); // a live table -> game mode (GAME_SUFFIX)
       sentence = sentence.replace(/\[table:[a-z0-9]{1,12}\]/gi, ' ').replace(/[ \t]{2,}/g, ' ').trim();
     }
     const gameCues = [];
     if (sentence.indexOf('[sound:') !== -1) {
+      session.lastGameTokenAt = Date.now(); // game sound cues -> game mode too
       GAME_SOUND_RE.lastIndex = 0;
       sentence = sentence
         .replace(GAME_SOUND_RE, (_m, c) => {
