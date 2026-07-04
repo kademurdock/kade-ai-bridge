@@ -81,7 +81,9 @@ const GAME_SUFFIX =
   'returns. When relaying a round, the short-reply phone rule is SUSPENDED: ' +
   'tell the WHOLE round from the tool result — the prompt, every card ' +
   'played and by whom, who won the round, and the score — and read hands ' +
-  'with their numbers. Skipping the reveal or the winner ruins the game.]';
+  'with their numbers. Skipping the reveal or the winner ruins the game. ' +
+  'Round numbers and scores come ONLY from the NEWEST tool result, never ' +
+  'from earlier conversation — earlier rounds are history, not the score.]';
 const GAME_ACTIVE_MS = 10 * 60 * 1000;
 // July 4 2026 round 2 ("Still having problems", 17:24 call): arming only on
 // [table:]/[sound:] tokens misses the game REQUEST itself — "let's play
