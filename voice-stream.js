@@ -408,6 +408,7 @@ class SentenceStreamer extends EventEmitter {
   constructor() {
     super();
     this._buf = '';
+    this._held = '';
     this._abbrevs = new Set([
       'dr','mr','mrs','ms','prof','vs','etc','e.g','i.e','a.m','p.m','st','ave',
       'jr','sr','no','vol','fig','dept','inc','ltd','corp',
@@ -418,7 +419,9 @@ class SentenceStreamer extends EventEmitter {
 
   end() {
     this._flush(true);
-    if (this._buf.trim().length > 2) this.emit('sentence', this._buf.trim());
+    let rem = this._buf.trim();
+    if (this._held) { rem = rem ? `${this._held} ${rem}` : this._held; this._held = ''; }
+    if (rem.length > 2) this.emit('sentence', rem);
     this._buf = '';
   }
 
@@ -436,13 +439,30 @@ class SentenceStreamer extends EventEmitter {
       const next = this._buf[abs + 1];
       if (!next && !isFinal) break;
       if (term === '.' && next && /\d/.test(next)) { pos = abs + 1; continue; }
+      // KADE July 4 2026 ("speech is still choppy... round, 1. You get to
+      // choose"): a numbered LIST item's period is not a sentence break.
+      // "\n  1. Getting caught at the buffet" used to split right after
+      // "1." — every card in a hand became two tiny TTS clips with a
+      // network-fetch gap between them. A number at line start (or buffer
+      // start) followed by a period is a list marker; a number mid-line
+      // ("the score is 21.") still ends a sentence normally.
+      if (term === '.' && /(^|\n)[ \t]*\d{1,3}$/.test(this._buf.slice(0, abs))) { pos = abs + 1; continue; }
       const pre = this._buf.slice(0, abs).split(/\s+/).pop();
       if (term === '.' && this._isAbbrev(pre)) { pos = abs + 1; continue; }
       if (!next || /[\s.!?]/.test(next)) {
         let end = abs;
         while (end < this._buf.length && /[.!?]/.test(this._buf[end])) end++;
-        const sentence = this._buf.slice(0, end).trim();
-        if (sentence.length > 4) this.emit('sentence', sentence);
+        let sentence = this._buf.slice(0, end).trim();
+        // Short-fragment merging (same report): "Round one." as its own
+        // synth = a stop-to-think pause mid-speech. Hold anything under
+        // 24 chars and let it ride in the same breath as what follows.
+        if (this._held) { sentence = `${this._held} ${sentence}`; this._held = ''; }
+        if (sentence.length > 4) {
+          if (sentence.length < 24 && !isFinal) this._held = sentence;
+          else this.emit('sentence', sentence);
+        } else if (sentence.length > 0 && !isFinal) {
+          this._held = this._held ? `${this._held} ${sentence}` : sentence;
+        }
         this._buf = this._buf.slice(end).trimStart();
         pos = 0;
         if (this._buf.length > 1400) { this.emit('sentence', this._buf.trim()); this._buf = ''; break; }
