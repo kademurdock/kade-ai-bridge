@@ -71,12 +71,31 @@ const PHONE_SUFFIX =
 // model of that on every turn while a table is live. Detection: any [table:]
 // or [sound:] token seen in this call within the last 10 minutes.
 const GAME_SUFFIX =
-  '\n[GAME IN PROGRESS on this call. The game tool is the ONLY referee: pass ' +
-  "the caller's move to the game tool VERBATIM every time — a bare number " +
-  'like "five" means card/slot five in THIS game, not a card from any other ' +
-  'game. Never guess, adjudicate, or restate game state from memory; call ' +
-  'the tool and speak from what it returns.]';
+  '\n[GAME MODE on this call. The game tool is the ONLY referee. If they name ' +
+  'a game or ask to play, START it through the game tool NOW — the engine ' +
+  'handles decks, rules, and settings; do not interview them about setup. ' +
+  "Once a game is live, pass the caller's move to the game tool VERBATIM " +
+  'every time — a bare number like "one" or "five" IS their move (card/slot ' +
+  'in THIS game, not a card from any other game). Never guess, adjudicate, ' +
+  'or restate game state from memory; call the tool and speak from what it ' +
+  'returns.]';
 const GAME_ACTIVE_MS = 10 * 60 * 1000;
+// July 4 2026 round 2 ("Still having problems", 17:24 call): arming only on
+// [table:]/[sound:] tokens misses the game REQUEST itself — "let's play
+// cards against reality" got a setup interview instead of a deal, and the
+// first bare "One." after the deal still went un-refereed. The ask-to-play
+// utterance now arms game mode BEFORE the turn goes to the model.
+const GAME_START_RE = new RegExp(
+  "\\b(let'?s play|deal me|play (?:a |some )?(?:game|cards)|game parlor|" +
+  'cards against|wild blanks|crab apples|blackjack|battleship|farkle|' +
+  "liar'?s dice|hangman|word scramble|tic[- ]?tac[- ]?toe|rock paper scissors|" +
+  'go fish|uno|in[- ]between|acey[- ]deucey|guess the sound|fill[- ]in stories|trivia)\\b', 'i');
+function armGameMode(session, why) {
+  const wasActive = typeof session.lastGameTokenAt === 'number'
+    && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS;
+  session.lastGameTokenAt = Date.now();
+  if (!wasActive) console.log(`[voice-stream] game mode ARMED (${why}) ${session.streamSid}`);
+}
 
 // Identity grounding (July 2 2026): the person on the line, by registry name.
 // Overrides any platform-memory notion of who "the user" is (see callerName
@@ -917,6 +936,7 @@ async function handleUtterance(session, text) {
 const BACKCHANNEL_RE = /^(?:(?:okay|ok|kay|yeah|yea|yes|yep|yup|mhm|mm-?hmm?|uh-?huh|right|sure|alright|all right|gotcha|i see|cool)[,.!?\s]*){1,3}$/i;
 
 async function streamReply(session, userText) {
+  if (GAME_START_RE.test(userText)) armGameMode(session, 'game request');
   session.history.push({ role: 'user', content: userText });
   while (session.history.length > 60) session.history.shift();
   // Deep-think mode: stamp THIS turn with a FRESH timestamped marker —
@@ -971,12 +991,12 @@ async function streamReply(session, userText) {
     // Game Parlor visuals (July 3 2026): [table:id] tokens are for the chat
     // client's table widget only — on the phone they must simply vanish.
     if (sentence.indexOf('[table:') !== -1) {
-      session.lastGameTokenAt = Date.now(); // a live table -> game mode (GAME_SUFFIX)
+      armGameMode(session, 'table token');
       sentence = sentence.replace(/\[table:[a-z0-9]{1,12}\]/gi, ' ').replace(/[ \t]{2,}/g, ' ').trim();
     }
     const gameCues = [];
     if (sentence.indexOf('[sound:') !== -1) {
-      session.lastGameTokenAt = Date.now(); // game sound cues -> game mode too
+      armGameMode(session, 'sound cue');
       GAME_SOUND_RE.lastIndex = 0;
       sentence = sentence
         .replace(GAME_SOUND_RE, (_m, c) => {
