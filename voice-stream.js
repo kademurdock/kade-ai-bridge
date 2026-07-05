@@ -565,6 +565,8 @@ class CallSession {
     this.rate        = typeof user?.rate === 'number' ? user.rate
       : (typeof agentTts?.rate === 'number' ? agentTts.rate : null);
     this.history     = [];
+    this.lcEmail     = user?.lcEmail || null;   // KADE Jul5: for Calls-history attribution
+    this.startedAt   = new Date().toISOString(); // KADE Jul5: call start for duration
     this.isSpeaking     = false;
     this.speakStartedAt = 0;
     this.lastSpokAt     = 0;
@@ -1940,6 +1942,7 @@ function attachMediaStreams(server, users, cfg) {
         case 'stop': {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           if (session) {
+            try { logCallTranscript(session); } catch (e) {}
             if (session.outbound && global._vsConfig.onCallEnd) {
               try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
             }
@@ -1957,6 +1960,7 @@ function attachMediaStreams(server, users, cfg) {
 
     ws.on('close', () => {
       if (session) {
+        try { logCallTranscript(session); } catch (e) {}
         if (session.outbound && global._vsConfig.onCallEnd) {
           try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
         }
@@ -1974,6 +1978,40 @@ function attachMediaStreams(server, users, cfg) {
 
   console.log('[voice-stream] WebSocket handler ready at /ws/media');
   return wss;
+}
+
+// KADE July 5 2026: persist the finished call transcript to the fork's Calls
+// history (POST /api/kade/calls/ingest). Text only, no audio. Idempotent (stop
+// + close can both fire). Fire-and-forget: never blocks or breaks a live call.
+async function logCallTranscript(session) {
+  try {
+    if (!session || session._loggedTranscript) return;
+    session._loggedTranscript = true;
+    const axios = require('axios');
+    const turns = (session.history || [])
+      .filter((m) => m && m.content && String(m.content).trim())
+      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', text: String(m.content) }));
+    if (!turns.length) return;
+    const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
+    if (!secret) return;
+    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    await axios.post(`${base}/api/kade/calls/ingest`, {
+      secret,
+      userEmail: session.lcEmail || null,
+      surface: 'phone',
+      agentId: session.agentId || null,
+      agentName: session.agentName || null,
+      callerName: session.callerName || null,
+      from: session.from || null,
+      startedAt: session.startedAt || null,
+      endedAt: new Date().toISOString(),
+      turns,
+      metadata: { callSid: session.callSid, outbound: !!session.outbound },
+    }, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+    console.log(`[voice-stream] logged transcript for ${session.callSid} (${turns.length} turns)`);
+  } catch (e) {
+    console.log(`[voice-stream] transcript log failed: ${e && e.message}`);
+  }
 }
 
 module.exports = { attachMediaStreams, synthesize };
