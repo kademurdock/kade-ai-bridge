@@ -1767,15 +1767,14 @@ async function maybeStartThinkingFiller(session, ctx) {
   }
   if (ctx.firstAudioReady || session.llmAbort) return;
   if (session.media !== 'mulaw') {
-    // WEB VOICE: the typing-clip loop is mulaw-frame-coded. One short spoken
-    // filler phrase (cached per voice+format after first synth) covers the
-    // thinking gap; the existing firstAudioReady clear+pause logic cuts it
-    // the moment the real reply is ready, exactly like the phone filler.
-    ctx.fillerStarted = true;
-    try {
-      const buf = await getFillerClip(session.voice, session.media);
-      if (!ctx.firstAudioReady && !session.llmAbort) await playBuffer(session, buf);
-    } catch (e) { console.error('[web-voice] filler error:', e.message); }
+    // KADE July 9 2026 (her first live test of streaming web calls): the
+    // spoken filler phrase here ("Let me think on that", "hold on a sec")
+    // read as forced/robotic — cut on her word. Web dead-air is already
+    // covered CLIENT-side: ConversationMode plays its own quiet thinking-
+    // loop sound whenever status is 'thinking' (the same texture idea as
+    // the phone's typing clips, minus a voice pretending to stall). So the
+    // server stays completely silent while generating on web. Phone keeps
+    // its typing-clip loop — different transport, different answer.
     return;
   }
   await runThinkingFiller(session, ctx);
