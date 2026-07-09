@@ -13,7 +13,7 @@
 
 const express  = require('express');
 const http     = require('http');
-const { attachMediaStreams, synthesize: vsSynthesize } = require('./voice-stream');
+const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
 const crypto   = require('crypto');
@@ -1625,6 +1625,12 @@ attachMediaStreams(server, users, {
   onCallEnd,
   endCall,
 });
+
+// WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
+// same engine as /ws/media with a browser transport. Ticket-authed (HMAC,
+// minted by the fork); shares global._vsConfig set by attachMediaStreams
+// above, so this call must stay AFTER it.
+attachWebVoice(server);
 
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);

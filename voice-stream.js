@@ -22,6 +22,7 @@ const EventEmitter = require('events');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -578,6 +579,11 @@ class CallSession {
     this.busy           = false;
     this._pending       = null;
     this._ringbackActive = false;  // true while pre-greeting ringback is playing
+    // WEB VOICE (July 9 2026): transport format. 'mulaw' = Twilio 8k frames
+    // (every existing phone path, byte-identical); 'wav' = browser client
+    // (whole WAV clips over the socket, client schedules playback).
+    this.media   = 'mulaw';
+    this.surface = 'phone';
   }
 
   twSend(obj) {
@@ -651,9 +657,17 @@ function openDeepgram(session) {
   const key = process.env.DEEPGRAM_API_KEY;
   if (!key) { console.warn('[voice-stream] DEEPGRAM_API_KEY not set — no STT'); return null; }
 
+  // WEB VOICE (July 9 2026): browser mic arrives as linear16 @ 16kHz (the
+  // client downsamples); phone stays mulaw 8k + the phonecall model. Same
+  // endpointing/utterance tuning on both — those lessons were transport-
+  // agnostic (they're about how PEOPLE pause, not about codecs).
+  const web = session.media === 'wav';
   const params = new URLSearchParams({
-    encoding: 'mulaw', sample_rate: '8000', channels: '1',
-    model: 'nova-2-phonecall', smart_format: 'true', interim_results: 'true',
+    encoding: web ? 'linear16' : 'mulaw',
+    sample_rate: web ? '16000' : '8000',
+    channels: '1',
+    model: web ? (process.env.WEB_VOICE_STT_MODEL || 'nova-2') : 'nova-2-phonecall',
+    smart_format: 'true', interim_results: 'true',
     utterance_end_ms: '1000', endpointing: '500', vad_events: 'true', // 350->500ms July 1: 350 finalized on natural mid-sentence breaths (cut Kade off); +150ms per turn is the cost
   });
 
@@ -1039,7 +1053,7 @@ async function streamReply(session, userText) {
     if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
     const synthInput = hasSpeech ? applyDirectionCarry(sentence, dirState) : '';
     const synthPromise = hasSpeech
-      ? synthesize(synthInput, session.voice, session.rate).catch((e) => {
+      ? synthesize(synthInput, session.voice, session.rate, session.media).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
           return null;
         })
@@ -1061,7 +1075,7 @@ async function streamReply(session, userText) {
     ) {
       rambleHintQueued = true;
       session._rambleHintPlayed = true;
-      ramblePromise = getRambleClip(session.voice, session.rate).catch((e) => {
+      ramblePromise = getRambleClip(session.voice, session.rate, session.media).catch((e) => {
         console.error('[voice-stream] ramble-hint synth error:', e.message);
         return null;
       });
@@ -1074,6 +1088,13 @@ async function streamReply(session, userText) {
       }
       for (const cue of gameCues) {
         if (session.llmAbort) break;
+        if (session.media !== 'mulaw') {
+          // WEB VOICE: cue clips on disk are pre-decoded mulaw. v1 ships the
+          // cue NAME to the client (future: client-side sounds); it must not
+          // touch fillerCtx so the spoken-audio bookkeeping stays truthful.
+          if (session.sendCue) session.sendCue(cue);
+          continue;
+        }
         const clip = pickGameClip(cue);
         if (!clip) continue;
         if (!fillerCtx.firstAudioReady) {
@@ -1234,7 +1255,7 @@ async function streamReply(session, userText) {
 }
 
 // ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
-async function synthesize(text, voice, rate) {
+async function synthesize(text, voice, rate, format = 'mulaw') {
   const cfg = global._vsConfig;
   const input = fixPronunciation(text).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
@@ -1243,7 +1264,7 @@ async function synthesize(text, voice, rate) {
   const body = { model: cfg.ttsModel, input, voice: useVoice };
   if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
   const res = await streamPost(
-    `${cfg.ttsProxyUrl}/v1/audio/speech?telephony=1`,
+    `${cfg.ttsProxyUrl}/v1/audio/speech${format === 'mulaw' ? '?telephony=1' : ''}`,
     { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
     body
   );
@@ -1265,10 +1286,66 @@ async function synthesize(text, voice, rate) {
 // ── Speak (one-shot, not streamed) ────────────────────────────────────────────
 async function speak(session, text, voice) {
   try {
-    const buf = await synthesize(text, voice || session.voice, session.rate);
+    const buf = await synthesize(text, voice || session.voice, session.rate, session.media);
     session._currentSpokenText = text; // for echo detection, see looksLikeEcho
     await playBuffer(session, buf);
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
+}
+
+// ── WEB VOICE (July 9 2026): WAV playback to a browser client ────────────────
+// The whole clip ships as ONE binary WS frame; the client decodes + schedules
+// gaplessly via Web Audio. Server keeps the same isSpeaking/lastSpokAt
+// bookkeeping as the phone path (via the WAV header's real duration) so every
+// echo gate, barge-in rule, and busy-drop works UNCHANGED on web.
+const WEB_LEAD_MS = 600; // ship the next clip this early so client seams are sample-accurate
+
+function wavDurationMs(buf) {
+  try {
+    if (!buf || buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') return null;
+    const byteRate = buf.readUInt32LE(28);
+    let off = 12; // walk chunks: some encoders put LIST/fact before data
+    while (off + 8 <= buf.length) {
+      const id = buf.toString('ascii', off, off + 4);
+      const size = buf.readUInt32LE(off + 4);
+      if (id === 'data') return byteRate > 0 ? Math.round((size / byteRate) * 1000) : null;
+      off += 8 + size + (size % 2);
+    }
+  } catch {}
+  return null;
+}
+
+async function playBufferWav(session, wavBuf) {
+  if (!wavBuf || !wavBuf.length) return;
+  if (session.ws.readyState !== WebSocket.OPEN) return;
+  const durMs = wavDurationMs(wavBuf) ?? Math.round(wavBuf.length / 48); // fallback: 24kHz 16-bit mono
+  session.finalBuf       = '';
+  session.partialBuf     = '';
+  session.isSpeaking     = true;
+  session.speakStartedAt = Date.now();
+  session.bargedIn       = false;
+  if (session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', session._currentSpokenText);
+  if (session.sendState) session.sendState('speaking');
+  try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
+  session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
+  // Return WEB_LEAD_MS early so the playChain synthesizes/ships the NEXT clip
+  // while this one is still sounding (the client queues it seamlessly)...
+  while (!session.llmAbort && session.isSpeaking && session.ws.readyState === WebSocket.OPEN) {
+    const remaining = session._webPlayheadEnd - WEB_LEAD_MS - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(r => setTimeout(r, Math.min(remaining, 100)));
+  }
+  if (session.llmAbort || !session.isSpeaking) return; // barged: sendClear already flushed the client
+  // ...and let a tail timer own the TRUE end. If a later clip extends the
+  // playhead, its own timer supersedes this one (the guard below no-ops).
+  if (session._webTailTimer) clearTimeout(session._webTailTimer);
+  const tailMs = Math.max(0, session._webPlayheadEnd - Date.now());
+  session._webTailTimer = setTimeout(() => {
+    if (session.llmAbort || session.ws.readyState !== WebSocket.OPEN) return;
+    if (Date.now() < (session._webPlayheadEnd || 0) - 20) return; // a newer clip took over
+    session.isSpeaking = false;
+    session.lastSpokAt = Date.now();
+    if (session.sendState) session.sendState('listening');
+  }, tailMs + 30);
 }
 
 // ── Play μ-law as 20ms frames ─────────────────────────────────────────────────
@@ -1277,6 +1354,7 @@ const FRAME_BYTES = 160;
 async function playBuffer(session, mulawBuf) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
+  if (session.media === 'wav') return playBufferWav(session, mulawBuf);
   session.finalBuf       = '';
   session.partialBuf     = '';
   session.isSpeaking     = true;
@@ -1394,11 +1472,11 @@ const ORIENTATION_LINES = [
 // Lazy per-voice cache so a given filler phrase is only synthesized once per
 // running process, not on every single call.
 const _fillerCache = new Map();
-async function getFillerClip(voice) {
+async function getFillerClip(voice, format = 'mulaw') {
   const idx = Math.floor(Math.random() * FILLER_PHRASES.length);
-  const key = `${voice}::${idx}`;
+  const key = `${format}::${voice}::${idx}`;
   if (_fillerCache.has(key)) return _fillerCache.get(key);
-  const buf = await synthesize(FILLER_PHRASES[idx], voice);
+  const buf = await synthesize(FILLER_PHRASES[idx], voice, undefined, format);
   _fillerCache.set(key, buf);
   return buf;
 }
@@ -1484,11 +1562,11 @@ const RAMBLE_HINTS = [
   'Feel free to jump in, by the way.',
 ];
 const _rambleCache = new Map();
-async function getRambleClip(voice, rate) {
+async function getRambleClip(voice, rate, format = 'mulaw') {
   const idx = Math.floor(Math.random() * RAMBLE_HINTS.length);
-  const key = `${voice}::${typeof rate === 'number' ? rate : 'd'}::${idx}`;
+  const key = `${format}::${voice}::${typeof rate === 'number' ? rate : 'd'}::${idx}`;
   if (_rambleCache.has(key)) return _rambleCache.get(key);
-  const buf = await synthesize(RAMBLE_HINTS[idx], voice, rate);
+  const buf = await synthesize(RAMBLE_HINTS[idx], voice, rate, format);
   _rambleCache.set(key, buf);
   return buf;
 }
@@ -1684,6 +1762,18 @@ async function maybeStartThinkingFiller(session, ctx) {
     waited += 150;
   }
   if (ctx.firstAudioReady || session.llmAbort) return;
+  if (session.media !== 'mulaw') {
+    // WEB VOICE: the typing-clip loop is mulaw-frame-coded. One short spoken
+    // filler phrase (cached per voice+format after first synth) covers the
+    // thinking gap; the existing firstAudioReady clear+pause logic cuts it
+    // the moment the real reply is ready, exactly like the phone filler.
+    ctx.fillerStarted = true;
+    try {
+      const buf = await getFillerClip(session.voice, session.media);
+      if (!ctx.firstAudioReady && !session.llmAbort) await playBuffer(session, buf);
+    } catch (e) { console.error('[web-voice] filler error:', e.message); }
+    return;
+  }
   await runThinkingFiller(session, ctx);
 }
 
@@ -1710,10 +1800,30 @@ async function playRingback(session) {
 }
 
 // ── Attach to HTTP server ─────────────────────────────────────────────────────
+// ── Shared WS upgrade router (July 9 2026) ───────────────────────────────────
+// ws v8 in server+path mode 400-aborts EVERY non-matching upgrade (verified in
+// node_modules/ws/lib/websocket-server.js: shouldHandle -> abortHandshake 400).
+// Two path-ed servers on one HTTP server therefore fight: whichever attached
+// first kills the other's handshakes. noServer mode + one router fixes it.
+function installUpgradeRouter(server) {
+  if (server._kadeUpgradeRoutes) return server._kadeUpgradeRoutes;
+  const routes = new Map();
+  server._kadeUpgradeRoutes = routes;
+  server.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try { pathname = new URL(req.url, 'ws://x').pathname; } catch {}
+    const wss = routes.get(pathname);
+    if (!wss) { socket.destroy(); return; }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+  return routes;
+}
+
 function attachMediaStreams(server, users, cfg) {
   global._vsConfig = { ...cfg, users };
 
-  const wss = new WebSocket.Server({ server, path: '/ws/media' });
+  const wss = new WebSocket.Server({ noServer: true });
+  installUpgradeRouter(server).set('/ws/media', wss);
 
   wss.on('connection', (ws) => {
     console.log('[voice-stream] Twilio WS connected');
@@ -1998,7 +2108,7 @@ async function logCallTranscript(session) {
     await axios.post(`${base}/api/kade/calls/ingest`, {
       secret,
       userEmail: session.lcEmail || null,
-      surface: 'phone',
+      surface: session.surface || 'phone',
       agentId: session.agentId || null,
       agentName: session.agentName || null,
       callerName: session.callerName || null,
@@ -2014,4 +2124,177 @@ async function logCallTranscript(session) {
   }
 }
 
-module.exports = { attachMediaStreams, synthesize };
+// ═══ WEB VOICE (July 9 2026) — browser streaming calls, same engine ══════════
+// Everything above (echo gates, barge-in, backchannel drops, agent/voice
+// switching, deep-think, filler, ramble hint, TTS chunk batching) runs
+// UNCHANGED for web sessions. Only the transport differs:
+//   browser mic (PCM16 16k, binary WS frames) -> Deepgram linear16
+//   Inworld WAV clips + JSON control events   -> browser Web Audio queue
+// Auth: short-lived HMAC ticket minted by the fork (JWT-authed route) using
+// the SAME secret as calls/ingest (KADE_CALL_INGEST_SECRET falling back to
+// KADE_USAGE_EVENT_SECRET) — zero new env vars on either service.
+
+class WebCallSession extends CallSession {
+  constructor(from, user, ws, cfg) {
+    const sid = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    super(sid, sid, from, user, ws, cfg);
+    this.media    = 'wav';
+    this.surface  = 'web';
+    this.userId   = user?.userId || null; // LibreChat user id, for usage events
+    this._webPlayheadEnd = 0;
+  }
+  jsonSend(obj) {
+    if (this.ws.readyState === WebSocket.OPEN) { try { this.ws.send(JSON.stringify(obj)); } catch {} }
+  }
+  // Twilio protocol frames are meaningless to a browser — swallow them so any
+  // shared code path that emits them is harmless here.
+  twSend() {}
+  sendMedia() {}
+  sendClear() {
+    this._webPlayheadEnd = 0;
+    if (this._webTailTimer) { clearTimeout(this._webTailTimer); this._webTailTimer = null; }
+    this.jsonSend({ type: 'clear' });
+    this.jsonSend({ type: 'state', state: 'listening' });
+  }
+  sendCaption(role, text) { this.jsonSend({ type: 'caption', role, text }); }
+  sendState(state)        { this.jsonSend({ type: 'state', state }); }
+  sendCue(name)           { this.jsonSend({ type: 'cue', name }); }
+}
+
+function verifyWebTicket(ticket) {
+  const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
+  if (!secret || !ticket || typeof ticket !== 'string' || ticket.length > 4096) return null;
+  const dot = ticket.lastIndexOf('.');
+  if (dot < 1) return null;
+  const body = ticket.slice(0, dot);
+  const sig  = ticket.slice(dot + 1);
+  let expect;
+  try { expect = crypto.createHmac('sha256', secret).update(body).digest('base64url'); } catch { return null; }
+  const a = Buffer.from(sig || '');
+  const b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let payload;
+  try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch { return null; }
+  if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) return null;
+  if (!payload.email) return null;
+  return payload;
+}
+
+// Spend visibility on Feed the Server. costUSD deliberately 0 for v1: STT is
+// inside Deepgram's free tier and TTS chars already flow through the same
+// Inworld proxy as everything else — posting a guessed char-price here risks
+// DOUBLE-counting. Open item: confirm where phone/web TTS chars get billed.
+async function postWebVoiceUsage(session) {
+  try {
+    if (session._usagePosted || !session.userId) return;
+    session._usagePosted = true;
+    const secret = process.env.KADE_USAGE_EVENT_SECRET;
+    if (!secret) return;
+    const secs = Math.max(1, Math.round((Date.now() - new Date(session.startedAt).getTime()) / 1000));
+    const minutes = Math.round((secs / 60) * 10) / 10;
+    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    const axios = require('axios');
+    await axios.post(`${base}/api/kade/usage-event`, {
+      secret,
+      userId: session.userId,
+      service: 'web_voice',
+      quantity: minutes,
+      unit: 'minutes',
+      costUSD: 0,
+      metadata: { agent: session.agentName, surface: 'web', seconds: secs },
+    }, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+  } catch (e) { console.log('[web-voice] usage post failed:', e && e.message); }
+}
+
+function attachWebVoice(server) {
+  const wss = new WebSocket.Server({ noServer: true });
+  installUpgradeRouter(server).set('/ws/web-voice', wss);
+
+  wss.on('connection', (ws, req) => {
+    const cfg = global._vsConfig;
+    if (!cfg) { try { ws.close(1011, 'not ready'); } catch {} return; }
+    // Browsers always send Origin. The HMAC ticket is the real lock; this
+    // just shuts out casual cross-site noise.
+    const origin = req.headers.origin || '';
+    const allowed = (process.env.WEB_VOICE_ORIGINS || 'https://kademurdock.com,https://www.kademurdock.com')
+      .split(',').map(x => x.trim()).filter(Boolean);
+    if (origin && !allowed.includes(origin)) { try { ws.close(4403, 'origin'); } catch {} return; }
+
+    let session = null;
+    const helloTimer = setTimeout(() => {
+      if (!session) { try { ws.close(4408, 'no hello'); } catch {} }
+    }, 8000);
+
+    ws.on('message', (raw, isBinary) => {
+      if (isBinary) {
+        // Raw PCM16 mic frames -> straight to Deepgram, exactly like the
+        // Twilio media case (which is what makes listening continuous:
+        // the mic NEVER stops, even while the agent is talking).
+        if (session && session.dgWs?.readyState === WebSocket.OPEN) session.dgWs.send(raw);
+        return;
+      }
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+      if (msg.type === 'hello' && !session) {
+        clearTimeout(helloTimer);
+        const t = verifyWebTicket(msg.ticket);
+        if (!t) {
+          try {
+            ws.send(JSON.stringify({ type: 'error', message: 'Call ticket expired or invalid. Hang up and try again.' }));
+            ws.close(4401, 'bad ticket');
+          } catch {}
+          return;
+        }
+        const user = {
+          name:        t.name || null,
+          agentId:     t.agentId || cfg.defaultAgent,
+          agentName:   t.agentName || cfg.defaultAgentName,
+          accountType: t.accountType || null,
+          voice:       t.voiceId || null, // fork resolves the builder voice; CallSession fallback chain covers the rest
+          rate:        (typeof t.rate === 'number' ? t.rate : undefined),
+          lcEmail:     t.email,
+          userId:      t.uid || null,
+        };
+        session = new WebCallSession(`web:${t.email}`, user, ws, cfg);
+        console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice}`);
+        session.dgWs = openDeepgram(session);
+        session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice });
+        session.sendState('listening');
+        // Short spoken greeting: a blind caller needs to HEAR the line is
+        // live. One line, invitation LAST (the July 1 greeting lesson), and
+        // it doubles as the interrupt orientation.
+        const first = (t.name || '').trim().split(/\s+/)[0] || null;
+        const line = first
+          ? `Hey ${first}! ${session.agentName} here — go ahead, and feel free to cut me off any time.`
+          : `Hey! ${session.agentName} here — go ahead, and feel free to cut me off any time.`;
+        speak(session, line, session.voice).catch(() => {});
+        return;
+      }
+
+      if (!session) return;
+      if (msg.type === 'bye') { try { ws.close(1000, 'bye'); } catch {} return; }
+    });
+
+    ws.on('close', () => {
+      clearTimeout(helloTimer);
+      if (session) {
+        try { logCallTranscript(session); } catch {}
+        try { postWebVoiceUsage(session); } catch {}
+        session.llmAbort = true;
+        session.isSpeaking = false;
+        if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
+        if (session._webTailTimer) { clearTimeout(session._webTailTimer); session._webTailTimer = null; }
+        if (session.dgWs) { try { session.dgWs.close(); } catch {} }
+        session = null;
+      }
+    });
+
+    ws.on('error', (e) => console.error('[web-voice] WS error:', e.message));
+  });
+
+  console.log('[voice-stream] Web voice WebSocket handler ready at /ws/web-voice');
+  return wss;
+}
+
+module.exports = { attachMediaStreams, attachWebVoice, synthesize };
