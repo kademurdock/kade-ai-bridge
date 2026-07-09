@@ -819,6 +819,10 @@ async function handleUtterance(session, text) {
     return;
   }
   console.log(`[voice-stream] utterance: "${text.slice(0, 80)}"`);
+  // WEB VOICE: live caption of what was heard + a 'thinking' state so the
+  // client UI mirrors the turn. Both are undefined on phone sessions.
+  if (session.sendCaption) session.sendCaption('user', text);
+  if (session.sendState) session.sendState('thinking');
   session.busy = true;
   try {
     const rateCmd = extractRateCommand(text);
@@ -2258,6 +2262,18 @@ function attachWebVoice(server) {
         };
         session = new WebCallSession(`web:${t.email}`, user, ws, cfg);
         console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice}`);
+        // Ticket usually carries the builder voice (fork reads agent.tts).
+        // If it didn't, warm the bridge cache and upgrade the session voice
+        // as soon as it lands — same trick as mid-call agent switches.
+        if (!t.voiceId && cfg.refreshAgentTts) {
+          cfg.refreshAgentTts(user.agentId).then(() => {
+            const tts = cfg.getAgentTts && cfg.getAgentTts(user.agentId);
+            if (session && tts && tts.voiceId) {
+              session.voice = tts.voiceId;
+              if (session.rate == null && typeof tts.rate === 'number') session.rate = tts.rate;
+            }
+          }).catch(() => {});
+        }
         session.dgWs = openDeepgram(session);
         session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice });
         session.sendState('listening');
@@ -2273,6 +2289,17 @@ function attachWebVoice(server) {
       }
 
       if (!session) return;
+      if (msg.type === 'barge') {
+        // Manual Stop button: same path as a voice barge-in. The client
+        // already flushed its local queue; this kills generation + marks
+        // the turn so the next utterance is a clean new turn.
+        if (session.isSpeaking || session.busy) {
+          session.bargedIn = true;
+          bargeIn(session);
+          if (session.busy && !session.isSpeaking) { session.sendClear(); session.llmAbort = true; }
+        }
+        return;
+      }
       if (msg.type === 'bye') { try { ws.close(1000, 'bye'); } catch {} return; }
     });
 
