@@ -1039,6 +1039,15 @@ async function streamReply(session, userText) {
     // client's table widget only — on the phone they must simply vanish.
     if (sentence.indexOf('[table:') !== -1) {
       armGameMode(session, 'table token');
+      // WEB VOICE (July 9 2026): hand the table id to the client so the call
+      // screen can draw the same aria-hidden GameTable widget chat gets. One
+      // event per token = one refetch per move. Phone sessions have no
+      // sendTable — token just vanishes, as before.
+      if (session.sendTable) {
+        const tblRe = /\[table:([a-z0-9]{1,12})\]/gi;
+        let tm;
+        while ((tm = tblRe.exec(sentence)) !== null) session.sendTable(tm[1].toLowerCase());
+      }
       sentence = sentence.replace(/\[table:[a-z0-9]{1,12}\]/gi, ' ').replace(/[ \t]{2,}/g, ' ').trim();
     }
     const gameCues = [];
@@ -1093,10 +1102,16 @@ async function streamReply(session, userText) {
       for (const cue of gameCues) {
         if (session.llmAbort) break;
         if (session.media !== 'mulaw') {
-          // WEB VOICE: cue clips on disk are pre-decoded mulaw. v1 ships the
-          // cue NAME to the client (future: client-side sounds); it must not
-          // touch fillerCtx so the spoken-audio bookkeeping stays truthful.
-          if (session.sendCue) session.sendCue(cue);
+          // KADE July 9 2026 ("wire up the game stuff if you wanna"): web
+          // calls now play the REAL game sound files — raw WAVs down the
+          // same ordered chain as speech, gain-matched to the phone bank.
+          // Cards/dice/chips land exactly where the action happens; a sound
+          // effect never re-sends the previous sentence's caption.
+          const webClip = pickGameClipWeb(cue);
+          if (webClip) {
+            if (!fillerCtx.firstAudioReady) fillerCtx.firstAudioReady = true;
+            await playBufferWav(session, webClip, { noCaption: true });
+          }
           continue;
         }
         const clip = pickGameClip(cue);
@@ -1318,7 +1333,7 @@ function wavDurationMs(buf) {
   return null;
 }
 
-async function playBufferWav(session, wavBuf) {
+async function playBufferWav(session, wavBuf, opts = {}) {
   if (!wavBuf || !wavBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
   const durMs = wavDurationMs(wavBuf) ?? Math.round(wavBuf.length / 48); // fallback: 24kHz 16-bit mono
@@ -1327,7 +1342,7 @@ async function playBufferWav(session, wavBuf) {
   session.isSpeaking     = true;
   session.speakStartedAt = Date.now();
   session.bargedIn       = false;
-  if (session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', session._currentSpokenText);
+  if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', session._currentSpokenText);
   if (session.sendState) session.sendState('speaking');
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
@@ -1663,6 +1678,37 @@ const SOUND_ASSETS_DIR = path.join(__dirname, 'assets', 'sounds');
 const SOUND_GAIN = Math.max(0.05, Math.min(1, parseFloat(process.env.PHONE_SOUND_GAIN || '0.4')));
 const MAX_CUES_PER_SENTENCE = 4;
 
+// WEB VOICE (July 9 2026, "wire up the game stuff"): scale a 16-bit PCM WAV's
+// samples by `gain` and return the whole file buffer untouched otherwise —
+// browsers decode it natively, so game clips ride the same binary pipe as
+// speech. Gain-matched to the phone bank so levels feel identical.
+function loadWavScaled(filePath, gain = 1) {
+  const raw = fs.readFileSync(filePath);
+  if (raw.toString('ascii', 0, 4) !== 'RIFF' || raw.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error('not a RIFF/WAVE file');
+  }
+  let offset = 12, bits = 16, dataStart = -1, dataLen = 0;
+  while (offset + 8 <= raw.length) {
+    const id   = raw.toString('ascii', offset, offset + 4);
+    const size = Math.min(raw.readUInt32LE(offset + 4), raw.length - offset - 8);
+    const body = offset + 8;
+    if (id === 'fmt ' && body + 16 <= raw.length) bits = raw.readUInt16LE(body + 14);
+    else if (id === 'data') { dataStart = body; dataLen = size; }
+    offset = body + size + (size % 2);
+  }
+  if (dataStart < 0) throw new Error('missing data chunk');
+  if (bits !== 16) throw new Error(`only 16-bit PCM supported (got ${bits}-bit)`);
+  if (gain !== 1) {
+    const end = dataStart + dataLen - 1;
+    for (let i = dataStart; i < end; i += 2) {
+      raw.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(raw.readInt16LE(i) * gain))), i);
+    }
+  }
+  return raw;
+}
+
+const GAME_SOUND_BANK_WEB = new Map(); // cue -> [wavBuf, ...] (filled by loadGameSoundClips)
+
 function loadGameSoundClips() {
   const bank = new Map(); // cue -> [mulawBuf, ...] (takes)
   try {
@@ -1680,8 +1726,16 @@ function loadGameSoundClips() {
       } catch (e) {
         console.warn(`[voice-stream] skipping sound asset ${f}: ${e.message}`);
       }
+      try {
+        const webBuf = loadWavScaled(path.join(SOUND_ASSETS_DIR, f), SOUND_GAIN);
+        if (!GAME_SOUND_BANK_WEB.has(cue)) GAME_SOUND_BANK_WEB.set(cue, []);
+        GAME_SOUND_BANK_WEB.get(cue).push(webBuf);
+      } catch (e) {
+        console.warn(`[voice-stream] skipping web sound asset ${f}: ${e.message}`);
+      }
     }
     console.log(`[voice-stream] game sound bank: ${bank.size} cues from ${files.length} wav files (gain ${SOUND_GAIN})`);
+    console.log(`[voice-stream] web game sound bank: ${GAME_SOUND_BANK_WEB.size} cues (raw WAV, same gain)`);
   } catch (e) {
     console.warn('[voice-stream] game sound bank load failed:', e.message);
   }
@@ -1692,6 +1746,12 @@ const GAME_SOUND_BANK = loadGameSoundClips();
 function pickGameClip(cue) {
   const takes = GAME_SOUND_BANK.get(cue);
   if (!takes || !takes.length) return null; // unknown cue — stay silent, never break the call
+  return takes[Math.floor(Math.random() * takes.length)];
+}
+
+function pickGameClipWeb(cue) {
+  const takes = GAME_SOUND_BANK_WEB.get(cue);
+  if (!takes || !takes.length) return null;
   return takes[Math.floor(Math.random() * takes.length)];
 }
 
@@ -2162,6 +2222,7 @@ class WebCallSession extends CallSession {
   sendCaption(role, text) { this.jsonSend({ type: 'caption', role, text }); }
   sendState(state)        { this.jsonSend({ type: 'state', state }); }
   sendCue(name)           { this.jsonSend({ type: 'cue', name }); }
+  sendTable(id)           { this.jsonSend({ type: 'table', id }); }
 }
 
 function verifyWebTicket(ticket) {
