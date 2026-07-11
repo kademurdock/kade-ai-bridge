@@ -1001,7 +1001,7 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness } = req.body || {};
   // KADE July 2 2026: the model sometimes fills calleeName with junk like
   // "whoever it is" or "the person" — which produced the live gem
   // "Hi, is this whoever it is?". A name is only a name if it looks like one.
@@ -1173,6 +1173,15 @@ app.post('/outbound-call', async (req, res) => {
       recordingSid: null,
       recordingUrl: null,
       finalized: false,
+      // FAMILY WELLNESS CALLS (July 11 2026): when set, finalize writes a rich
+      // LLM summary of the call and nudges it back to the person who set the
+      // schedule up (fork /api/kade/nudges/ingest -> their chosen channel).
+      wellness: rawWellness && typeof rawWellness === 'object' ? {
+        scheduleId: String(rawWellness.scheduleId || '').slice(0, 64) || null,
+        notifyUserId: String(rawWellness.notifyUserId || '').slice(0, 64) || null,
+        targetName: String(rawWellness.targetName || '').slice(0, 80) || null,
+        topics: String(rawWellness.topics || '').slice(0, 600) || null,
+      } : null,
     });
     lastDialed.set(e164, Date.now());
     daily.byUser[userId] = (daily.byUser[userId] || 0) + 1;
@@ -1285,6 +1294,12 @@ async function finalizeOutboundCall(callSid) {
   saveJsonFile(OUTBOUND_LOG_FILE, outboundLog);
   outboundMeta.delete(callSid);
   console.log(`[outbound] finalized ${callSid}: status=${record.status} ${duration}s $${costUSD}`);
+
+  // FAMILY WELLNESS CALLS: rich summary back to whoever set the schedule up.
+  if (meta.wellness && meta.wellness.notifyUserId) {
+    wellnessReportBack(record, meta.wellness).catch((e) =>
+      console.error('[wellness] report-back failed:', e.message));
+  }
 
   // Land the spend on the user's Feed-the-Server page via the fork.
   if (USAGE_EVENT_SECRET && meta.userId && duration > 0) {
@@ -1583,6 +1598,272 @@ setInterval(() => {
     console.error('[briefing] scheduler tick error:', e.message);
   }
 }, 60 * 1000);
+
+
+// ── FAMILY WELLNESS CALLS (July 11 2026, Kade's ask) ─────────────────────────
+// Opt-in scheduled companion check-in calls to REGISTRY numbers only (family
+// Kade has registered), riding the existing /outbound-call machinery — AI
+// disclosure, caps, cooldowns, allowlists and recording all apply unchanged.
+// After each call, an LLM writes a rich summary and the fork nudges it to the
+// person who set the schedule up. Store: wellness.json on the volume.
+//
+//   POST   /wellness        create/update (BRIDGE_SECRET)
+//   GET    /wellness        list — ?userId= scopes to one enroller
+//   POST   /wellness/toggle pause/resume
+//   POST   /wellness/fire   run one NOW (the "test with me listening" path)
+//   DELETE /wellness?id=    remove
+const WELLNESS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'wellness.json');
+const wellness = new Map(Object.entries(loadJsonFile(WELLNESS_FILE, {})));
+function saveWellness() { saveJsonFile(WELLNESS_FILE, Object.fromEntries(wellness)); }
+const WELLNESS_MAX_PER_USER = Number(process.env.WELLNESS_MAX_PER_USER || 5);
+const WELLNESS_MAX_TOTAL = Number(process.env.WELLNESS_MAX_TOTAL || 20);
+const WELLNESS_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+function centralNowParts() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false, weekday: 'short',
+  }).formatToParts(new Date()).reduce((o, p2) => ((o[p2.type] = p2.value), o), {});
+  return {
+    today: `${parts.year}-${parts.month}-${parts.day}`,
+    hhmm: `${parts.hour === '24' ? '00' : parts.hour}:${parts.minute}`,
+    day: String(parts.weekday || '').toLowerCase().slice(0, 3),
+  };
+}
+
+/** Find a registered family member by name (or already-normalized number). */
+function resolveRegistryPerson(who) {
+  const asPhone = normalizeUsPhone(who);
+  if (asPhone && users.has(asPhone)) {
+    const u = users.get(asPhone) || {};
+    return { e164: asPhone, name: u.name || 'there' };
+  }
+  const q = String(who || '').trim().toLowerCase();
+  if (!q) return null;
+  const entries = [...users.entries()].map(([e164, u]) => ({ e164, name: String((u || {}).name || '') }));
+  let hit = entries.find((e) => e.name.toLowerCase() === q);
+  if (!hit) hit = entries.find((e) => e.name.toLowerCase().split(/\s+/)[0] === q);
+  if (!hit) hit = entries.find((e) => e.name.toLowerCase().startsWith(q));
+  if (!hit) hit = entries.find((e) => e.name.toLowerCase().includes(q));
+  return hit ? { e164: hit.e164, name: hit.name } : null;
+}
+
+function quietHoursBlocked(hhmm) {
+  // No scheduled family calls between 9pm and 8am Central. Hard rule for v1.
+  return hhmm >= '21:01' || hhmm < '08:00';
+}
+
+app.post('/wellness', (req, res) => {
+  const b = req.body || {};
+  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const existing = b.id ? wellness.get(String(b.id)) : null;
+  if (b.id && !existing) return res.status(404).json({ error: 'No schedule with that id' });
+
+  const person = b.who || b.to ? resolveRegistryPerson(b.who || b.to) : (existing ? { e164: existing.to, name: existing.targetName } : null);
+  if (!person) {
+    const names = [...users.values()].map((u) => (u || {}).name).filter(Boolean).join(', ');
+    return res.status(400).json({ error: `I can only schedule check-ins for registered family. Registered people: ${names || '(nobody registered yet)'}` });
+  }
+
+  const time = String(b.time || (existing && existing.time) || '').trim();
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return res.status(400).json({ error: 'time must be HH:mm, 24-hour, US Central' });
+  if (quietHoursBlocked(time)) return res.status(400).json({ error: 'Scheduled check-ins run between 8:00 and 21:00 Central only — pick a daytime or evening time.' });
+
+  let days = b.days !== undefined ? b.days : (existing ? existing.days : 'daily');
+  if (typeof days === 'string' && days.toLowerCase() !== 'daily') days = days.split(/[,\s]+/).filter(Boolean);
+  if (Array.isArray(days)) {
+    days = days.map((d) => String(d).toLowerCase().slice(0, 3)).filter((d) => WELLNESS_DAYS.includes(d));
+    if (!days.length) return res.status(400).json({ error: "days must be 'daily' or day names like ['mon','thu']" });
+  } else {
+    days = 'daily';
+  }
+
+  const enrolledBy = b.enrolledBy && b.enrolledBy.userId ? {
+    userId: String(b.enrolledBy.userId).slice(0, 64),
+    userName: String(b.enrolledBy.userName || 'a Kade-AI user').slice(0, 80),
+  } : (existing ? existing.enrolledBy : null);
+  if (!enrolledBy) return res.status(400).json({ error: 'enrolledBy.userId required — whose schedule (and whose spend) is this?' });
+
+  if (!existing) {
+    const mine = [...wellness.values()].filter((w) => w.enrolledBy.userId === enrolledBy.userId).length;
+    if (mine >= WELLNESS_MAX_PER_USER) return res.status(429).json({ error: `Limit reached: ${WELLNESS_MAX_PER_USER} check-in schedules per person.` });
+    if (wellness.size >= WELLNESS_MAX_TOTAL) return res.status(429).json({ error: 'Platform-wide wellness schedule limit reached.' });
+  }
+
+  const id = existing ? existing.id : crypto.randomBytes(6).toString('hex');
+  const sub = {
+    id,
+    to: person.e164,
+    targetName: person.name,
+    days,
+    time,
+    agentId: b.agentId !== undefined ? String(b.agentId || DEFAULT_AGENT) : (existing ? existing.agentId : DEFAULT_AGENT),
+    agentName: b.agentName !== undefined ? String(b.agentName || DEFAULT_AGENT_NAME).slice(0, 60) : (existing ? existing.agentName : DEFAULT_AGENT_NAME),
+    topics: b.topics !== undefined ? String(b.topics || '').slice(0, 600) : (existing ? existing.topics : ''),
+    enrolledBy,
+    enabled: b.enabled !== undefined ? !!b.enabled : (existing ? existing.enabled : true),
+    createdAt: existing ? existing.createdAt : new Date().toISOString(),
+    lastRun: existing ? existing.lastRun : null,
+  };
+  wellness.set(id, sub);
+  saveWellness();
+  console.log(`[wellness] schedule ${existing ? 'updated' : 'created'}: ${id} -> ${person.name} (${sub.days === 'daily' ? 'daily' : sub.days.join(',')}) at ${sub.time} CT by ${enrolledBy.userName}`);
+  res.json({ ok: true, schedule: sub });
+});
+
+app.get('/wellness', (req, res) => {
+  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  let rows = [...wellness.values()];
+  if (req.query.userId) rows = rows.filter((w) => w.enrolledBy.userId === String(req.query.userId));
+  res.json({ count: rows.length, schedules: rows });
+});
+
+app.post('/wellness/toggle', (req, res) => {
+  const b = req.body || {};
+  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const sub = wellness.get(String(b.id || ''));
+  if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
+  sub.enabled = b.enabled !== undefined ? !!b.enabled : !sub.enabled;
+  saveWellness();
+  res.json({ ok: true, schedule: sub });
+});
+
+app.delete('/wellness', (req, res) => {
+  const id = String((req.query.id || (req.body || {}).id) || '');
+  const secret = req.query.secret || (req.body || {}).secret;
+  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!wellness.has(id)) return res.status(404).json({ error: 'No schedule with that id' });
+  const sub = wellness.get(id);
+  wellness.delete(id);
+  saveWellness();
+  console.log(`[wellness] schedule deleted: ${id} (${sub.targetName})`);
+  res.json({ ok: true, deleted: id });
+});
+
+app.post('/wellness/fire', async (req, res) => {
+  const b = req.body || {};
+  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const sub = wellness.get(String(b.id || ''));
+  if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
+  try {
+    const out = await fireWellnessCall(sub, { test: true });
+    res.json({ ok: true, callSid: out && out.callSid, note: 'Test call dialing now. The summary will arrive after it ends.' });
+  } catch (e) {
+    const msg = (e.response && e.response.data && e.response.data.error) || e.message;
+    res.status(500).json({ error: msg });
+  }
+});
+
+async function fireWellnessCall(sub, { test = false } = {}) {
+  const firstName = String(sub.enrolledBy.userName || '').trim().split(/\s+/)[0] || 'your family';
+  const targetFirst = String(sub.targetName || '').trim().split(/\s+/)[0] || 'there';
+  const topicsLine = sub.topics
+    ? `\n\nTHINGS ${firstName.toUpperCase()} WANTED WOVEN IN (naturally, not as an interview): ${sub.topics}`
+    : '';
+  const resp = await axios.post(`${PUBLIC_URL}/outbound-call`, {
+    secret: BRIDGE_SECRET,
+    to: sub.to,
+    userId: sub.enrolledBy.userId,
+    userName: sub.enrolledBy.userName,
+    calleeName: targetFirst,
+    agentId: sub.agentId,
+    agentName: sub.agentName,
+    purpose: `check in and see how you're doing — ${firstName} set up these companion calls for you`,
+    context:
+      `THIS IS A SCHEDULED COMPANION CHECK-IN CALL that ${firstName} set up for ${targetFirst}. ` +
+      `Your job: be warm, unhurried company. Ask how they're doing today and how they've been feeling; let THEM steer — follow whatever they bring up (memories, family, aches, weather, TV) and keep them talking rather than talking at them. ` +
+      `Listen for anything worth passing along: how their mood seems, anything they need, health mentions, plans, and things they're looking forward to — you'll summarize this for ${firstName} afterward, so gently gather without interrogating. ` +
+      `If they say they don't want these calls anymore, take it graciously, promise to pass that along, and keep the rest of the call kind. ` +
+      `If they seem to be in real distress or an emergency, tell them clearly to hang up and call 911 (you cannot call for them), and make sure that lands in the conversation. ` +
+      `Wrap up naturally when the conversation winds down — warm goodbye, then [END CALL].${topicsLine}` +
+      (test ? `\n\nNOTE: this first one is a TEST RUN — ${firstName} is likely the person answering. Run it exactly like the real thing.` : ''),
+    wellness: {
+      scheduleId: sub.id,
+      notifyUserId: sub.enrolledBy.userId,
+      targetName: sub.targetName,
+      topics: sub.topics || '',
+    },
+  }, { timeout: 30000 });
+  console.log(`[wellness] ${test ? 'TEST ' : ''}call fired for ${sub.targetName}: ${resp.data && resp.data.callSid}`);
+  return resp.data;
+}
+
+setInterval(() => {
+  if (!ENABLE_OUTBOUND || !twilioClient || wellness.size === 0) return;
+  try {
+    const { today, hhmm, day } = centralNowParts();
+    for (const sub of wellness.values()) {
+      const dayOk = sub.days === 'daily' || (Array.isArray(sub.days) && sub.days.includes(day));
+      if (sub.enabled && dayOk && sub.time === hhmm && sub.lastRun !== today) {
+        sub.lastRun = today;
+        saveWellness();
+        fireWellnessCall(sub).catch((e) =>
+          console.error(`[wellness] fire failed for ${sub.targetName}: ${(e.response && JSON.stringify(e.response.data)) || e.message}`));
+      }
+    }
+  } catch (e) {
+    console.error('[wellness] scheduler tick error:', e.message);
+  }
+}, 60 * 1000);
+
+/** Plain proxy chat call (NO phone-brevity suffix — summaries should be rich). */
+async function askAgentRich(agentId, userMessage) {
+  const r = await axios.post(
+    `${PROXY_URL}/librechat/ask`,
+    { agentId, messages: [{ role: 'user', content: userMessage }] },
+    { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' }, timeout: 150000 },
+  );
+  return (r.data && r.data.text) || null;
+}
+
+async function wellnessReportBack(record, w) {
+  const enrolledFirst = 'the person who set this up';
+  let summary = null;
+  const transcript = (record.transcript || [])
+    .map((t) => `${t.role === 'assistant' ? record.agentName : (w.targetName || 'Them')}: ${t.content}`)
+    .join('\n');
+  if (record.status === 'completed' && transcript.trim()) {
+    try {
+      summary = await askAgentRich(
+        record.agentId,
+        `You just finished a scheduled companion check-in phone call with ${w.targetName}. Below is the transcript. ` +
+        `Write a warm, detailed report (5-8 sentences of plain speakable prose, no lists, no headings) for the family member who set these calls up: ` +
+        `how ${w.targetName} seemed (mood, energy), what you talked about, anything they need or mentioned needing, any health or worry mentions, ` +
+        `plans or things they're looking forward to, and anything worth following up on. If they asked for the calls to stop, say so PROMINENTLY. ` +
+        `Only report what the transcript actually supports.\n\nTRANSCRIPT:\n${transcript.slice(0, 12000)}`,
+      );
+    } catch (e) {
+      console.warn('[wellness] summary generation failed:', e.message);
+    }
+  }
+  if (!summary) {
+    summary =
+      record.status === 'completed'
+        ? `The check-in call to ${w.targetName} connected (${Math.round((record.durationSec || 0) / 60)} min), but I couldn't write up a summary — the transcript is in Call History.`
+        : `The scheduled check-in call to ${w.targetName} didn't connect (status: ${record.status}). I'll try again next scheduled time.`;
+  }
+  record.summary = String(summary).slice(0, 4000);
+  saveJsonFile(OUTBOUND_LOG_FILE, outboundLog);
+
+  if (!USAGE_EVENT_SECRET) return;
+  const costLine = record.costUSD ? ` (call cost about $${record.costUSD.toFixed(2)})` : '';
+  const text = `Check-in report — ${w.targetName}: ${record.summary}${costLine}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await axios.post(`${FORK_USAGE_URL}/api/kade/nudges/ingest`, {
+        secret: USAGE_EVENT_SECRET,
+        userId: w.notifyUserId,
+        text: text.slice(0, 3000),
+        type: 'wellness',
+      }, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 });
+      console.log(`[wellness] report nudged to ${w.notifyUserId} for ${w.targetName}`);
+      return;
+    } catch (e) {
+      console.warn(`[wellness] report nudge ${attempt}/3 failed:`, e.message);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 15000));
+    }
+  }
+}
 
 // Hooks for voice-stream.js
 
