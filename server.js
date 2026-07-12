@@ -1170,10 +1170,22 @@ app.post('/outbound-call', async (req, res) => {
   // First name only when speaking (Kade's ask: "calling for Kade", not
   // "calling for Kade Murdock"). Full name stays in records/transcripts.
   const spokenUserName = String(userName || '').trim().split(/\s+/)[0] || 'a Kade-AI user';
-  const introText =
-    `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
-    `${spokenUserName}. This call may be recorded. ` +
-    framePurpose(purpose);
+  // GREETING TIERS (July 12 2026, Kade: "none of this weird fourth-wall
+  // stuff"). Registered family who KNOW the agent get greeted like a friend;
+  // the full formal AI-disclosure + recording notice stays for strangers and
+  // businesses (that's the anti-prank armor — unchanged where it matters).
+  //   own agent  -> "Hey! It's Lilly. <mission>"          (their OWN companion)
+  //   family     -> "Hey — it's Kiana, Kade's A I. <mission>"
+  //   stranger   -> full disclosure, exactly as before
+  const calleeRec = users.get(e164);
+  const ownAgent = !!(calleeRec && calleeRec.agentId === (agentId || DEFAULT_AGENT));
+  const introText = ownAgent
+    ? `It's ${agentName || DEFAULT_AGENT_NAME}! ${framePurpose(purpose)}`
+    : calleeRec
+      ? `It's ${agentName || DEFAULT_AGENT_NAME} — ${spokenUserName}'s A I. ${framePurpose(purpose)}`
+      : `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
+        `${spokenUserName}. This call may be recorded. ` +
+        framePurpose(purpose);
   const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
   const greeting2Text = calleeName ? introText : null;
   let greetingBuf = null;

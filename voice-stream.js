@@ -681,7 +681,10 @@ function openDeepgram(session) {
     encoding: web ? 'linear16' : 'mulaw',
     sample_rate: web ? '16000' : '8000',
     channels: '1',
-    model: web ? (process.env.WEB_VOICE_STT_MODEL || 'nova-2') : 'nova-2-phonecall',
+    // July 12 2026 (Kade: "flip it, I always wanna be on the latest"):
+    // nova-3 — better on noisy rooms + fast kid speech. Env hatches to step
+    // back without a deploy if anything sounds off.
+    model: web ? (process.env.WEB_VOICE_STT_MODEL || 'nova-3') : (process.env.PHONE_STT_MODEL || 'nova-3'),
     smart_format: 'true', interim_results: 'true',
     utterance_end_ms: '1000', endpointing: '500', vad_events: 'true', // 350->500ms July 1: 350 finalized on natural mid-sentence breaths (cut Kade off); +150ms per turn is the cost
   });
@@ -1944,10 +1947,23 @@ async function handleAmdResult(callSid, result) {
   const who = String(ctx.userName || 'a Kade-AI user').trim().split(/\s+/)[0];
   let mission = String(ctx.purpose || '').replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '').trim();
   if (mission.length > 160) mission = mission.slice(0, 157) + '...';
-  const msg =
-    `Hey ${first}, it's ${ctx.agentName || session.agentName}, the A I companion calling for ${who} from Kade A I. ` +
-    (mission ? `I was calling to ${mission} ` : '') +
-    `Sorry I missed you — catch me in the app any time, or call the Kade A I line back. Talk soon. Bye!`;
+  // July 12 2026 (Kade): voicemail matches the greeting tiers — your OWN
+  // companion sounds like your own companion, family gets a natural
+  // possessive, strangers get the honest formal version.
+  const agentName = ctx.agentName || session.agentName;
+  const rec = cfg.users && cfg.users.get(ctx.to || session.from);
+  const ownAgent = !!(rec && ctx.agentId && rec.agentId === ctx.agentId);
+  const msg = ownAgent
+    ? `Hey ${first}, it's ${agentName}! ` +
+      (mission ? `I called to ${mission} ` : 'Just calling to say hi. ') +
+      `Sorry I missed you — catch me in the app any time, or call me back on the Kade A I line. Talk soon. Bye!`
+    : rec
+      ? `Hey ${first}, it's ${agentName} — ${who}'s A I. ` +
+        (mission ? `I was calling to ${mission} ` : '') +
+        `Catch me in the app any time, or call the Kade A I line back. Bye!`
+      : `Hi, this is ${agentName}, an A I assistant calling for ${who} from Kade A I. ` +
+        (mission ? `I was calling to ${mission} ` : '') +
+        `Sorry I missed you — I may try again another time. Bye!`;
   console.log(`[voice-stream] VOICEMAIL MODE for ${callSid} — leaving one message`);
   try {
     await speak(session, msg, session.voice);
