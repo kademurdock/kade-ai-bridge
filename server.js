@@ -1147,7 +1147,7 @@ app.post('/outbound-call', async (req, res) => {
     t = t.replace(/\s+/g, ' ').trim();
     if (!t) return "I'm calling on their behalf";
     const endPunct = /[.?!]$/.test(t) ? '' : '.';
-    if (/^(?:to\s+)?(?:ask|find out|check|see|confirm|verify|make sure|place|order|book|schedule|cancel|request|remind|tell|invite|wish|set up|pick up|drop off|let)\b/i.test(t)) {
+    if (/^(?:to\s+)?(?:ask|find out|check|catch up|catch|check in|see|confirm|verify|make sure|place|order|book|schedule|cancel|request|remind|tell|invite|wish|set up|pick up|drop off|let)\b/i.test(t)) {
       t = t.replace(/^to\s+/i, '');
       return `I'm calling to ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
     }
@@ -1373,6 +1373,7 @@ async function finalizeOutboundCall(callSid) {
     costUSD,
     recordingSid: meta.recordingSid,
     recordingUrl: meta.recordingUrl,
+    voicemail: meta.voicemail || false,
     transcript: meta.transcript || null,
   };
   outboundLog.push(record);
@@ -1908,7 +1909,13 @@ async function wellnessReportBack(record, w) {
   const transcript = (record.transcript || [])
     .map((t) => `${t.role === 'assistant' ? record.agentName : (w.targetName || 'Them')}: ${t.content}`)
     .join('\n');
-  if (record.status === 'completed' && transcript.trim()) {
+  if (record.voicemail) {
+    const vmLine = (record.transcript || []).map((t) => t.content).find((c) => String(c).startsWith('[VOICEMAIL LEFT]'));
+    summary =
+      `${w.targetName} didn't pick up — it went to voicemail, so ${record.agentName} left a short message` +
+      (vmLine ? `: "${String(vmLine).replace('[VOICEMAIL LEFT] ', '')}"` : '.') +
+      ' No conversation happened, so nothing to report on how they seemed.';
+  } else if (record.status === 'completed' && transcript.trim()) {
     try {
       summary = await askAgentRich(
         record.agentId,

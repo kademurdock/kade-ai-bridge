@@ -1965,6 +1965,10 @@ async function handleAmdResult(callSid, result) {
         (mission ? `I was calling to ${mission} ` : '') +
         `Sorry I missed you — I may try again another time. Bye!`;
   console.log(`[voice-stream] VOICEMAIL MODE for ${callSid} — leaving one message`);
+  // Record what we left: the message rides the transcript + flags the meta so
+  // the report-back says "left a voicemail" instead of summarizing a non-chat.
+  try { ctx.voicemail = true; } catch {}
+  try { session.history.push({ role: 'assistant', content: `[VOICEMAIL LEFT] ${msg}` }); } catch {}
   try {
     await speak(session, msg, session.voice);
     setTimeout(() => { try { cfg.endCall && cfg.endCall(callSid); } catch {} }, 1200);
