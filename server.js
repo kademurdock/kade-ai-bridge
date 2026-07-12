@@ -13,7 +13,7 @@
 
 const express  = require('express');
 const http     = require('http');
-const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize } = require('./voice-stream');
+const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
 const crypto   = require('crypto');
@@ -373,6 +373,8 @@ const PHONE_SUFFIX =
   'genuinely mid-story and it would feel weird to stop. ' +
   'If you have been going for a while, throw in a natural check-in: ' +
   '\"am I rambling?\" or \"jump in whenever\" — whatever fits your voice. ' +
+  'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm what you heard before running with it. ' +
+  'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
 async function askAgent(agentId, history, userMessage) {
@@ -979,6 +981,20 @@ async function lookupVoicePref(identity, agentId) {
     return (r.data && r.data.voice) || null;
   } catch { return null; }
 }
+async function fetchCallMemories(identity, agentId) {
+  if (!USAGE_EVENT_SECRET || !identity) return null;
+  try {
+    const params = new URLSearchParams({ secret: USAGE_EVENT_SECRET });
+    if (agentId) params.set('agentId', agentId);
+    if (identity.email) params.set('email', identity.email);
+    if (identity.phone) params.set('phone', identity.phone);
+    if (identity.userId) params.set('userId', identity.userId);
+    const r = await axios.get(`${FORK_USAGE_URL}/api/kade/call-memories?${params}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 2500,
+    });
+    return (r.data && r.data.text) || null;
+  } catch { return null; }
+}
 function ingestVoicePref(identity, agentId, voice) {
   if (!USAGE_EVENT_SECRET || !agentId || !identity) return;
   axios.post(`${FORK_USAGE_URL}/api/kade/voice-pref-ingest`, {
@@ -1178,6 +1194,16 @@ app.post('/outbound-call', async (req, res) => {
       from: OUR_NUMBER,
       url: `${PUBLIC_URL}/voice-ws-outbound?userPhone=${encodeURIComponent(e164)}`,
       method: 'POST',
+      // July 12 2026 (Kade, after Lilly serenaded Skylee's voicemail with
+      // typing sounds): ASYNC answering-machine detection. The call proceeds
+      // normally for humans; when Twilio hears a machine it posts to
+      // /amd-status at message-end (the beep) and the session switches to
+      // voicemail mode: one clean message, no turn loop, graceful hangup.
+      machineDetection: 'DetectMessageEnd',
+      asyncAmd: 'true',
+      asyncAmdStatusCallback: `${PUBLIC_URL}/amd-status`,
+      asyncAmdStatusCallbackMethod: 'POST',
+      machineDetectionTimeout: 45,
       timeLimit: OUTBOUND_TIME_LIMIT_SEC,
       record: OUTBOUND_RECORD,
       ...(OUTBOUND_RECORD ? {
@@ -1255,6 +1281,15 @@ app.post('/voice-ws-outbound', (req, res) => {
 });
 
 // Call status callback — finalizes outbound calls once they end.
+app.post('/amd-status', (req, res) => {
+  const { CallSid, AnsweredBy } = req.body || {};
+  console.log(`[amd] ${CallSid}: AnsweredBy=${AnsweredBy}`);
+  if (CallSid && /^machine_end/.test(String(AnsweredBy || ''))) {
+    try { vsHandleAmd(CallSid, 'machine'); } catch (e) { console.warn('[amd] handler failed:', e.message); }
+  }
+  res.status(200).end();
+});
+
 app.post('/voice-status', (req, res) => {
   const { CallSid, CallStatus, To, From, CallDuration } = req.body;
   console.log(`[bridge] Call status: sid=${CallSid} ${From}->${To} status=${CallStatus}${CallDuration ? ` dur=${CallDuration}s` : ''}`);
@@ -1946,6 +1981,7 @@ attachMediaStreams(server, users, {
   endCall,
   lookupVoicePref,   // July 12 2026: per-caller per-agent voice picks (fork)
   ingestVoicePref,
+  fetchCallMemories, // July 12 2026: caller's own memory cards on calls
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the

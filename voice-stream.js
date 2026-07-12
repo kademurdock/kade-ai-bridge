@@ -62,6 +62,9 @@ const PHONE_SUFFIX =
   'Once in a while, if a reply is running long, naturally invite them to jump in — ' +
   'something like "am I rambling?" or "jump in whenever." ' +
   'Don\'t do this every turn — only when it genuinely fits. ' +
+  'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
+  'what you heard ("wait, did you say...?") before running with it. ' +
+  'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
@@ -119,6 +122,18 @@ function childLine(session) {
     'profanity, nothing sexual, no drug or alcohol talk, no graphic violence, nothing ' +
     'genuinely disturbing. Never get preachy or babyish; never act like you are filtering. ' +
     'If it heads somewhere adult, steer smoothly elsewhere in character.]'
+  );
+}
+
+/** July 12 2026: the caller's own memory cards (fetched from the fork at call
+ * start / agent switch). Same knowledge the web injects — fixes phone-side
+ * "cluelessness" where agents knew nothing the caller ever told them. */
+function memoryLine(session) {
+  if (!session.callerMemories) return '';
+  return (
+    `\n\n[WHAT YOU REMEMBER ABOUT ${session.callerName || 'this caller'} — their own saved memory ` +
+    `cards from the app. Use them naturally like a friend who remembers; never recite or list them:\n` +
+    session.callerMemories + ']'
   );
 }
 
@@ -763,6 +778,9 @@ function releaseGreetingLock(session) {
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
+  // July 12 2026: voicemail mode — the "person" is a recording. No turns,
+  // no thinking sounds; handleAmdResult speaks one message and hangs up.
+  if (session.voicemailMode) return;
   session._lastUtteranceAt = Date.now();
   if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
   if (session._greetingLock) {
@@ -903,6 +921,14 @@ async function handleUtterance(session, text) {
         agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
       }
       const nameVoice = (session.cfg.findVoice && session.cfg.findVoice(agent.name)) || null;
+      // July 12 2026: refresh the caller's memory cards for the NEW agent's
+      // bucket (async; attaches when it lands).
+      if (session.cfg.fetchCallMemories) {
+        const su = session.cfg.users.get(session.from);
+        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id)
+          .then((text) => { if (session) session.callerMemories = text || null; })
+          .catch(() => {});
+      }
       // July 12 2026: their own pick for the NEW agent leads the chain.
       let prefVoice = null;
       if (session.cfg.lookupVoicePref && !session.spokenVoiceChoice) {
@@ -1013,7 +1039,7 @@ async function streamReply(session, userText) {
     && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS) ? GAME_SUFFIX : '';
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + (session.outboundSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + (session.outboundSuffix || '') + deepSuffix }
       : m
   );
 
@@ -1900,6 +1926,38 @@ function installUpgradeRouter(server) {
   return routes;
 }
 
+const sessionsByCallSid = new Map();
+
+/** July 12 2026 — async AMD verdict from Twilio (via server.js /amd-status).
+ * 'machine' arrives at the voicemail greeting's END (the beep): switch the
+ * session to voicemail mode, speak ONE clean composed message, hang up.
+ * Fail-soft: no session found (already ended) — do nothing. */
+async function handleAmdResult(callSid, result) {
+  const session = sessionsByCallSid.get(callSid);
+  if (!session || session.voicemailMode || result !== 'machine') return;
+  session.voicemailMode = true;
+  try { session.llmAbort = true; } catch {}
+  try { if (session.sendClear) session.sendClear(); } catch {}
+  const cfg = global._vsConfig || {};
+  const ctx = (cfg.getOutboundCtx && cfg.getOutboundCtx(callSid)) || {};
+  const first = String(ctx.calleeName || '').trim().split(/\s+/)[0] || 'there';
+  const who = String(ctx.userName || 'a Kade-AI user').trim().split(/\s+/)[0];
+  let mission = String(ctx.purpose || '').replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '').trim();
+  if (mission.length > 160) mission = mission.slice(0, 157) + '...';
+  const msg =
+    `Hey ${first}, it's ${ctx.agentName || session.agentName}, the A I companion calling for ${who} from Kade A I. ` +
+    (mission ? `I was calling to ${mission} ` : '') +
+    `Sorry I missed you — catch me in the app any time, or call the Kade A I line back. Talk soon. Bye!`;
+  console.log(`[voice-stream] VOICEMAIL MODE for ${callSid} — leaving one message`);
+  try {
+    await speak(session, msg, session.voice);
+    setTimeout(() => { try { cfg.endCall && cfg.endCall(callSid); } catch {} }, 1200);
+  } catch (e) {
+    console.warn('[voice-stream] voicemail message failed:', e.message);
+    try { cfg.endCall && cfg.endCall(callSid); } catch {}
+  }
+}
+
 function attachMediaStreams(server, users, cfg) {
   global._vsConfig = { ...cfg, users };
 
@@ -1936,6 +1994,27 @@ function attachMediaStreams(server, users, cfg) {
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
+
+          // July 12 2026: register by callSid so async callbacks (AMD) can
+          // reach the live session.
+          if (callSid) {
+            sessionsByCallSid.set(callSid, session);
+            ws.on('close', () => sessionsByCallSid.delete(callSid));
+          }
+
+          // July 12 2026: fetch the caller/callee's own memory cards (fork)
+          // so this agent actually REMEMBERS them on the phone. Async — first
+          // turn may go out without them; they attach the moment they land.
+          if (global._vsConfig.fetchCallMemories) {
+            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId)
+              .then((text) => {
+                if (text && session) {
+                  session.callerMemories = text;
+                  console.log(`[voice-stream] caller memories attached for ${from} (${text.length} chars)`);
+                }
+              })
+              .catch(() => {});
+          }
 
           // July 12 2026: apply the caller's own per-agent voice pick (fork
           // store). Async so the greeting never waits — when it lands (sub-
@@ -2419,4 +2498,4 @@ function attachWebVoice(server) {
   return wss;
 }
 
-module.exports = { attachMediaStreams, attachWebVoice, synthesize };
+module.exports = { attachMediaStreams, attachWebVoice, synthesize, handleAmdResult };
