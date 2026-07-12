@@ -64,7 +64,7 @@ const PHONE_BRIEF = 'SYSTEM NOTE (not from the caller): You are on a live phone 
 
 // ── Phone voice list — SHARED (voice-commands.js) since July 13 2026 ────────
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
-        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent } = require('./voice-commands');
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
 
 
 const SIGNUP_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Register your phone — Kade AI</title>\n  <style>\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e8e8e8; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }\n    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 2rem; width: 100%; max-width: 400px; }\n    h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }\n    p { color: #999; font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5; }\n    label { display: block; font-size: 0.85rem; color: #ccc; margin-bottom: 0.35rem; }\n    input { width: 100%; padding: 0.65rem 0.85rem; background: #111; border: 1px solid #333; border-radius: 8px; color: #e8e8e8; font-size: 1rem; margin-bottom: 1rem; }\n    input:focus { outline: none; border-color: #555; }\n    button { width: 100%; padding: 0.75rem; background: #7c3aed; border: none; border-radius: 8px; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; }\n    button:hover { background: #6d28d9; }\n    .msg { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; text-align: center; display: none; }\n    .msg.ok { background: #14532d; color: #86efac; display: block; }\n    .msg.err { background: #450a0a; color: #fca5a5; display: block; }\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Register your phone</h1>\n    <p>So the AI knows who you are when you call in to the Kade AI line.</p>\n    <form id=\"f\">\n      <label for=\"name\">Your name</label>\n      <input id=\"name\" name=\"name\" type=\"text\" placeholder=\"Mom\" required autocomplete=\"name\">\n      <label for=\"phone\">Phone number</label>\n      <input id=\"phone\" name=\"phone\" type=\"tel\" placeholder=\"417-555-1234\" required autocomplete=\"tel\">\n      <button type=\"submit\">Register</button>\n    </form>\n    <div id=\"msg\" class=\"msg\"></div>\n  </div>\n  <script>\n    document.getElementById('f').addEventListener('submit', async e => {\n      e.preventDefault();\n      const btn = e.target.querySelector('button');\n      btn.disabled = true; btn.textContent = 'Registering...';\n      const msg = document.getElementById('msg');\n      msg.className = 'msg'; msg.textContent = '';\n      try {\n        const r = await fetch('/signup', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ name: document.getElementById('name').value.trim(), phone: document.getElementById('phone').value.trim() })\n        });\n        const d = await r.json();\n        if (d.ok) { msg.className = 'msg ok'; msg.textContent = \"You're registered! Next time you call, the AI will know your name.\"; e.target.reset(); }\n        else { msg.className = 'msg err'; msg.textContent = d.error || 'Something went wrong. Try again.'; }\n      } catch { msg.className = 'msg err'; msg.textContent = 'Network error. Try again.'; }\n      btn.disabled = false; btn.textContent = 'Register';\n    });\n  </script>\n</body>\n</html>";
@@ -136,7 +136,7 @@ async function getLCToken() {
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/auth/login`,
     { email: LIBRECHAT_EMAIL, password: LIBRECHAT_PASS },
-    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+    { headers: { 'User-Agent': BROWSER_UA }, timeout: 10000 }
   );
   _adminToken    = r.data.token;
   _adminTokenExp = Date.now() + 20 * 60 * 1000;
@@ -151,7 +151,7 @@ async function getUserToken(email, password) {
   const r = await axios.post(
     `${LIBRECHAT_URL}/api/auth/login`,
     { email, password },
-    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+    { headers: { 'User-Agent': BROWSER_UA }, timeout: 10000 }
   );
   _userTokens.set(email, { token: r.data.token, expires: Date.now() + 20 * 60 * 1000 });
   return r.data.token;
@@ -168,7 +168,7 @@ async function createLCAccount(name, email, password) {
   await axios.post(
     `${LIBRECHAT_URL}/api/auth/register`,
     { name, email, password, confirm_password: password },
-    { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 }
+    { headers: { 'User-Agent': BROWSER_UA }, timeout: 15000 }
   );
 }
 
@@ -191,7 +191,7 @@ async function getAgents() {
   if (_agentCache && Date.now() < _agentCacheExp) return _agentCache;
   try {
     const r = await axios.get(`${PROXY_URL}/librechat/agents`, {
-      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
       timeout: 15000,
     });
     _agentCache    = (r.data.agents || []);
@@ -217,7 +217,7 @@ async function refreshAgentTts(agentId) {
   if (!agentId) return;
   try {
     const r = await axios.get(`${PROXY_URL}/librechat/agent?id=${encodeURIComponent(agentId)}`, {
-      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
       timeout: 15000,
     });
     const tts = r.data?.tts || {};
@@ -285,7 +285,7 @@ async function askAgent(agentId, history, userMessage) {
     `${PROXY_URL}/librechat/ask`,
     { agentId, messages: outgoing },
     {
-      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' },
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
       timeout: 150000,
     }
   );
@@ -871,7 +871,7 @@ async function lookupVoicePref(identity, agentId) {
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/voice-pref-lookup?${params}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 1500,
+      headers: { 'User-Agent': BROWSER_UA }, timeout: 1500,
     });
     return (r.data && r.data.voice) || null;
   } catch { return null; }
@@ -885,7 +885,7 @@ async function fetchCallMemories(identity, agentId) {
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/call-memories?${params}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 2500,
+      headers: { 'User-Agent': BROWSER_UA }, timeout: 2500,
     });
     return (r.data && r.data.text) || null;
   } catch { return null; }
@@ -898,7 +898,7 @@ function ingestVoicePref(identity, agentId, voice) {
     phone: identity.phone || undefined,
     userId: identity.userId || undefined,
     agentId, voice,
-  }, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 4000 }).catch(() => {});
+  }, { headers: { 'User-Agent': BROWSER_UA }, timeout: 4000 }).catch(() => {});
 }
 const OUR_NUMBER         = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
 const RECORDING_USD_PER_MIN = 0.0025; // Twilio recording rate; call-leg price comes from Twilio itself
@@ -1008,7 +1008,7 @@ app.post('/outbound-call', async (req, res) => {
   try {
     const ar = await axios.get(
       `${PROXY_URL}/librechat/agent?id=${encodeURIComponent(agentId || DEFAULT_AGENT)}`,
-      { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 },
+      { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: 15000 },
     );
     outVoice = ar.data?.tts?.voiceId || null;
     outRate = typeof ar.data?.tts?.speakingRate === 'number' ? ar.data.tts.speakingRate : null;
@@ -1303,7 +1303,7 @@ async function finalizeOutboundCall(callSid) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await axios.post(`${FORK_USAGE_URL}/api/kade/usage-event`, body, {
-          headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000,
+          headers: { 'User-Agent': BROWSER_UA }, timeout: 10000,
         });
         console.log(`[outbound] usage event posted for user ${meta.userId}: $${costUSD}`);
         break;
@@ -1793,7 +1793,7 @@ async function askAgentRich(agentId, userMessage) {
   const r = await axios.post(
     `${PROXY_URL}/librechat/ask`,
     { agentId, messages: [{ role: 'user', content: userMessage }] },
-    { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': 'Mozilla/5.0' }, timeout: 150000 },
+    { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: 150000 },
   );
   return (r.data && r.data.text) || null;
 }
@@ -1843,7 +1843,7 @@ async function wellnessReportBack(record, w) {
         userId: w.notifyUserId,
         text: text.slice(0, 3000),
         type: 'wellness',
-      }, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 });
+      }, { headers: { 'User-Agent': BROWSER_UA }, timeout: 10000 });
       console.log(`[wellness] report nudged to ${w.notifyUserId} for ${w.targetName}`);
       return;
     } catch (e) {

@@ -202,3 +202,39 @@ module.exports.stripSwitchPadding = stripSwitchPadding;
 module.exports.extractSwitchTarget = extractSwitchTarget;
 module.exports.findAgent = findAgent;
 module.exports.fuzzyFindAgent = fuzzyFindAgent;
+
+
+// ── Full browser UA for EVERY call that touches kademurdock.com ─────────────
+// STANDING RULE (learned July 11 the hard way): a bare "Mozilla/5.0" parses
+// as NO browser → NON_BROWSER violation (20 pts) on uaParser-guarded routes;
+// two = 15-min Mongo-backed account ban. Always send a full UA with a real
+// browser token.
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// ── Transcript scrub (July 13 2026) ─────────────────────────────────────────
+// Call transcripts land on the /calls page as READ text — strip every tag
+// family the speech path strips (the TTS proxy cleans audio; nothing cleaned
+// the saved words): %%%voice tags, [sound:]/[table:] cues, citation glyphs +
+// literal escape-text, thinking blocks, [END CALL], stray markdown.
+function scrubTranscriptText(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/:::thinking[\s\S]*?:::\n?/g, '')
+    .replace(/<think>[\s\S]*?<\/think>\n?/g, '')
+    .replace(/%{2,4}[a-zA-Z][^%\n]{0,80}%{2,4}/g, '')
+    .replace(/\[(?:sound:[a-z0-9_]+|table:[a-z0-9]{1,12})\]/gi, '')
+    .replace(/\[END CALL\]/gi, '')
+    .replace(/[\uE200-\uE20F]turn\d+[a-z]+\d+/gi, '')
+    .replace(/[\uE000-\uF8FF]/g, '')
+    .replace(/\\?u[eE]20[0-9a-fA-F]turn\d+[a-zA-Z]+\d+/g, '')
+    .replace(/\\?u[eE]20[0-9a-fA-F]/g, '')
+    .replace(/turn\d+(?:search|image|news|video|ref|file)\d+/g, '')
+    .replace(/\\u00a0/gi, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+module.exports.BROWSER_UA = BROWSER_UA;
+module.exports.scrubTranscriptText = scrubTranscriptText;

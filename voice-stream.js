@@ -54,7 +54,7 @@ function applyDirectionCarry(sentence, dirState) {
 
 // SHARED voice-command brain (July 13 2026): one copy for both engines.
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
-        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent } = require('./voice-commands');
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1154,7 +1154,7 @@ async function streamReply(session, userText) {
       {
         Authorization: `Bearer ${session.cfg.proxySecret}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
       { agentId: session.agentId, messages: outgoing }
@@ -1244,7 +1244,7 @@ async function synthesize(text, voice, rate, format = 'mulaw') {
   if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech${format === 'mulaw' ? '?telephony=1' : ''}`,
-    { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA },
     body
   );
   return new Promise((resolve, reject) => {
@@ -1482,7 +1482,7 @@ async function fetchLlmOpener(session, user) {
       {
         Authorization: `Bearer ${session.cfg.proxySecret}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
       { agentId: session.agentId, messages: [{ role: 'user', content: instruction }] }
@@ -2210,7 +2210,7 @@ async function logCallTranscript(session) {
     const axios = require('axios');
     const turns = (session.history || [])
       .filter((m) => m && m.content && String(m.content).trim())
-      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', text: String(m.content) }));
+      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', text: scrubTranscriptText(String(m.content)) }));
     if (!turns.length) return;
     const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
     if (!secret) return;
@@ -2227,7 +2227,7 @@ async function logCallTranscript(session) {
       endedAt: new Date().toISOString(),
       turns,
       metadata: { callSid: session.callSid, outbound: !!session.outbound },
-    }, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
     console.log(`[voice-stream] logged transcript for ${session.callSid} (${turns.length} turns)`);
   } catch (e) {
     console.log(`[voice-stream] transcript log failed: ${e && e.message}`);
@@ -2313,7 +2313,7 @@ async function postWebVoiceUsage(session) {
       unit: 'minutes',
       costUSD: 0,
       metadata: { agent: session.agentName, surface: 'web', seconds: secs },
-    }, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
   } catch (e) { console.log('[web-voice] usage post failed:', e && e.message); }
 }
 
