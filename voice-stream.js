@@ -849,8 +849,18 @@ async function handleUtterance(session, text) {
     const newVoice = extractVoiceSwitch(text);
     if (newVoice) {
       session.voice = newVoice;
+      session.spokenVoiceChoice = true; // explicit — nothing may stomp it this call
       const u = session.cfg.users.get(session.from);
       if (u) { u.voice = newVoice; session.cfg.saveUsers(); }
+      // July 12 2026: a spoken pick is a REAL preference — save it to the
+      // fork per (account, current agent) so the app + web calls follow suit.
+      if (session.cfg.ingestVoicePref) {
+        session.cfg.ingestVoicePref(
+          { email: session.lcEmail || (u && u.lcEmail), phone: session.from },
+          session.agentId,
+          newVoice,
+        );
+      }
       await speak(session, `Switching to ${newVoice}'s voice! Go ahead.`, newVoice);
       return;
     }
@@ -893,7 +903,15 @@ async function handleUtterance(session, text) {
         agentTts = (session.cfg.getAgentTts && session.cfg.getAgentTts(agent.id)) || null;
       }
       const nameVoice = (session.cfg.findVoice && session.cfg.findVoice(agent.name)) || null;
-      session.voice = (u && u.voice) || (agentTts && agentTts.voiceId) || nameVoice || session.cfg.defaultVoice;
+      // July 12 2026: their own pick for the NEW agent leads the chain.
+      let prefVoice = null;
+      if (session.cfg.lookupVoicePref && !session.spokenVoiceChoice) {
+        prefVoice = await Promise.race([
+          session.cfg.lookupVoicePref({ email: session.lcEmail || (u && u.lcEmail), phone: session.from }, agent.id),
+          new Promise((r) => setTimeout(() => r(null), 1200)),
+        ]).catch(() => null);
+      }
+      session.voice = prefVoice || (u && u.voice) || (agentTts && agentTts.voiceId) || nameVoice || session.cfg.defaultVoice;
       session.rate  = (u && typeof u.rate === 'number') ? u.rate
         : (agentTts && typeof agentTts.rate === 'number' ? agentTts.rate : null);
       await speak(session, `Switching to ${agent.name}! What's on your mind?`, session.voice);
@@ -1918,6 +1936,23 @@ function attachMediaStreams(server, users, cfg) {
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
+
+          // July 12 2026: apply the caller's own per-agent voice pick (fork
+          // store). Async so the greeting never waits — when it lands (sub-
+          // second typical) the session upgrades unless they've since spoken
+          // an explicit switch. Outbound callee picks are applied in
+          // /outbound-call before greeting synth, so skip those here.
+          if (!outboundCtx && global._vsConfig.lookupVoicePref) {
+            const startAgentId = session.agentId;
+            global._vsConfig.lookupVoicePref({ email: user?.lcEmail, phone: from }, startAgentId)
+              .then((pref) => {
+                if (pref && session && session.agentId === startAgentId && !session.spokenVoiceChoice) {
+                  session.voice = pref;
+                  console.log(`[voice-stream] personal voice applied for ${from}: "${pref}"`);
+                }
+              })
+              .catch(() => {});
+          }
 
           session.dgWs = openDeepgram(session);
 

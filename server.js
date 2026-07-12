@@ -960,6 +960,35 @@ const OUTBOUND_USER_ALLOWLIST = (() => {
 const OUTBOUND_RECORD    = process.env.OUTBOUND_RECORD !== '0';
 const FORK_USAGE_URL     = (process.env.FORK_USAGE_URL || LIBRECHAT_URL).replace(/\/$/, '');
 const USAGE_EVENT_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
+
+// ── PHONE-LINE PERSONAL VOICES (July 12 2026) ────────────────────────────────
+// The fork stores each user's per-agent voice picks (kadeVoicePref). These two
+// helpers let the phone engine APPLY them (lookup) and SAVE spoken mid-call
+// switches back (ingest) so a pick made anywhere follows the person everywhere.
+// Fail-soft by design: any error/timeout -> null -> existing voice chain rules.
+async function lookupVoicePref(identity, agentId) {
+  if (!USAGE_EVENT_SECRET || !agentId || !identity) return null;
+  try {
+    const params = new URLSearchParams({ secret: USAGE_EVENT_SECRET, agentId });
+    if (identity.email) params.set('email', identity.email);
+    if (identity.phone) params.set('phone', identity.phone);
+    if (identity.userId) params.set('userId', identity.userId);
+    const r = await axios.get(`${FORK_USAGE_URL}/api/kade/voice-pref-lookup?${params}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 1500,
+    });
+    return (r.data && r.data.voice) || null;
+  } catch { return null; }
+}
+function ingestVoicePref(identity, agentId, voice) {
+  if (!USAGE_EVENT_SECRET || !agentId || !identity) return;
+  axios.post(`${FORK_USAGE_URL}/api/kade/voice-pref-ingest`, {
+    secret: USAGE_EVENT_SECRET,
+    email: identity.email || undefined,
+    phone: identity.phone || undefined,
+    userId: identity.userId || undefined,
+    agentId, voice,
+  }, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 4000 }).catch(() => {});
+}
 const OUR_NUMBER         = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
 const RECORDING_USD_PER_MIN = 0.0025; // Twilio recording rate; call-leg price comes from Twilio itself
 
@@ -1077,6 +1106,16 @@ app.post('/outbound-call', async (req, res) => {
   }
   if (!outVoice) outVoice = findVoice(agentName || DEFAULT_AGENT_NAME);
   if (!outVoice) outVoice = voice || DEFAULT_PHONE_VOICE;
+  // July 12 2026: the CALLEE's own voice pick for this agent beats the
+  // builder default — they're the one listening. Fail-soft, ~1.5s max.
+  try {
+    const callee = users.get(e164);
+    const personal = await lookupVoicePref({ email: callee && callee.lcEmail, phone: e164 }, agentId || DEFAULT_AGENT);
+    if (personal) {
+      outVoice = personal;
+      console.log(`[outbound] callee personal voice applied: "${personal}"`);
+    }
+  } catch { /* agent default stands */ }
   console.log(`[outbound] voice resolved: "${outVoice}"${outRate ? ` rate ${outRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
   // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
   // is JUST "Hi — is this X?" — the stream layer waits for their answer before
@@ -1905,6 +1944,8 @@ attachMediaStreams(server, users, {
   getOutboundCtx,
   onCallEnd,
   endCall,
+  lookupVoicePref,   // July 12 2026: per-caller per-agent voice picks (fork)
+  ingestVoicePref,
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
