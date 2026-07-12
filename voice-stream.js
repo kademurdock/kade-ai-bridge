@@ -867,10 +867,29 @@ async function handleUtterance(session, text) {
       await speak(session, line, session.voice);
       return;
     }
+    // July 12 2026 (Kade: "unable to identify which voice is being used"):
+    // spoken identify command — answers instantly, no LLM turn.
+    if (/^(?:(?:what|which)\s+(?:voice|number)\s+(?:are\s+you(?:\s+(?:using|on))?|is\s+(?:this|that)|am\s+i\s+(?:hearing|on))|whose\s+voice\s+is\s+(?:this|that)|what\s+voice\s+is\s+(?:this|that))\??$/i.test(text.trim())) {
+      await speak(session, `I'm speaking as ${session.voice} right now. Say switch to voice, and a number, any time.`, session.voice);
+      return;
+    }
     const newVoice = extractVoiceSwitch(text);
     if (newVoice) {
+      const prevVoice = session.voice;
       session.voice = newVoice;
       session.spokenVoiceChoice = true; // explicit — nothing may stomp it this call
+      try {
+        // The confirmation speaks IN the new voice — instant audible proof,
+        // and it doubles as validation: an unknown voice number fails synth,
+        // so we revert instead of leaving the call voiceless.
+        await speak(session, `Switching to ${newVoice}'s voice! Go ahead.`, newVoice);
+      } catch (e) {
+        console.warn(`[voice-stream] voice switch to "${newVoice}" failed synth — reverting: ${e.message}`);
+        session.voice = prevVoice;
+        session.spokenVoiceChoice = false;
+        await speak(session, `Hmm, I don't seem to have ${newVoice}. The app's voice picker lists everything I've got. Go ahead.`, prevVoice).catch(() => {});
+        return;
+      }
       const u = session.cfg.users.get(session.from);
       if (u) { u.voice = newVoice; session.cfg.saveUsers(); }
       // July 12 2026: a spoken pick is a REAL preference — save it to the
@@ -882,7 +901,6 @@ async function handleUtterance(session, text) {
           newVoice,
         );
       }
-      await speak(session, `Switching to ${newVoice}'s voice! Go ahead.`, newVoice);
       return;
     }
     const agents = await session.cfg.getAgents();

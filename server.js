@@ -80,6 +80,11 @@ const SIGNUP_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charse
 function findVoice(query) {
   if (!query) return null;
   const q = query.toLowerCase().trim();
+  // July 12 2026: the catalog is NUMBERED now (Voice 1-324) — accept
+  // "voice 67", "voice number 67", or a bare number, and pass the canonical
+  // label through (the TTS proxy owns the map).
+  const num = q.match(/^(?:voice\s*)?(?:number\s*)?(\d{1,3})$/);
+  if (num) return `Voice ${Number(num[1])}`;
   return PHONE_VOICES.find(v => v.toLowerCase() === q)
       || PHONE_VOICES.find(v => q.includes(v.toLowerCase()))
       || PHONE_VOICES.find(v => v.toLowerCase().includes(q))
@@ -87,11 +92,16 @@ function findVoice(query) {
 }
 
 function extractVoiceSwitch(text) {
-  const m = text.match(
+  const t = String(text || '').trim().replace(/[.!?]+$/, '');
+  const m = t.match(
     /^(?:switch|change)\s+(?:my\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:the\s+)?voice(?:\s+to)?\s+(.+)/i
   );
-  if (!m) return null;
-  return findVoice((m[1] || m[2]).trim());
+  if (m) return findVoice((m[1] || m[2]).trim());
+  // July 12 2026 (Kade said "Switch to 67." and nothing happened): number-first
+  // phrasings — "switch to (voice) 67", "try voice 67", "voice 67 please".
+  const n = t.match(/^(?:switch|change|go)\s+to\s+(?:voice\s*)?(\d{1,3})$|^(?:try|use|gimme|give me)\s+voice\s*(\d{1,3})$|^voice\s*(\d{1,3})(?:\s+please)?$/i);
+  if (n) return `Voice ${Number(n[1] || n[2] || n[3])}`;
+  return null;
 }
 
 function getTwilioClient() {
@@ -258,6 +268,10 @@ function refreshAllAgentTts() {
 }
 setTimeout(refreshAllAgentTts, 5000);          // boot (give users load a beat)
 setInterval(refreshAllAgentTts, 15 * 60 * 1000); // builder voice changes land within 15 min
+// July 12 2026 (Kade's live catch: fresh deploys served the WRONG voice —
+// "Kiana (Comedian)" name-match fallback — until the first 15-min tick):
+// warm the cache IMMEDIATELY at boot.
+setTimeout(refreshAllAgentTts, 3000);
 
 // Fuzzy matching (July 2 2026): same code as voice-stream.js — STT/typos
 // mangle invented names, so exact matching alone fails on the names that
