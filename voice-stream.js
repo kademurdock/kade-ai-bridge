@@ -27,9 +27,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fixPronunciation(t) {
-  return t.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
-}
+// fixPronunciation: shared — see voice-commands.js
 
 // ── Voice-steering carry-forward (phone path) ────────────────────────────────
 // inworld-tts-proxy's applySteeringTags() carries a leading %%%direction%%% tag
@@ -54,18 +52,9 @@ function applyDirectionCarry(sentence, dirState) {
   return sentence;
 }
 
-const PHONE_SUFFIX =
-  '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
-  'Talk the way you naturally would: warm, engaged, conversational. ' +
-  'Two or three sentences is usually right; go longer only if you are genuinely ' +
-  'mid-story and stopping would feel weird. ' +
-  'Once in a while, if a reply is running long, naturally invite them to jump in — ' +
-  'something like "am I rambling?" or "jump in whenever." ' +
-  'Don\'t do this every turn — only when it genuinely fits. ' +
-  'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
-  'what you heard ("wait, did you say...?") before running with it. ' +
-  'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
-  'No lists, no markdown, no formatting. Just talk.]';
+// SHARED voice-command brain (July 13 2026): one copy for both engines.
+const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent } = require('./voice-commands');
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -189,28 +178,11 @@ function buildOutboundSuffix(ctx) {
   );
 }
 
-const PHONE_VOICES = [
-  'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
-  'Amy', 'Hannah', 'Kiana (Comedian)', 'Zadiana', 'Honey', 'Sadie',
-  'Lannie', 'Reanne', 'Sharma', 'Fara', 'Fucia', 'Colby', 'Zadia',
-  'Mazy (Podcaster)', 'Houston Stone', 'DJ Velvet', 'Podcaster 1', 'Podcaster 2',
-];
+// PHONE_VOICES: shared — see voice-commands.js
 
-function findVoice(q) {
-  if (!q) return null;
-  const lq = q.toLowerCase().trim();
-  return PHONE_VOICES.find(v => v.toLowerCase() === lq)
-      || PHONE_VOICES.find(v => lq.includes(v.toLowerCase()))
-      || PHONE_VOICES.find(v => v.toLowerCase().includes(lq))
-      || null;
-}
+// findVoice: shared — see voice-commands.js (now understands numbers here too)
 
-function extractVoiceSwitch(text) {
-  const m = text.match(
-    /^(?:switch|change)\s+(?:my\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:the\s+)?voice(?:\s+to)?\s+(.+)/i
-  );
-  return m ? findVoice((m[1] || m[2]).trim()) : null;
-}
+// extractVoiceSwitch: shared — see voice-commands.js (possessives + numbers now work on streaming calls)
 
 // ── Speaking-rate voice commands ("speak faster", "slow down") ────────────────
 // Kade's ask (2026-07-01): control the pace mid-call by just saying so.
@@ -243,6 +215,14 @@ function extractRateCommand(text) {
     (words <= 3 && /\bslower\b/.test(t));
   if (fast && !slow) return 'faster';
   if (slow && !fast) return 'slower';
+  // July 13 2026 audit: complaints are commands too — "you're talking too
+  // fast" means slow down. Short utterances only (a 5-word cap keeps
+  // "that song is way too fast" conversations from misfiring mid-story).
+  if (words <= 5) {
+    if (/\btoo\s+(?:fast|quick(?:ly)?)\b/.test(t)) return 'slower';
+    if (/\btoo\s+slow(?:ly)?\b/.test(t)) return 'faster';
+    if (/\bquicker\b/.test(t) && words <= 3) return 'faster';
+  }
   return null;
 }
 
@@ -252,66 +232,10 @@ function extractRateCommand(text) {
 // useless for exactly the agents Kade cares most about. Fold both sides
 // phonetically (z/s, c/k, ph/f, vowels loosened, doubles collapsed, spaces
 // stripped) and accept close edit distances.
-function phoneticFold(s) {
-  return (s || '')
-    .toLowerCase()
-    .replace(/[^a-z]/g, '')
-    .replace(/ph/g, 'f')
-    .replace(/ck/g, 'k')
-    .replace(/[cq]/g, 'k')
-    .replace(/z/g, 's')
-    .replace(/y/g, 'i')
-    .replace(/(.)\1+/g, '$1');
-}
-function editDistance(a, b) {
-  const m = a.length, n = b.length;
-  if (!m) return n;
-  if (!n) return m;
-  let prev = Array.from({ length: n + 1 }, (_, j) => j);
-  for (let i = 1; i <= m; i++) {
-    const cur = [i];
-    for (let j = 1; j <= n; j++) {
-      cur[j] = Math.min(
-        prev[j] + 1,
-        cur[j - 1] + 1,
-        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
-      );
-    }
-    prev = cur;
-  }
-  return prev[n];
-}
-function fuzzyFindAgent(agents, query) {
-  if (!query || !agents.length) return null;
-  const lq = query.toLowerCase().trim();
-  // exact / substring first (cheap, precise)
-  const exact = agents.find(a => a.name.toLowerCase() === lq)
-      || agents.find(a => lq.includes(a.name.toLowerCase()))
-      || agents.find(a => a.name.toLowerCase().includes(lq));
-  if (exact) return { agent: exact, confidence: 1 };
-  const fq = phoneticFold(query);
-  if (fq.length < 2) return null;
-  let best = null, bestDist = Infinity;
-  for (const a of agents) {
-    const fn = phoneticFold(a.name);
-    if (!fn) continue;
-    const d = editDistance(fq, fn);
-    if (d < bestDist) { bestDist = d; best = a; }
-  }
-  if (!best) return null;
-  const fn = phoneticFold(best.name);
-  const maxLen = Math.max(fq.length, fn.length);
-  // short names must be near-exact; longer names tolerate ~1/3 mangling
-  const limit = maxLen <= 4 ? 1 : Math.floor(maxLen / 3);
-  if (bestDist <= limit) return { agent: best, confidence: 1 - bestDist / maxLen };
-  // close-but-not-sure: return as a low-confidence guess (caller may confirm)
-  if (bestDist <= Math.ceil(maxLen / 2)) return { agent: best, confidence: 0.4 };
-  return null;
-}
-function findAgent(agents, query) {
-  const r = fuzzyFindAgent(agents, query);
-  return r && r.confidence >= 0.6 ? r.agent : null;
-}
+// phoneticFold: shared — see voice-commands.js
+// editDistance: shared — see voice-commands.js
+// fuzzyFindAgent: shared — see voice-commands.js
+// findAgent: shared — see voice-commands.js
 
 // Strip conversational padding so switch commands survive politeness (Kade's
 // July 3 report: "Can you switch to Kiana?" fell through to the LLM and
@@ -319,39 +243,9 @@ function findAgent(agents, query) {
 // The old matcher was anchored to the utterance start, so any polite lead-in
 // defeated it, including the help page's own documented phrasing "can I talk
 // to Zadiana?").
-function stripSwitchPadding(text) {
-  let t = (text || '').trim();
-  const lead = /^(?:hey|hi|hello|yo|okay|ok|oh|um|uh|so|well|now|actually|please)[,.!?\s]+/i;
-  for (let i = 0; i < 4 && lead.test(t); i++) t = t.replace(lead, '');
-  t = t.replace(/^(?:can|could|would|will|do)\s+(?:you|we)\s+(?:please\s+)?/i, '');
-  t = t.replace(/^please\s+/i, '');
-  return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
-}
+// stripSwitchPadding: shared — see voice-commands.js
 
-function extractSwitchTarget(text, agents) {
-  const t = stripSwitchPadding(text);
-  const patterns = [
-    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
-    /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
-    /^give\s+me\s+(.+)$/i,
-    /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
-  ];
-  let q = null;
-  for (const re of patterns) { const m = t.match(re); if (m) { q = m[1].trim(); break; } }
-  // Bare name: unchanged from the original matcher — raw short utterances
-  // only. (Stripping padding here backfired in regression tests: "Now what?"
-  // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
-  // substring pass already handles "Kiana please".)
-  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
-  if (!q) {
-    // Last-ditch: an explicit switch verb ANYWHERE — covers the vocative case
-    // ("Zadiana, switch me to Kiana"). findAgent's confidence gate keeps this
-    // from false-firing on ordinary sentences.
-    const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
-    if (m) q = stripSwitchPadding(m[1]);
-  }
-  return q ? findAgent(agents, q) : null;
-}
+// extractSwitchTarget: shared — see voice-commands.js
 
 // ── Deep-think voice command (July 4 2026, Kade's reasoning-switch plan) ─────
 // Phone turns run reasoning effort:'none' by default (reframe-proxy's
@@ -365,13 +259,14 @@ function extractSwitchTarget(text, agents) {
 function deepThinkCommandOf(text) {
   const t = stripSwitchPadding(text).replace(/[.!?]+$/, '').trim();
   const on = [
-    /^(?:turn|switch)?\s*(?:on\s+)?deep\s*think(?:ing)?(?:\s*mode)?(?:\s+on)?$/i,
+    /^(?:turn|switch|enable|start|activate|use)?\s*(?:on\s+)?deep\s*think(?:ing)?(?:\s*mode)?(?:\s+on)?$/i,
     /^(?:really\s+)?think\s+(?:hard(?:er)?|deeply|carefully)(?:\s+(?:about|on)\s+(?:this|that|it|things|everything))?(?:\s+from\s+now\s+on)?$/i,
     /^put\s+(?:on\s+)?your\s+thinking\s+cap(?:\s+on)?$/i,
     /^take\s+your\s+time\s+and\s+think$/i,
   ];
   const off = [
     /^(?:(?:turn|switch)\s+)?(?:off\s+deep\s*think(?:ing)?(?:\s*mode)?|deep\s*think(?:ing)?(?:\s*mode)?\s+off)$/i,
+    /^(?:disable|stop|end|kill)\s+deep\s*think(?:ing)?(?:\s*mode)?$/i,
     /^(?:go\s+)?back\s+to\s+(?:quick|fast|normal)\s+(?:answers|replies|mode|thinking)$/i,
     /^quick\s+answers$/i,
     /^stop\s+thinking\s+so\s+hard$/i,
@@ -869,7 +764,7 @@ async function handleUtterance(session, text) {
     }
     // July 12 2026 (Kade: "unable to identify which voice is being used"):
     // spoken identify command — answers instantly, no LLM turn.
-    if (/^(?:(?:what|which)\s+(?:voice|number)\s+(?:are\s+you(?:\s+(?:using|on))?|is\s+(?:this|that)|am\s+i\s+(?:hearing|on))|whose\s+voice\s+is\s+(?:this|that)|what\s+voice\s+is\s+(?:this|that))\??$/i.test(text.trim())) {
+    if (VOICE_IDENTIFY_REGEX.test(text.trim())) {
       await speak(session, `I'm speaking as ${session.voice} right now. Say switch to voice, and a number, any time.`, session.voice);
       return;
     }

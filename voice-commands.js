@@ -1,0 +1,204 @@
+// ── SHARED voice-command brain (July 13 2026) ────────────────────────────────
+// ONE copy of the spoken voice-command logic for BOTH call engines:
+//   server.js       — legacy Gather loop + outbound plumbing
+//   voice-stream.js — streaming engine (phone /ws/media + web /ws/web-voice)
+//
+// WHY THIS FILE EXISTS: these used to be two hand-copied sets that drifted.
+// The July 12 fixes (numbered switching, "change YOUR voice" possessives,
+// polite lead-ins) landed only in server.js — the STREAMING engine, the
+// default surface for both phone and web calls, kept the old narrow regex,
+// so "switch to 67" silently fell through to the LLM there. Never again:
+// edit HERE, both engines pick it up.
+
+// Curated legacy display names — the TTS proxy still resolves these as
+// aliases. The real catalog is NUMBERED ("Voice 1"…"Voice 324+", see
+// /voices.json on the proxy); numbers are the first-class citizens.
+const PHONE_VOICES = [
+  'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
+  'Amy', 'Hannah', 'Kiana (Comedian)', 'Zadiana', 'Honey', 'Sadie',
+  'Lannie', 'Reanne', 'Sharma', 'Fara', 'Fucia', 'Colby', 'Zadia',
+  'Mazy (Podcaster)', 'Houston Stone', 'DJ Velvet', 'Podcaster 1', 'Podcaster 2',
+];
+
+// Accepts a spoken target and returns a canonical voice label, or null.
+// "voice 67" / "voice number 67" / bare "67" → "Voice 67" (proxy owns the map;
+// synth-time validation reverts unknown numbers gracefully).
+function findVoice(query) {
+  if (!query) return null;
+  const q = String(query).toLowerCase().trim();
+  const num = q.match(/^(?:voice\s*)?(?:number\s*)?(\d{1,3})$/);
+  if (num) return `Voice ${Number(num[1])}`;
+  return PHONE_VOICES.find(v => v.toLowerCase() === q)
+      || PHONE_VOICES.find(v => q.includes(v.toLowerCase()))
+      || PHONE_VOICES.find(v => v.toLowerCase().includes(q))
+      || null;
+}
+
+// Spoken switch command → canonical voice label or null.
+// Wide on purpose (July 12, Kade live: "change your voice to 67" improvised a
+// refusal): possessives my/your/the, polite lead-ins, number-first phrasings,
+// trailing punctuation.
+function extractVoiceSwitch(text) {
+  let t = String(text || '').trim().replace(/[.!?]+$/, '');
+  // Lead-ins STACK ("hey, can you please…") — strip repeatedly.
+  t = t.replace(/^(?:(?:hey|okay|ok|please|can you|could you|would you|will you)[,\s]+)+/i, '').trim();
+  const m = t.match(
+    /^(?:switch|change)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)/i
+  );
+  if (m) return findVoice((m[1] || m[2]).trim());
+  const n = t.match(/^(?:switch|change|go)\s+to\s+(?:voice\s*)?(\d{1,3})$|^(?:try|use|gimme|give me)\s+voice\s*(\d{1,3})$|^voice\s*(\d{1,3})(?:\s+please)?$/i);
+  if (n) return `Voice ${Number(n[1] || n[2] || n[3])}`;
+  return null;
+}
+
+// Spoken identify command ("what voice are you using?") — instant, no LLM turn.
+const VOICE_IDENTIFY_REGEX =
+  /^(?:(?:what|which)\s+(?:voice|number)\s+(?:are\s+you(?:\s+(?:using|on))?|is\s+(?:this|that)|am\s+i\s+(?:hearing|on))|whose\s+voice\s+is\s+(?:this|that)|what\s+voice\s+is\s+(?:this|that))\??$/i;
+
+// The ONE canonical phone-style suffix (was two drifting copies).
+const PHONE_SUFFIX =
+  '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
+  'Talk the way you naturally would: warm, engaged, conversational. ' +
+  'Two or three sentences is usually right; go longer only if you are genuinely ' +
+  'mid-story and stopping would feel weird. ' +
+  'Once in a while, if a reply is running long, naturally invite them to jump in — ' +
+  'something like "am I rambling?" or "jump in whenever." ' +
+  'Don\'t do this every turn — only when it genuinely fits. ' +
+  'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
+  'what you heard ("wait, did you say...?") before running with it. ' +
+  'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
+  'No lists, no markdown, no formatting. Just talk.]';
+
+module.exports = { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX };
+
+
+// ── Fuzzy AGENT matching + pronunciation (moved here July 13 2026 — was
+// hand-copied identically in BOTH engines; identical today, kept that way
+// by living in one place) ──────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fixPronunciation(t) {
+  return t.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
+}
+
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// ── Fuzzy agent matching (July 2 2026, Kade's fix request) ────────────────────
+// Deepgram never transcribes made-up names right ("Zadiana" arrives as
+// "Zadi Anna", "sadie ana", "zodiana"...). Exact/substring matching was
+// useless for exactly the agents Kade cares most about. Fold both sides
+// phonetically (z/s, c/k, ph/f, vowels loosened, doubles collapsed, spaces
+// stripped) and accept close edit distances.
+function phoneticFold(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .replace(/ph/g, 'f')
+    .replace(/ck/g, 'k')
+    .replace(/[cq]/g, 'k')
+    .replace(/z/g, 's')
+    .replace(/y/g, 'i')
+    .replace(/(.)\1+/g, '$1');
+}
+
+// Strip conversational padding so switch commands survive politeness (Kade's
+// July 3 report: "Can you switch to Kiana?" fell through to the LLM and
+// Zadiana answered IN CHARACTER — slightly offended — instead of switching.
+// The old matcher was anchored to the utterance start, so any polite lead-in
+// defeated it, including the help page's own documented phrasing "can I talk
+// to Zadiana?").
+function stripSwitchPadding(text) {
+  let t = (text || '').trim();
+  const lead = /^(?:hey|hi|hello|yo|okay|ok|oh|um|uh|so|well|now|actually|please)[,.!?\s]+/i;
+  for (let i = 0; i < 4 && lead.test(t); i++) t = t.replace(lead, '');
+  t = t.replace(/^(?:can|could|would|will|do)\s+(?:you|we)\s+(?:please\s+)?/i, '');
+  t = t.replace(/^please\s+/i, '');
+  return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
+}
+
+function extractSwitchTarget(text, agents) {
+  const t = stripSwitchPadding(text);
+  const patterns = [
+    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
+    /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
+    /^(?:give|bring)\s+(?:me\s+|back\s+)?(.+)$/i,
+    /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
+    // July 13 2026 audit: "I want Kiana", "can I have Zadiana" — natural asks
+    // that previously fell to the LLM. findAgent's 0.6 confidence gate keeps
+    // ordinary sentences ("I want pizza") from false-matching an agent.
+    /^(?:i\s+(?:want|choose|pick)|gimme)\s+(.+)$/i,
+    /^(?:can|could)\s+i\s+have\s+(.+)$/i,
+  ];
+  let q = null;
+  for (const re of patterns) { const m = t.match(re); if (m) { q = m[1].trim(); break; } }
+  // Bare name: unchanged from the original matcher — raw short utterances
+  // only. (Stripping padding here backfired in regression tests: "Now what?"
+  // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
+  // substring pass already handles "Kiana please".)
+  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
+  if (!q) {
+    // Last-ditch: an explicit switch verb ANYWHERE — covers the vocative case
+    // ("Zadiana, switch me to Kiana"). findAgent's confidence gate keeps this
+    // from false-firing on ordinary sentences.
+    const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
+    if (m) q = stripSwitchPadding(m[1]);
+  }
+  return q ? findAgent(agents, q) : null;
+}
+
+function findAgent(agents, query) {
+  const r = fuzzyFindAgent(agents, query);
+  return r && r.confidence >= 0.6 ? r.agent : null;
+}
+
+function fuzzyFindAgent(agents, query) {
+  if (!query || !agents.length) return null;
+  const lq = query.toLowerCase().trim();
+  // exact / substring first (cheap, precise)
+  const exact = agents.find(a => a.name.toLowerCase() === lq)
+      || agents.find(a => lq.includes(a.name.toLowerCase()))
+      || agents.find(a => a.name.toLowerCase().includes(lq));
+  if (exact) return { agent: exact, confidence: 1 };
+  const fq = phoneticFold(query);
+  if (fq.length < 2) return null;
+  let best = null, bestDist = Infinity;
+  for (const a of agents) {
+    const fn = phoneticFold(a.name);
+    if (!fn) continue;
+    const d = editDistance(fq, fn);
+    if (d < bestDist) { bestDist = d; best = a; }
+  }
+  if (!best) return null;
+  const fn = phoneticFold(best.name);
+  const maxLen = Math.max(fq.length, fn.length);
+  // short names must be near-exact; longer names tolerate ~1/3 mangling
+  const limit = maxLen <= 4 ? 1 : Math.floor(maxLen / 3);
+  if (bestDist <= limit) return { agent: best, confidence: 1 - bestDist / maxLen };
+  // close-but-not-sure: return as a low-confidence guess (caller may confirm)
+  if (bestDist <= Math.ceil(maxLen / 2)) return { agent: best, confidence: 0.4 };
+  return null;
+}
+
+module.exports.fixPronunciation = fixPronunciation;
+module.exports.editDistance = editDistance;
+module.exports.phoneticFold = phoneticFold;
+module.exports.stripSwitchPadding = stripSwitchPadding;
+module.exports.extractSwitchTarget = extractSwitchTarget;
+module.exports.findAgent = findAgent;
+module.exports.fuzzyFindAgent = fuzzyFindAgent;

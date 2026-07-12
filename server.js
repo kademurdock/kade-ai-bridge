@@ -60,53 +60,18 @@ const PHONE_BRIEF = 'SYSTEM NOTE (not from the caller): You are on a live phone 
 
 // ── Pronunciation fixes ───────────────────────────────────────────────────────
 // "Kade" (the person) is pronounced "Kadie" — fix it before sending to TTS.
-function fixPronunciation(text) {
-  return text.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
-}
+// fixPronunciation: shared — see voice-commands.js
 
-// ── Phone voice list ──────────────────────────────────────────────────────────
-// Curated subset of available Inworld voices, friendly for phone conversations.
-// Full list at kademurdock.com/voices — these are just the ones worth switching to by name.
-const PHONE_VOICES = [
-  'Sarah', 'Julia', 'Olivia', 'Timothy', 'Edward', 'Dennis',
-  'Amy', 'Hannah', 'Kiana (Comedian)', 'Zadiana', 'Honey', 'Sadie',
-  'Lannie', 'Reanne', 'Sharma', 'Fara', 'Fucia', 'Colby', 'Zadia',
-  'Mazy (Podcaster)', 'Houston Stone', 'DJ Velvet', 'Podcaster 1', 'Podcaster 2',
-];
+// ── Phone voice list — SHARED (voice-commands.js) since July 13 2026 ────────
+const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent } = require('./voice-commands');
 
 
 const SIGNUP_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Register your phone — Kade AI</title>\n  <style>\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e8e8e8; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }\n    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 2rem; width: 100%; max-width: 400px; }\n    h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }\n    p { color: #999; font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5; }\n    label { display: block; font-size: 0.85rem; color: #ccc; margin-bottom: 0.35rem; }\n    input { width: 100%; padding: 0.65rem 0.85rem; background: #111; border: 1px solid #333; border-radius: 8px; color: #e8e8e8; font-size: 1rem; margin-bottom: 1rem; }\n    input:focus { outline: none; border-color: #555; }\n    button { width: 100%; padding: 0.75rem; background: #7c3aed; border: none; border-radius: 8px; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; }\n    button:hover { background: #6d28d9; }\n    .msg { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; text-align: center; display: none; }\n    .msg.ok { background: #14532d; color: #86efac; display: block; }\n    .msg.err { background: #450a0a; color: #fca5a5; display: block; }\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Register your phone</h1>\n    <p>So the AI knows who you are when you call in to the Kade AI line.</p>\n    <form id=\"f\">\n      <label for=\"name\">Your name</label>\n      <input id=\"name\" name=\"name\" type=\"text\" placeholder=\"Mom\" required autocomplete=\"name\">\n      <label for=\"phone\">Phone number</label>\n      <input id=\"phone\" name=\"phone\" type=\"tel\" placeholder=\"417-555-1234\" required autocomplete=\"tel\">\n      <button type=\"submit\">Register</button>\n    </form>\n    <div id=\"msg\" class=\"msg\"></div>\n  </div>\n  <script>\n    document.getElementById('f').addEventListener('submit', async e => {\n      e.preventDefault();\n      const btn = e.target.querySelector('button');\n      btn.disabled = true; btn.textContent = 'Registering...';\n      const msg = document.getElementById('msg');\n      msg.className = 'msg'; msg.textContent = '';\n      try {\n        const r = await fetch('/signup', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ name: document.getElementById('name').value.trim(), phone: document.getElementById('phone').value.trim() })\n        });\n        const d = await r.json();\n        if (d.ok) { msg.className = 'msg ok'; msg.textContent = \"You're registered! Next time you call, the AI will know your name.\"; e.target.reset(); }\n        else { msg.className = 'msg err'; msg.textContent = d.error || 'Something went wrong. Try again.'; }\n      } catch { msg.className = 'msg err'; msg.textContent = 'Network error. Try again.'; }\n      btn.disabled = false; btn.textContent = 'Register';\n    });\n  </script>\n</body>\n</html>";
 
-function findVoice(query) {
-  if (!query) return null;
-  const q = query.toLowerCase().trim();
-  // July 12 2026: the catalog is NUMBERED now (Voice 1-324) — accept
-  // "voice 67", "voice number 67", or a bare number, and pass the canonical
-  // label through (the TTS proxy owns the map).
-  const num = q.match(/^(?:voice\s*)?(?:number\s*)?(\d{1,3})$/);
-  if (num) return `Voice ${Number(num[1])}`;
-  return PHONE_VOICES.find(v => v.toLowerCase() === q)
-      || PHONE_VOICES.find(v => q.includes(v.toLowerCase()))
-      || PHONE_VOICES.find(v => v.toLowerCase().includes(q))
-      || null;
-}
+// findVoice: shared — see voice-commands.js
 
-function extractVoiceSwitch(text) {
-  let t = String(text || '').trim().replace(/[.!?]+$/, '');
-  // July 12 2026 (Kade live: "change your voice to 67" fell through to the
-  // LLM, which improvised a refusal): accept polite lead-ins and any
-  // possessive, not just "my".
-  t = t.replace(/^(?:hey|okay|ok|please|can you|could you|would you)[,\s]+/i, '').trim();
-  const m = t.match(
-    /^(?:switch|change)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)/i
-  );
-  if (m) return findVoice((m[1] || m[2]).trim());
-  // July 12 2026 (Kade said "Switch to 67." and nothing happened): number-first
-  // phrasings — "switch to (voice) 67", "try voice 67", "voice 67 please".
-  const n = t.match(/^(?:switch|change|go)\s+to\s+(?:voice\s*)?(\d{1,3})$|^(?:try|use|gimme|give me)\s+voice\s*(\d{1,3})$|^voice\s*(\d{1,3})(?:\s+please)?$/i);
-  if (n) return `Voice ${Number(n[1] || n[2] || n[3])}`;
-  return null;
-}
+// extractVoiceSwitch: shared — see voice-commands.js
 
 function getTwilioClient() {
   if (!TWILIO_SID || !TWILIO_TOKEN || TWILIO_SID === 'FILL_IN') return null;
@@ -270,111 +235,32 @@ function refreshAllAgentTts() {
   const ids = new Set([...users.values()].map((u) => u.agentId).filter(Boolean));
   for (const id of ids) refreshAgentTts(id);
 }
-setTimeout(refreshAllAgentTts, 5000);          // boot (give users load a beat)
 setInterval(refreshAllAgentTts, 15 * 60 * 1000); // builder voice changes land within 15 min
 // July 12 2026 (Kade's live catch: fresh deploys served the WRONG voice —
 // "Kiana (Comedian)" name-match fallback — until the first 15-min tick):
-// warm the cache IMMEDIATELY at boot.
+// warm the cache IMMEDIATELY at boot. (July 13: the old duplicate 5s timer is
+// gone — it double-fired every lookup through the proxy's paced queue.)
 setTimeout(refreshAllAgentTts, 3000);
+// July 13 2026 cache-race audit: the AGENTS LIST cache was lazy too — the
+// first caller after every deploy paid the fetch (plus proxy pacing) MID-CALL
+// during fuzzy agent switching. Warm it right after the TTS warm.
+setTimeout(() => { getAgents().catch(() => {}); }, 6000);
 
 // Fuzzy matching (July 2 2026): same code as voice-stream.js — STT/typos
 // mangle invented names, so exact matching alone fails on the names that
 // matter most.
-function phoneticFold(s) {
-  return (s || '')
-    .toLowerCase()
-    .replace(/[^a-z]/g, '')
-    .replace(/ph/g, 'f')
-    .replace(/ck/g, 'k')
-    .replace(/[cq]/g, 'k')
-    .replace(/z/g, 's')
-    .replace(/y/g, 'i')
-    .replace(/(.)\1+/g, '$1');
-}
-function editDistance(a, b) {
-  const m = a.length, n = b.length;
-  if (!m) return n;
-  if (!n) return m;
-  let prev = Array.from({ length: n + 1 }, (_, j) => j);
-  for (let i = 1; i <= m; i++) {
-    const cur = [i];
-    for (let j = 1; j <= n; j++) {
-      cur[j] = Math.min(
-        prev[j] + 1,
-        cur[j - 1] + 1,
-        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
-      );
-    }
-    prev = cur;
-  }
-  return prev[n];
-}
-function fuzzyFindAgent(agents, query) {
-  if (!query || !agents.length) return null;
-  const lq = query.toLowerCase().trim();
-  // exact / substring first (cheap, precise)
-  const exact = agents.find(a => a.name.toLowerCase() === lq)
-      || agents.find(a => lq.includes(a.name.toLowerCase()))
-      || agents.find(a => a.name.toLowerCase().includes(lq));
-  if (exact) return { agent: exact, confidence: 1 };
-  const fq = phoneticFold(query);
-  if (fq.length < 2) return null;
-  let best = null, bestDist = Infinity;
-  for (const a of agents) {
-    const fn = phoneticFold(a.name);
-    if (!fn) continue;
-    const d = editDistance(fq, fn);
-    if (d < bestDist) { bestDist = d; best = a; }
-  }
-  if (!best) return null;
-  const fn = phoneticFold(best.name);
-  const maxLen = Math.max(fq.length, fn.length);
-  // short names must be near-exact; longer names tolerate ~1/3 mangling
-  const limit = maxLen <= 4 ? 1 : Math.floor(maxLen / 3);
-  if (bestDist <= limit) return { agent: best, confidence: 1 - bestDist / maxLen };
-  // close-but-not-sure: return as a low-confidence guess (caller may confirm)
-  if (bestDist <= Math.ceil(maxLen / 2)) return { agent: best, confidence: 0.4 };
-  return null;
-}
-function findAgent(agents, query) {
-  const r = fuzzyFindAgent(agents, query);
-  return r && r.confidence >= 0.6 ? r.agent : null;
-}
+// phoneticFold: shared — see voice-commands.js
+// editDistance: shared — see voice-commands.js
+// fuzzyFindAgent: shared — see voice-commands.js
+// findAgent: shared — see voice-commands.js
 
 
 // Padding stripper + widened patterns, mirrored from voice-stream.js (July 3
 // 2026): polite phrasings ("Can you switch to Kiana?") must switch, not fall
 // through to the LLM.
-function stripSwitchPadding(text) {
-  let t = (text || '').trim();
-  const lead = /^(?:hey|hi|hello|yo|okay|ok|oh|um|uh|so|well|now|actually|please)[,.!?\s]+/i;
-  for (let i = 0; i < 4 && lead.test(t); i++) t = t.replace(lead, '');
-  t = t.replace(/^(?:can|could|would|will|do)\s+(?:you|we)\s+(?:please\s+)?/i, '');
-  t = t.replace(/^please\s+/i, '');
-  return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
-}
+// stripSwitchPadding: shared — see voice-commands.js
 
-function extractSwitchTarget(text, agents) {
-  const t = stripSwitchPadding(text);
-  const patterns = [
-    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
-    /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
-    /^give\s+me\s+(.+)$/i,
-    /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
-  ];
-  let q = null;
-  for (const re of patterns) { const m = t.match(re); if (m) { q = m[1].trim(); break; } }
-  // Bare name: unchanged from the original matcher — raw short utterances
-  // only. (Stripping padding here backfired in regression tests: "Now what?"
-  // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
-  // substring pass already handles "Kiana please".)
-  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
-  if (!q) {
-    const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
-    if (m) q = stripSwitchPadding(m[1]);
-  }
-  return q ? findAgent(agents, q) : null;
-}
+// extractSwitchTarget: shared — see voice-commands.js
 
 // ── AI call ────────────────────────────────────────────────────────────────────
 // Appended to the LAST user turn on every call. A brevity note placed at the
@@ -384,16 +270,7 @@ function extractSwitchTarget(text, agents) {
 // after the caller's words (recency) makes the model actually obey: replies drop
 // to ~1-2 sentences and latency to ~3-8s. Kept out of stored history so it never
 // accumulates.
-const PHONE_SUFFIX =
-  '\n\n[PHONE CALL — you are literally on the phone with this person right now. ' +
-  'Talk the way you naturally would: warm, engaged, conversational. ' +
-  'Do NOT monologue — two or three sentences is usually right, go longer only if you are ' +
-  'genuinely mid-story and it would feel weird to stop. ' +
-  'If you have been going for a while, throw in a natural check-in: ' +
-  '\"am I rambling?\" or \"jump in whenever\" — whatever fits your voice. ' +
-  'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm what you heard before running with it. ' +
-  'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
-  'No lists, no markdown, no formatting. Just talk.]';
+// PHONE_SUFFIX: shared — see voice-commands.js
 
 async function askAgent(agentId, history, userMessage) {
   history.push({ role: 'user', content: userMessage });
