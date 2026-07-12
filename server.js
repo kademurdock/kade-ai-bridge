@@ -92,9 +92,13 @@ function findVoice(query) {
 }
 
 function extractVoiceSwitch(text) {
-  const t = String(text || '').trim().replace(/[.!?]+$/, '');
+  let t = String(text || '').trim().replace(/[.!?]+$/, '');
+  // July 12 2026 (Kade live: "change your voice to 67" fell through to the
+  // LLM, which improvised a refusal): accept polite lead-ins and any
+  // possessive, not just "my".
+  t = t.replace(/^(?:hey|okay|ok|please|can you|could you|would you)[,\s]+/i, '').trim();
   const m = t.match(
-    /^(?:switch|change)\s+(?:my\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:the\s+)?voice(?:\s+to)?\s+(.+)/i
+    /^(?:switch|change)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)/i
   );
   if (m) return findVoice((m[1] || m[2]).trim());
   // July 12 2026 (Kade said "Switch to 67." and nothing happened): number-first
