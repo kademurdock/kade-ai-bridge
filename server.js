@@ -37,7 +37,16 @@ const PROXY_URL    = (process.env.LIBRECHAT_PROXY_URL || 'https://inworld-tts-pr
 const PROXY_SECRET = process.env.LIBRECHAT_PROXY_SECRET || '';
 const DEFAULT_AGENT      = process.env.DEFAULT_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb';
 const DEFAULT_AGENT_NAME = 'Kiana';
-const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || 'change-me';
+// July 13 2026 security sweep: NO default secret — with the env unset every
+// admin route must refuse, not open under a publicly-known fallback value.
+const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || '';
+// Header-first secret check (query strings land in edge logs); query/body
+// still accepted so existing callers keep working.
+function bridgeSecretOk(req, provided) {
+  if (!BRIDGE_SECRET) return false;
+  const h = req.get && req.get('x-bridge-secret');
+  return h === BRIDGE_SECRET || provided === BRIDGE_SECRET;
+}
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
@@ -370,7 +379,7 @@ app.get('/media/:id', (req, res) => {
 // ── Admin: register / list users ───────────────────────────────────────────────
 app.post('/register', (req, res) => {
   const { phone, name, agentId, agentName, lcEmail, lcPass, secret, accountType } = req.body;
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const digits = phone.replace(/\D/g, '');
   const e164   = digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
@@ -386,7 +395,7 @@ app.post('/register', (req, res) => {
 });
 
 app.get('/users', (req, res) => {
-  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   res.json(Object.fromEntries(users));
 });
 
@@ -866,12 +875,13 @@ const USAGE_EVENT_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
 async function lookupVoicePref(identity, agentId) {
   if (!USAGE_EVENT_SECRET || !agentId || !identity) return null;
   try {
-    const params = new URLSearchParams({ secret: USAGE_EVENT_SECRET, agentId });
+    // July 13 2026: secret rides a HEADER now (query strings land in edge logs).
+    const params = new URLSearchParams({ agentId });
     if (identity.email) params.set('email', identity.email);
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/voice-pref-lookup?${params}`, {
-      headers: { 'User-Agent': BROWSER_UA }, timeout: 1500,
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 1500,
     });
     return (r.data && r.data.voice) || null;
   } catch { return null; }
@@ -879,13 +889,14 @@ async function lookupVoicePref(identity, agentId) {
 async function fetchCallMemories(identity, agentId) {
   if (!USAGE_EVENT_SECRET || !identity) return null;
   try {
-    const params = new URLSearchParams({ secret: USAGE_EVENT_SECRET });
+    // July 13 2026: secret rides a HEADER now (query strings land in edge logs).
+    const params = new URLSearchParams();
     if (agentId) params.set('agentId', agentId);
     if (identity.email) params.set('email', identity.email);
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/call-memories?${params}`, {
-      headers: { 'User-Agent': BROWSER_UA }, timeout: 2500,
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 2500,
     });
     return (r.data && r.data.text) || null;
   } catch { return null; }
@@ -954,7 +965,7 @@ app.post('/outbound-call', async (req, res) => {
     if (!/^[a-z][a-z .,'-]*$/i.test(n)) return null;
     return n;
   })();
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   if (!twilioClient) return res.status(500).json({ error: 'Twilio not configured' });
   if (!userId) return res.status(400).json({ error: 'userId required — whose spend page does this call bill to?' });
   if (!purpose || String(purpose).trim().length < 3) {
@@ -1190,6 +1201,16 @@ app.post('/voice-ws-outbound', (req, res) => {
 // Call status callback — finalizes outbound calls once they end.
 app.post('/amd-status', (req, res) => {
   const { CallSid, AnsweredBy } = req.body || {};
+  // July 13 2026 security sweep: LOG-ONLY Twilio signature check. Deliberately
+  // non-blocking — a URL-reconstruction mismatch must never silently kill
+  // voicemail detection (phone quality is sacred); a forged POST still needs a
+  // live CallSid to do anything (unknown sids no-op in the handler).
+  try {
+    if (TWILIO_TOKEN && twilio.validateRequest) {
+      const ok = twilio.validateRequest(TWILIO_TOKEN, req.get('X-Twilio-Signature') || '', `${PUBLIC_URL}/amd-status`, req.body || {});
+      if (!ok) console.warn(`[amd] SIGNATURE MISMATCH for ${CallSid} — investigate if this ever fires on a real Twilio callback`);
+    }
+  } catch {}
   console.log(`[amd] ${CallSid}: AnsweredBy=${AnsweredBy}`);
   if (CallSid && /^machine_end/.test(String(AnsweredBy || ''))) {
     try { vsHandleAmd(CallSid, 'machine'); } catch (e) { console.warn('[amd] handler failed:', e.message); }
@@ -1320,7 +1341,7 @@ async function finalizeOutboundCall(callSid) {
 // Scoped to the requesting user's id so nobody can read anyone else's calls.
 app.post('/outbound/result', async (req, res) => {
   const { secret, userId, callSid, waitSec } = req.body || {};
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   if (!userId) return res.status(400).json({ error: 'userId required' });
 
   const findState = () => {
@@ -1391,7 +1412,7 @@ app.post('/outbound/result', async (req, res) => {
 
 // Admin: list outbound calls. ?full=1 includes transcripts.
 app.get('/outbound/calls', (req, res) => {
-  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   const full = req.query.full === '1';
   const rows = [...outboundLog].reverse().slice(0, 50).map((r) =>
     full ? r : { ...r, transcript: r.transcript ? `${r.transcript.length} turns (add &full=1)` : null });
@@ -1401,7 +1422,7 @@ app.get('/outbound/calls', (req, res) => {
 // Admin: stream a call recording as mp3 (proxies Twilio auth so a plain
 // browser link works — needed for QA listening).
 app.get('/outbound/recording/:callSid', async (req, res) => {
-  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   const rec = outboundLog.find((r) => r.callSid === req.params.callSid) || outboundMeta.get(req.params.callSid);
   if (!rec || !rec.recordingUrl) return res.status(404).json({ error: 'No recording for that call (yet?)' });
   try {
@@ -1488,7 +1509,7 @@ async function fetchBriefingHeadlines(categories) {
 //         userName?, agentId?, agentName?, enabled? }
 app.post('/briefing', (req, res) => {
   const { secret, phone, time, categories, name, userId, userName, agentId, agentName, enabled } = req.body || {};
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   const e164 = normalizeUsPhone(phone);
   if (!e164) return res.status(400).json({ error: 'phone must be a valid US/Canada number' });
   if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(String(time || ''))) {
@@ -1515,13 +1536,13 @@ app.post('/briefing', (req, res) => {
 });
 
 app.get('/briefings', (req, res) => {
-  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   res.json(Object.fromEntries(briefings));
 });
 
 app.delete('/briefing', (req, res) => {
   const secret = req.query.secret || (req.body && req.body.secret);
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   const e164 = normalizeUsPhone(req.query.phone || (req.body && req.body.phone));
   if (!e164 || !briefings.has(e164)) return res.status(404).json({ error: 'No subscription for that phone' });
   briefings.delete(e164);
@@ -1694,7 +1715,7 @@ app.post('/wellness', (req, res) => {
 });
 
 app.get('/wellness', (req, res) => {
-  if (req.query.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   let rows = [...wellness.values()];
   if (req.query.userId) rows = rows.filter((w) => w.enrolledBy.userId === String(req.query.userId));
   res.json({ count: rows.length, schedules: rows });
@@ -1713,7 +1734,7 @@ app.post('/wellness/toggle', (req, res) => {
 app.delete('/wellness', (req, res) => {
   const id = String((req.query.id || (req.body || {}).id) || '');
   const secret = req.query.secret || (req.body || {}).secret;
-  if (secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   if (!wellness.has(id)) return res.status(404).json({ error: 'No schedule with that id' });
   const sub = wellness.get(id);
   wellness.delete(id);
