@@ -841,7 +841,7 @@ async function handleUtterance(session, text) {
       // bucket (async; attaches when it lands).
       if (session.cfg.fetchCallMemories) {
         const su = session.cfg.users.get(session.from);
-        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id)
+        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id, { nudges: true })
           .then((text) => { if (session) session.callerMemories = text || null; })
           .catch(() => {});
       }
@@ -1939,7 +1939,7 @@ function attachMediaStreams(server, users, cfg) {
           // so this agent actually REMEMBERS them on the phone. Async — first
           // turn may go out without them; they attach the moment they land.
           if (global._vsConfig.fetchCallMemories) {
-            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId)
+            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId, { nudges: !session.outbound })
               .then((text) => {
                 if (text && session) {
                   session.callerMemories = text;
@@ -2369,6 +2369,20 @@ function attachWebVoice(server) {
         };
         session = new WebCallSession(`web:${t.email}`, user, ws, cfg);
         console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice}`);
+        // July 13 2026 drift audit: web streaming calls never got the July 12
+        // caller-memories fix — the phone had it, the sibling engine surface
+        // didn't. Same fetch, and a web caller is live by definition, so
+        // waiting family messages/reminders deliver here too (nudges: 1).
+        if (cfg.fetchCallMemories) {
+          cfg.fetchCallMemories({ email: t.email, userId: t.uid }, user.agentId, { nudges: true })
+            .then((text) => {
+              if (text && session) {
+                session.callerMemories = text;
+                console.log(`[web-voice] caller memories attached for ${t.email} (${text.length} chars)`);
+              }
+            })
+            .catch(() => {});
+        }
         // Ticket usually carries the builder voice (fork reads agent.tts).
         // If it didn't, warm the bridge cache and upgrade the session voice
         // as soon as it lands — same trick as mid-call agent switches.

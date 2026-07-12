@@ -886,12 +886,15 @@ async function lookupVoicePref(identity, agentId) {
     return (r.data && r.data.voice) || null;
   } catch { return null; }
 }
-async function fetchCallMemories(identity, agentId) {
+async function fetchCallMemories(identity, agentId, opts = {}) {
   if (!USAGE_EVENT_SECRET || !identity) return null;
   try {
     // July 13 2026: secret rides a HEADER now (query strings land in edge logs).
     const params = new URLSearchParams();
     if (agentId) params.set('agentId', agentId);
+    // Family messages / nudges: consume-on-fetch ONLY when a human is
+    // definitely live on the line (inbound caller, or mid-call switch).
+    if (opts.nudges) params.set('nudges', '1');
     if (identity.email) params.set('email', identity.email);
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
