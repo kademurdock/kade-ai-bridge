@@ -550,7 +550,7 @@ function armBargeRecovery(session) {
     // suspenders) or a new turn is running/speaking: nothing to recover.
     if (session.busy || session.isSpeaking) return;
     if ((session._lastUtteranceAt || 0) >= armedAt) return;
-    if (session.finalBuf || session._fluxTurnText) {
+    if (session.finalBuf || session._fluxTurnText || session._fluxCarry) {
       // She IS talking, the final/turn just hasn't closed yet -- check again.
       // (_fluxTurnText is the Flux engine's mid-turn signal; finalBuf is nova's.)
       session._bargeRecoveryTimer = setTimeout(check, 3000);
@@ -570,7 +570,9 @@ function openDeepgramFlux(session, key) {
     model: process.env.FLUX_STT_MODEL || 'flux-general-en',
     encoding: web ? 'linear16' : 'mulaw',
     sample_rate: web ? '16000' : '8000',
-    eot_threshold: process.env.FLUX_EOT_THRESHOLD || '0.8',
+    // KADE July 12 2026 ('wait and listen a second so stoners can swallow
+    // spit'): a notch more end-of-turn patience at the model level too.
+    eot_threshold: process.env.FLUX_EOT_THRESHOLD || '0.85',
   });
   const dg = new WebSocket(
     `wss://api.deepgram.com/v2/listen?${params}`,
@@ -592,11 +594,17 @@ function openDeepgramFlux(session, key) {
       // voice opens turns too. Same posture as the old SpeechStarted skip —
       // words first, then the content-based echo gate decides.
       session._fluxTurnText = '';
+      // Grace window: they started talking again — hold the carried text and
+      // wait for this new turn to finish (the two get stitched together).
+      if (session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
       return;
     }
 
     if (msg.event === 'Update' || msg.event === 'TurnResumed' || msg.event === 'EagerEndOfTurn') {
       if (text) session._fluxTurnText = text;
+      // Real words while a grace timer runs = they kept going; wait for the
+      // new EndOfTurn instead of firing the held one.
+      if (text && session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
       if (!text) return;
       // Barge-in: identical guards to the nova path (grace window + echo gate
       // + once-per-reply flag). All the July 1-4 lessons live in these checks.
@@ -612,23 +620,45 @@ function openDeepgramFlux(session, key) {
     }
 
     if (msg.event === 'EndOfTurn') {
-      const utterance = (text || session._fluxTurnText || '').trim();
+      const turnText = (text || session._fluxTurnText || '').trim();
       session._fluxTurnText = '';
-      if (!utterance) return;
-      // Same echo windows as the nova speech_final path (3s hard bound,
-      // stricter overlap inside 1.2s) — those are physics, not codec tuning.
-      const sinceSpoke = Date.now() - session.lastSpokAt;
-      const echoPossible = session.isSpeaking || sinceSpoke < 3000;
-      const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-      const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
-      if (!isEcho) handleUtterance(session, utterance);
-      else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${utterance.slice(0, 60)}"`);
+      if (!turnText && !session._fluxCarry) return;
+      // KADE July 12 2026 ("wait and listen a second so stoners can swallow
+      // spit"): don't grab the mic the instant Flux calls end-of-turn. Hold
+      // the utterance for a grace beat; if they start talking again inside
+      // it (StartOfTurn/Update below), cancel and STITCH the turns together
+      // so the model hears one complete thought. Env FLUX_POST_TURN_GRACE_MS
+      // (default 900, 0 = old instant behavior).
+      const carry = session._fluxCarry ? session._fluxCarry + ' ' : '';
+      const full = (carry + turnText).trim();
+      if (!full) return;
+      const dispatch = () => {
+        session._fluxCarry = null;
+        session._fluxGraceTimer = null;
+        const sinceSpoke = Date.now() - session.lastSpokAt;
+        const echoPossible = session.isSpeaking || sinceSpoke < 3000;
+        const echoWindow = session.isSpeaking || sinceSpoke < 1200;
+        const isEcho = echoPossible && looksLikeEcho(full, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        if (!isEcho) handleUtterance(session, full);
+        else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${full.slice(0, 60)}"`);
+      };
+      const grace = parseInt(process.env.FLUX_POST_TURN_GRACE_MS || '900', 10);
+      if (grace > 0) {
+        session._fluxCarry = full;
+        if (session._fluxGraceTimer) clearTimeout(session._fluxGraceTimer);
+        session._fluxGraceTimer = setTimeout(dispatch, grace);
+      } else {
+        dispatch();
+      }
       return;
     }
   });
 
   dg.on('error', (e) => console.error('[voice-stream] Deepgram FLUX error:', e.message));
-  dg.on('close', (code) => console.log(`[voice-stream] Deepgram FLUX closed ${session.streamSid} (${code})`));
+  dg.on('close', (code) => {
+    if (session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
+    console.log(`[voice-stream] Deepgram FLUX closed ${session.streamSid} (${code})`);
+  });
   return dg;
 }
 
