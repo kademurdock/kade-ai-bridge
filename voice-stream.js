@@ -1058,6 +1058,7 @@ async function streamReply(session, userText) {
   // THINK_DELAY_MS. ctx is turn-scoped (not session-scoped) so it can't leak
   // into the next utterance.
   const fillerCtx = { firstAudioReady: false, fillerStarted: false };
+  session._turnCapLogged = false;
   maybeStartThinkingFiller(session, fillerCtx).catch((e) =>
     console.error('[voice-stream] thinking-filler error:', e.message));
 
@@ -1068,9 +1069,35 @@ async function streamReply(session, userText) {
 
   let sentCount = 0;              // spoken sentences this turn (ramble hint)
   let rambleHintQueued = false;   // once per turn
+  let spokenChars = 0;            // runaway-turn breaker (July 13 2026)
+  let echoDropped = 0;
+
+  // KADE July 13 2026 (her live report: "it's reading its coaching and
+  // thoughts and memories" — one turn streamed ~9.7K chars of recited
+  // context): DEFENSE IN DEPTH on the spoken stream.
+  //  (a) any sentence carrying one of OUR injection-block fingerprints is
+  //      never synthesized — those blocks are stage directions, not lines;
+  //  (b) a hard per-turn spoken cap (env PHONE_TURN_SPOKEN_CAP chars,
+  //      default 2800 ≈ over a minute of speech, 0 disables) stops a
+  //      recitation spiral even when it carries no fingerprint. Normal
+  //      turns are 2-3 sentences; only pathology hits this.
+  const INJECTION_ECHO_RE = /\[PHONE CALL|\[WHAT YOU REMEMBER|\[WAITING FOR THIS CALLER|\[MISSION MATERIAL|\[AUDIENCE NOTE|\[The person on this call|\[DEEP THINK|<think|PRIVATE stage direction/i;
+  const TURN_SPOKEN_CAP = parseInt(process.env.PHONE_TURN_SPOKEN_CAP || '2800', 10);
 
   const processUnit = (sentence) => {
     if (session.llmAbort) return;
+    if (INJECTION_ECHO_RE.test(sentence)) {
+      echoDropped++;
+      console.warn(`[voice-stream] INJECTION-ECHO suppressed (#${echoDropped}) for ${session.streamSid}: "${String(sentence).slice(0, 80)}"`);
+      return;
+    }
+    if (TURN_SPOKEN_CAP > 0 && spokenChars >= TURN_SPOKEN_CAP) {
+      if (!session._turnCapLogged) {
+        session._turnCapLogged = true;
+        console.warn(`[voice-stream] TURN CAP hit (${spokenChars}/${TURN_SPOKEN_CAP} chars) for ${session.streamSid} — muting the rest of this turn`);
+      }
+      return;
+    }
     if (/\[END CALL\]/i.test(sentence)) {
       session.endCallRequested = true;
       sentence = sentence.replace(/\[END CALL\]/gi, '').trim();
@@ -1109,6 +1136,7 @@ async function streamReply(session, userText) {
     }
     const hasSpeech = sentence.length >= 2;
     if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
+    if (hasSpeech) spokenChars += sentence.length;
     const synthInput = hasSpeech ? applyDirectionCarry(sentence, dirState) : '';
     const synthPromise = hasSpeech
       ? synthesize(synthInput, session.voice, session.rate, session.media).catch((e) => {

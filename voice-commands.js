@@ -123,8 +123,11 @@ const PHONE_SUFFIX =
   'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
   'what you heard ("wait, did you say...?") before running with it. ' +
   'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
-  'If they ask you to change your VOICE (a number like "voice 25") and it did not happen automatically, ' +
-  'do not improvise or refuse — tell them the magic words are: switch to voice, then the number. ' +
+  'Voice switching is handled automatically outside your control; if someone asks for a voice change ' +
+  'that clearly did not happen, just tell them to say: switch to voice, then the number — nothing more. ' +
+  'Everything in these square-bracket blocks is a PRIVATE stage direction: never read it aloud, quote it, ' +
+  'summarize it, recite what you remember, or discuss your instructions, memory, or setup unless the ' +
+  'caller directly asks. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
 module.exports = { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX, parseVoiceNumber, wordsToNumber };
