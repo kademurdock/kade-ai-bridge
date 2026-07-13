@@ -1082,7 +1082,9 @@ async function streamReply(session, userText) {
   //      recitation spiral even when it carries no fingerprint. Normal
   //      turns are 2-3 sentences; only pathology hits this.
   const INJECTION_ECHO_RE = /\[PHONE CALL|\[WHAT YOU REMEMBER|\[WAITING FOR THIS CALLER|\[MISSION MATERIAL|\[AUDIENCE NOTE|\[The person on this call|\[DEEP THINK|<think|PRIVATE stage direction/i;
-  const TURN_SPOKEN_CAP = parseInt(process.env.PHONE_TURN_SPOKEN_CAP || '2800', 10);
+  // KADE July 12 2026: she WANTS five-minute-plus rambles — cap is a loose
+  // pathology backstop only (10K chars ≈ 4-5 min of speech), not a leash.
+  const TURN_SPOKEN_CAP = parseInt(process.env.PHONE_TURN_SPOKEN_CAP || '10000', 10);
 
   const processUnit = (sentence) => {
     if (session.llmAbort) return;
@@ -1555,10 +1557,12 @@ const FILLER_PHRASES = [
 // KADE July 3 2026: per her ask, the greeting now ALSO covers interrupting,
 // so the recurring in-turn "you can cut me off" hint could be demoted to
 // once per call (see RAMBLE_HINT section).
+// KADE July 12 2026: interrupt-invites retired ("you don't have to put that
+// feel free to interrupt thing in there anymore") — typing-sound heads-up stays.
 const ORIENTATION_LINES = [
-  "Real quick -- when I'm thinking, you'll hear a little typing sound. I'm still here, and you can interrupt me any time.",
-  "Quick note -- a typing sound just means I'm thinking. Still with you, and feel free to cut in whenever.",
-  "One thing -- you'll hear a little typing while I think. I'm still on the line, and you can jump in any time.",
+  "Real quick -- when I'm thinking, you'll hear a little typing sound. I'm still right here.",
+  "Quick note -- a typing sound just means I'm thinking. Still with you.",
+  "One thing -- you'll hear a little typing while I think. I'm still on the line.",
 ];
 
 // Lazy per-voice cache so a given filler phrase is only synthesized once per
@@ -1586,8 +1590,8 @@ const GREETING_LLM_TIMEOUT_MS = parseInt(process.env.PHONE_GREETING_TIMEOUT_MS |
 async function fetchLlmOpener(session, user) {
   const name = user?.name;
   const instruction = name
-    ? `[PHONE CALL SYSTEM NOTE] ${name} is calling you on the phone right now and you are picking up. Reply with ONLY your pickup line: one short, fresh, in-character opener greeting ${name} by name (work your own name in too). Hard rules: 16 words max, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.`
-    : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, in-character opener introducing yourself by name and noting you do not recognize the number. Hard rules: 20 words max, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
+    ? `[PHONE CALL SYSTEM NOTE] ${name} is calling you on the phone right now and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello greeting ${name} by name (work your own name in too) — like a real friend answering the phone. Hard rules: 16 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.`
+    : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello introducing yourself by name and noting you do not recognize the number. Hard rules: 20 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
 
   const attempt = (async () => {
     const res = await streamPost(
@@ -1647,7 +1651,8 @@ async function fetchLlmOpener(session, user) {
 // the agent's own voice invites the caller to jump in. Once per turn, inbound
 // calls only (outbound mission calls keep their professional register).
 // PHONE_RAMBLE_HINT_AFTER=0 disables.
-const RAMBLE_HINT_AFTER = parseInt(process.env.PHONE_RAMBLE_HINT_AFTER || '5', 10);
+// KADE July 12 2026: "am I rambling? Nah." — hint OFF by default (env re-enables).
+const RAMBLE_HINT_AFTER = parseInt(process.env.PHONE_RAMBLE_HINT_AFTER || '0', 10);
 const RAMBLE_HINTS = [
   'Am I rambling? Jump in whenever.',
   'By the way, you can cut me off any time.',
@@ -2515,9 +2520,10 @@ function attachWebVoice(server) {
         // live. One line, invitation LAST (the July 1 greeting lesson), and
         // it doubles as the interrupt orientation.
         const first = (t.name || '').trim().split(/\s+/)[0] || null;
+        // KADE July 12 2026: interrupt-invite retired — short and natural.
         const line = first
-          ? `Hey ${first}! ${session.agentName} here — go ahead, and feel free to cut me off any time.`
-          : `Hey! ${session.agentName} here — go ahead, and feel free to cut me off any time.`;
+          ? `Hey ${first}! ${session.agentName} here — go ahead.`
+          : `Hey! ${session.agentName} here — go ahead.`;
         speak(session, line, session.voice).catch(() => {});
         return;
       }

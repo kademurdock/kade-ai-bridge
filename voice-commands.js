@@ -117,9 +117,6 @@ const PHONE_SUFFIX =
   'Talk the way you naturally would: warm, engaged, conversational. ' +
   'Two or three sentences is usually right; go longer only if you are genuinely ' +
   'mid-story and stopping would feel weird. ' +
-  'Once in a while, if a reply is running long, naturally invite them to jump in — ' +
-  'something like "am I rambling?" or "jump in whenever." ' +
-  'Don\'t do this every turn — only when it genuinely fits. ' +
   'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
   'what you heard ("wait, did you say...?") before running with it. ' +
   'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
