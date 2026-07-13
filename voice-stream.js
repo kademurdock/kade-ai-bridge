@@ -550,8 +550,9 @@ function armBargeRecovery(session) {
     // suspenders) or a new turn is running/speaking: nothing to recover.
     if (session.busy || session.isSpeaking) return;
     if ((session._lastUtteranceAt || 0) >= armedAt) return;
-    if (session.finalBuf) {
-      // She IS talking, the final just hasn't closed yet -- check again.
+    if (session.finalBuf || session._fluxTurnText) {
+      // She IS talking, the final/turn just hasn't closed yet -- check again.
+      // (_fluxTurnText is the Flux engine's mid-turn signal; finalBuf is nova's.)
       session._bargeRecoveryTimer = setTimeout(check, 3000);
       return;
     }
@@ -563,9 +564,93 @@ function armBargeRecovery(session) {
 }
 
 // ── Deepgram STT ──────────────────────────────────────────────────────────────
+function openDeepgramFlux(session, key) {
+  const web = session.media === 'wav';
+  const params = new URLSearchParams({
+    model: process.env.FLUX_STT_MODEL || 'flux-general-en',
+    encoding: web ? 'linear16' : 'mulaw',
+    sample_rate: web ? '16000' : '8000',
+    eot_threshold: process.env.FLUX_EOT_THRESHOLD || '0.8',
+  });
+  const dg = new WebSocket(
+    `wss://api.deepgram.com/v2/listen?${params}`,
+    { headers: { Authorization: `Token ${key}` } }
+  );
+  dg.on('open', () => console.log(`[voice-stream] Deepgram FLUX open ${session.streamSid} (${web ? 'web/linear16-16k' : 'phone/mulaw-8k'})`));
+
+  session._fluxTurnText = '';
+
+  dg.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (msg.type !== 'TurnInfo') return;
+
+    const text = String(msg.transcript || '').trim();
+
+    if (msg.event === 'StartOfTurn') {
+      // Deliberately NOT barging on StartOfTurn alone: on speakerphone her own
+      // voice opens turns too. Same posture as the old SpeechStarted skip —
+      // words first, then the content-based echo gate decides.
+      session._fluxTurnText = '';
+      return;
+    }
+
+    if (msg.event === 'Update' || msg.event === 'TurnResumed' || msg.event === 'EagerEndOfTurn') {
+      if (text) session._fluxTurnText = text;
+      if (!text) return;
+      // Barge-in: identical guards to the nova path (grace window + echo gate
+      // + once-per-reply flag). All the July 1-4 lessons live in these checks.
+      const graceOk = Date.now() - session.speakStartedAt > 1000;
+      if (session.isSpeaking && !session.bargedIn && graceOk) {
+        if (!looksLikeEcho(text, session._currentSpokenText)) {
+          session.bargedIn = true;
+          console.log(`[voice-stream] barge-in trigger (flux): "${text.slice(0, 50)}"`);
+          bargeIn(session);
+        }
+      }
+      return;
+    }
+
+    if (msg.event === 'EndOfTurn') {
+      const utterance = (text || session._fluxTurnText || '').trim();
+      session._fluxTurnText = '';
+      if (!utterance) return;
+      // Same echo windows as the nova speech_final path (3s hard bound,
+      // stricter overlap inside 1.2s) — those are physics, not codec tuning.
+      const sinceSpoke = Date.now() - session.lastSpokAt;
+      const echoPossible = session.isSpeaking || sinceSpoke < 3000;
+      const echoWindow = session.isSpeaking || sinceSpoke < 1200;
+      const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+      if (!isEcho) handleUtterance(session, utterance);
+      else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${utterance.slice(0, 60)}"`);
+      return;
+    }
+  });
+
+  dg.on('error', (e) => console.error('[voice-stream] Deepgram FLUX error:', e.message));
+  dg.on('close', (code) => console.log(`[voice-stream] Deepgram FLUX closed ${session.streamSid} (${code})`));
+  return dg;
+}
+
 function openDeepgram(session) {
   const key = process.env.DEEPGRAM_API_KEY;
   if (!key) { console.warn('[voice-stream] DEEPGRAM_API_KEY not set — no STT'); return null; }
+
+  // ── FLUX (July 12 2026 late, Kade: "switch to Deepgram Flux now for sure") ──
+  // Deepgram's conversational model (listen v2): the model itself decides when
+  // a TURN is over (StartOfTurn/Update/EndOfTurn events) instead of our
+  // endpointing+utterance_end guesswork. Same Nova-3 transcription quality.
+  // ENV STEP-BACK WITHOUT DEPLOY: PHONE_STT_ENGINE=nova / WEB_VOICE_STT_ENGINE=nova
+  // returns that surface to the exact prior nova-3 path (which still honors
+  // PHONE_STT_MODEL/WEB_VOICE_STT_MODEL). FLUX_EOT_THRESHOLD tunes end-of-turn
+  // confidence (0.5-0.9, default 0.8).
+  {
+    const webSurface = session.media === 'wav';
+    const engine = webSurface
+      ? (process.env.WEB_VOICE_STT_ENGINE || 'flux')
+      : (process.env.PHONE_STT_ENGINE || 'flux');
+    if (engine === 'flux') return openDeepgramFlux(session, key);
+  }
 
   // WEB VOICE (July 9 2026): browser mic arrives as linear16 @ 16kHz (the
   // client downsamples); phone stays mulaw 8k + the phonecall model. Same
