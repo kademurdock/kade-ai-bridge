@@ -20,14 +20,63 @@ const PHONE_VOICES = [
   'Mazy (Podcaster)', 'Houston Stone', 'DJ Velvet', 'Podcaster 1', 'Podcaster 2',
 ];
 
+// ── Spoken number-words → integer (July 13 2026, Kade's live catch) ─────────
+// Deepgram FLUX transcribes numbers as WORDS ("switch to voice twenty five"),
+// where nova-3's smart_format gave digits — and Flux's v2 API has NO
+// formatting params to change that. Parse the words ourselves so voice
+// switching works the same on every STT engine, forever.
+const NUM_UNITS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+const NUM_TEENS = { ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
+const NUM_TENS  = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+
+function wordsToNumber(str) {
+  const toks = String(str || '').toLowerCase().replace(/-/g, ' ').replace(/\band\b/g, ' ')
+    .split(/\s+/).filter(Boolean);
+  if (!toks.length || toks.length > 5) return null;
+  // Digit-speak first: "three oh five" / "two one one" — every token one digit.
+  const digitish = toks.every((t) => NUM_UNITS[t] != null || t === 'oh' || t === 'o' || t === 'zero');
+  if (digitish && toks.length >= 2 && toks.length <= 3) {
+    const n = Number(toks.map((t) => (NUM_UNITS[t] != null ? NUM_UNITS[t] : 0)).join(''));
+    return n >= 1 && n <= 999 ? n : null;
+  }
+  // Compositional: "sixty seven", "three hundred twenty four", "one hundred and five".
+  let current = 0, consumed = false;
+  for (const t of toks) {
+    if (NUM_UNITS[t] != null) { current += NUM_UNITS[t]; consumed = true; }
+    else if (NUM_TEENS[t] != null || NUM_TENS[t] != null) {
+      const v = NUM_TEENS[t] != null ? NUM_TEENS[t] : NUM_TENS[t];
+      if (current >= 1 && current <= 9) current = current * 100 + v; // phone-speak: "two eleven"=211, "three twenty"=320
+      else if (current === 0 || current % 100 === 0) current += v;   // "twenty five", "one hundred twenty"
+      else return null; // "nineteen eighty…" — not real English number grammar
+      consumed = true;
+    }
+    else if (t === 'hundred') { current = (current || 1) * 100; consumed = true; }
+    else return null; // any non-number word disqualifies the whole phrase
+  }
+  return consumed && current >= 1 && current <= 999 ? current : null;
+}
+
+// "voice 67" / "voice number 67" / "67" / "voice twenty five" / "twenty five"
+// → the integer, or null when it isn't number-shaped at all.
+function parseVoiceNumber(query) {
+  const t = String(query || '').toLowerCase().trim()
+    .replace(/[.!?,]+$/, '')
+    .replace(/^(?:voice\s*)?(?:number\s*)?/, '')
+    .trim();
+  if (!t) return null;
+  const d = t.match(/^(\d{1,3})$/);
+  if (d) return Number(d[1]);
+  return wordsToNumber(t);
+}
+
 // Accepts a spoken target and returns a canonical voice label, or null.
-// "voice 67" / "voice number 67" / bare "67" → "Voice 67" (proxy owns the map;
-// synth-time validation reverts unknown numbers gracefully).
+// Numbers may be digits OR words (proxy owns the map; synth-time validation
+// reverts unknown numbers gracefully).
 function findVoice(query) {
   if (!query) return null;
   const q = String(query).toLowerCase().trim();
-  const num = q.match(/^(?:voice\s*)?(?:number\s*)?(\d{1,3})$/);
-  if (num) return `Voice ${Number(num[1])}`;
+  const n = parseVoiceNumber(q);
+  if (n != null) return `Voice ${n}`;
   return PHONE_VOICES.find(v => v.toLowerCase() === q)
       || PHONE_VOICES.find(v => q.includes(v.toLowerCase()))
       || PHONE_VOICES.find(v => v.toLowerCase().includes(q))
@@ -46,8 +95,15 @@ function extractVoiceSwitch(text) {
     /^(?:switch|change)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)|^(?:use|set)\s+(?:(?:my|your|the)\s+)?voice(?:\s+to)?\s+(.+)/i
   );
   if (m) return findVoice((m[1] || m[2]).trim());
-  const n = t.match(/^(?:switch|change|go)\s+to\s+(?:voice\s*)?(\d{1,3})$|^(?:try|use|gimme|give me)\s+voice\s*(\d{1,3})$|^voice\s*(\d{1,3})(?:\s+please)?$/i);
-  if (n) return `Voice ${Number(n[1] || n[2] || n[3])}`;
+  // Number-first phrasings, digits OR words ("switch to voice twenty five",
+  // "try voice 12", "voice three oh five please"). parseVoiceNumber returns
+  // null for anything not number-shaped, so "switch to Zadiana" still falls
+  // through to the AGENT matcher untouched.
+  const n = t.match(/^(?:switch|change|go)\s+to\s+(.+)$|^(?:try|use|gimme|give me)\s+voice\s+(.+)$|^voice\s+(.+?)(?:\s+please)?$/i);
+  if (n) {
+    const num = parseVoiceNumber((n[1] || n[2] || n[3]).trim());
+    if (num != null) return `Voice ${num}`;
+  }
   return null;
 }
 
@@ -67,9 +123,11 @@ const PHONE_SUFFIX =
   'Phone audio garbles: if what they said seems surprising or off-topic, casually confirm ' +
   'what you heard ("wait, did you say...?") before running with it. ' +
   'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
+  'If they ask you to change your VOICE (a number like "voice 25") and it did not happen automatically, ' +
+  'do not improvise or refuse — tell them the magic words are: switch to voice, then the number. ' +
   'No lists, no markdown, no formatting. Just talk.]';
 
-module.exports = { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX };
+module.exports = { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX, parseVoiceNumber, wordsToNumber };
 
 
 // ── Fuzzy AGENT matching + pronunciation (moved here July 13 2026 — was
