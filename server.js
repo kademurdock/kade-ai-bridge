@@ -13,6 +13,7 @@
 
 const express  = require('express');
 const http     = require('http');
+const http2    = require('http2');
 const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
@@ -398,6 +399,97 @@ app.get('/users', (req, res) => {
   if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
   res.json(Object.fromEntries(users));
 });
+
+// ── Push notifications (APNs) ───────────────────────────────────────────────────
+// Device tokens come from the native iOS app (POST /push-register, no secret —
+// a device token carries no privileges). Sending is admin-only (BRIDGE_SECRET).
+// APNs auth is an ES256 JWT signed with the .p8 key; built-ins only (http2+crypto).
+const PUSH_FILE = path.join(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
+  'bridge-push-tokens.json'
+);
+function loadPushTokens() {
+  try { if (fs.existsSync(PUSH_FILE)) return new Set(JSON.parse(fs.readFileSync(PUSH_FILE, 'utf8'))); }
+  catch {}
+  return new Set();
+}
+const pushTokens = loadPushTokens();
+function savePushTokens() {
+  try { fs.writeFileSync(PUSH_FILE, JSON.stringify([...pushTokens])); }
+  catch (e) { console.error('[push] Could not save tokens:', e.message); }
+}
+
+const APNS_HOST      = process.env.APNS_HOST || 'https://api.push.apple.com';
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.kademurdock.kadeai';
+const _toB64Url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+let _apnsJwt = { token: null, iat: 0 };
+function apnsAuthToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (_apnsJwt.token && (now - _apnsJwt.iat) < 2400) return _apnsJwt.token; // reuse ~40 min
+  const key = (process.env.APNS_KEY || '').replace(/\\n/g, '\n');
+  const seg = (o) => _toB64Url(Buffer.from(JSON.stringify(o)));
+  const signingInput = `${seg({ alg: 'ES256', kid: process.env.APNS_KEY_ID })}.${seg({ iss: process.env.APNS_TEAM_ID, iat: now })}`;
+  const sig = _toB64Url(crypto.sign('SHA256', Buffer.from(signingInput), { key, dsaEncoding: 'ieee-p1363' }));
+  _apnsJwt = { token: `${signingInput}.${sig}`, iat: now };
+  return _apnsJwt.token;
+}
+
+function sendApnsPush(deviceToken, title, body) {
+  return new Promise((resolve) => {
+    let client;
+    try { client = http2.connect(APNS_HOST); }
+    catch (e) { return resolve({ token: deviceToken, status: 0, error: e.message }); }
+    client.on('error', (e) => resolve({ token: deviceToken, status: 0, error: e.message }));
+    const payload = JSON.stringify({ aps: { alert: { title, body }, sound: 'default' } });
+    const r = client.request({
+      ':method': 'POST',
+      ':path': `/3/device/${deviceToken}`,
+      'authorization': `bearer ${apnsAuthToken()}`,
+      'apns-topic': APNS_BUNDLE_ID,
+      'apns-push-type': 'alert',
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(payload)
+    });
+    let status = 0, data = '';
+    r.on('response', (h) => { status = h[':status']; });
+    r.setEncoding('utf8');
+    r.on('data', (d) => { data += d; });
+    r.on('end', () => { try { client.close(); } catch (e) {} resolve({ token: deviceToken, status, data }); });
+    r.on('error', (e) => { try { client.close(); } catch (e2) {} resolve({ token: deviceToken, status: 0, error: e.message }); });
+    r.write(payload);
+    r.end();
+  });
+}
+
+// App posts its device token here on launch. Public + validated (hex only).
+app.post('/push-register', (req, res) => {
+  const token = String((req.body && req.body.token) || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
+  if (!pushTokens.has(token)) { pushTokens.add(token); savePushTokens(); }
+  console.log(`[push] Registered a device token (total ${pushTokens.size})`);
+  res.json({ ok: true, count: pushTokens.size });
+});
+
+// Admin: send a push to all devices (or one via `token`). Body: { secret, title?, body?, token? }
+app.post('/push-send', async (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  if (!process.env.APNS_KEY || !process.env.APNS_KEY_ID || !process.env.APNS_TEAM_ID) {
+    return res.status(500).json({ error: 'APNs not configured (APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID)' });
+  }
+  const title   = b.title || 'Kade-AI';
+  const message = b.body  || 'Ki was thinking about you.';
+  const targets = b.token ? [String(b.token).toLowerCase()] : [...pushTokens];
+  if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no device tokens registered yet' });
+  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
+  let pruned = 0;
+  results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); // 410 = dead token
+  if (pruned) savePushTokens();
+  const sent = results.filter((r) => r.status === 200).length;
+  console.log(`[push] Sent ${sent}/${targets.length} (pruned ${pruned})`);
+  res.json({ ok: true, sent, total: targets.length, pruned, statuses: results.map((r) => r.status) });
+});
+
 
 // ── SMS webhook ────────────────────────────────────────────────────────────────
 app.post('/sms', async (req, res) => {
