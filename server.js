@@ -48,6 +48,17 @@ function bridgeSecretOk(req, provided) {
   const h = req.get && req.get('x-bridge-secret');
   return h === BRIDGE_SECRET || provided === BRIDGE_SECRET;
 }
+
+// July 15 2026: SCOPED secret for the agent /notify primitive only. Agents send
+// this (never BRIDGE_SECRET); a leak of it can at most fire rate-capped, guard-
+// railed notifications and can NOT reach any admin route. /notify accepts either.
+const NOTIFY_AGENT_SECRET = process.env.NOTIFY_AGENT_SECRET || '';
+function notifySecretOk(req, provided) {
+  if (bridgeSecretOk(req, provided)) return true;
+  if (!NOTIFY_AGENT_SECRET) return false;
+  const h = req.get && req.get('x-notify-secret');
+  return h === NOTIFY_AGENT_SECRET || provided === NOTIFY_AGENT_SECRET;
+}
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
@@ -512,7 +523,7 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 // Any agent -> user push. Body: { secret, agentId, agentName, title?, body, urgent? }
 app.post('/notify', async (req, res) => {
   const b = req.body || {};
-  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
   const agentId = String(b.agentId || 'unknown');
   const agentName = String(b.agentName || 'Kade-AI').slice(0, 40);
   const message = String(b.body || '').trim().slice(0, 300);
