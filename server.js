@@ -520,33 +520,40 @@ function centralClock() {
 }
 function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhmm < notifyPrefs.quietEnd; }
 
-// Any agent -> user push. Body: { secret, agentId, agentName, title?, body, urgent? }
-app.post('/notify', async (req, res) => {
-  const b = req.body || {};
-  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
-  const agentId = String(b.agentId || 'unknown');
-  const agentName = String(b.agentName || 'Kade-AI').slice(0, 40);
-  const message = String(b.body || '').trim().slice(0, 300);
-  if (!message) return res.status(400).json({ error: 'body required' });
-  const title = String(b.title || agentName).slice(0, 40);
+// Core notify logic (guardrails + APNs send), shared by the /notify route AND the
+// scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
+async function runNotify({ agentId, agentName, title, body, urgent }) {
+  agentId = String(agentId || 'unknown');
+  agentName = String(agentName || 'Kade-AI').slice(0, 40);
+  const message = String(body || '').trim().slice(0, 300);
+  if (!message) return { ok: false, error: 'body required' };
+  title = String(title || agentName).slice(0, 40);
   const { day, hhmm } = centralClock();
   if (notifyCounts.day !== day) notifyCounts = { day, global: 0, perAgent: {}, lastSentMs: notifyCounts.lastSentMs };
-  // ── guardrails (server-side, unbypassable by agents) ──
-  if (!notifyPrefs.enabled) return res.json({ ok: false, blocked: 'notifications are globally muted' });
-  if (notifyPrefs.mutedAgents.includes(agentId)) return res.json({ ok: false, blocked: 'this agent is muted' });
-  if (!b.urgent && notifyInQuietHours(hhmm)) return res.json({ ok: false, blocked: 'quiet hours (Central)' });
-  if (Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return res.json({ ok: false, blocked: 'cooldown active' });
-  if (notifyCounts.global >= notifyPrefs.globalDailyCap) return res.json({ ok: false, blocked: 'daily total cap reached' });
-  if ((notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return res.json({ ok: false, blocked: 'per-agent daily cap reached' });
-
+  // guardrails (server-side, unbypassable)
+  if (!notifyPrefs.enabled) return { ok: false, blocked: 'notifications are globally muted' };
+  if (notifyPrefs.mutedAgents.includes(agentId)) return { ok: false, blocked: 'this agent is muted' };
+  if (!urgent && notifyInQuietHours(hhmm)) return { ok: false, blocked: 'quiet hours (Central)' };
+  if (Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return { ok: false, blocked: 'cooldown active' };
+  if (notifyCounts.global >= notifyPrefs.globalDailyCap) return { ok: false, blocked: 'daily total cap reached' };
+  if ((notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return { ok: false, blocked: 'per-agent daily cap reached' };
   const targets = [...pushTokens];
-  if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no device tokens registered yet' });
+  if (!targets.length) return { ok: true, sent: 0, note: 'no device tokens registered yet' };
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
   if (sent > 0) { notifyCounts.global++; notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1; notifyCounts.lastSentMs = Date.now(); }
   console.log(`[notify] ${agentName} (${agentId}) sent=${sent} global=${notifyCounts.global}/${notifyPrefs.globalDailyCap}`);
-  res.json({ ok: true, sent, from: agentName, remainingToday: Math.max(0, notifyPrefs.globalDailyCap - notifyCounts.global) });
+  return { ok: true, sent, from: agentName, remainingToday: Math.max(0, notifyPrefs.globalDailyCap - notifyCounts.global) };
+}
+
+// Any agent -> user push. Body: { secret, agentId, agentName, title?, body, urgent? }
+app.post('/notify', async (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent });
+  if (out.error) return res.status(400).json({ error: out.error });
+  res.json(out);
 });
 
 // View / change notification preferences (admin). Body/query: secret; POST body may set
@@ -564,6 +571,72 @@ app.post('/notify-prefs', (req, res) => {
   saveNotifyPrefs();
   res.json({ ok: true, prefs: notifyPrefs });
 });
+
+// ── Scheduled "Ki reaches out" (July 15 2026) ─────────────────────────────────
+// On a schedule, ask Ki (headless) for a short warm check-in and deliver it
+// through the SAME guardrailed notify path (quiet hours + caps + cooldown apply).
+// Admin-tunable via /reachout; DEFAULT OFF until switched on.
+const REACHOUT_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'bridge-reachout.json');
+const REACHOUT_AGENT_ID = DEFAULT_AGENT;
+const REACHOUT_AGENT_NAME = DEFAULT_AGENT_NAME;
+const REACHOUT_DEFAULT_PROMPT =
+  "You are reaching out to Kade on your own initiative — you two haven't talked in a little while. " +
+  "Write ONE short, warm check-in text (1 to 2 sentences, under 200 characters, easy to hear read aloud, " +
+  "no emoji, in your natural voice) that gently checks in or shares a small thought to brighten her day. " +
+  "Reply with ONLY the message text, nothing else.";
+function loadReachout() {
+  const base = { enabled: false, time: '18:00', days: 'daily', title: 'Ki', prompt: REACHOUT_DEFAULT_PROMPT, lastRun: '' };
+  try { if (fs.existsSync(REACHOUT_FILE)) return { ...base, ...JSON.parse(fs.readFileSync(REACHOUT_FILE, 'utf8')) }; } catch {}
+  return base;
+}
+let reachout = loadReachout();
+function saveReachout() { try { fs.writeFileSync(REACHOUT_FILE, JSON.stringify(reachout)); } catch (e) { console.error('[reachout] save:', e.message); } }
+
+async function fireReachout(urgent) {
+  const text = await askAgentRich(REACHOUT_AGENT_ID, reachout.prompt);
+  if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
+  const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
+  const delivery = await runNotify({ agentId: REACHOUT_AGENT_ID, agentName: REACHOUT_AGENT_NAME, title: reachout.title || 'Ki', body, urgent: urgent === true });
+  return { ok: true, generated: body, delivery };
+}
+
+// GET /reachout (admin) view · POST /reachout (admin) set enabled/time/days/prompt/title
+app.get('/reachout', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({ reachout });
+});
+app.post('/reachout', (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  ['enabled', 'time', 'days', 'prompt', 'title'].forEach((k) => { if (b[k] !== undefined) reachout[k] = b[k]; });
+  saveReachout();
+  res.json({ ok: true, reachout });
+});
+// POST /reachout/fire (admin) — generate + send one NOW (testing). urgent:true skips quiet hours.
+app.post('/reachout/fire', async (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  try { res.json(await fireReachout(b.urgent === true)); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Minute tick: fire when the Central time matches and it hasn't already run today.
+setInterval(async () => {
+  try {
+    if (!reachout.enabled) return;
+    const { day, hhmm } = centralClock();
+    if (reachout.time !== hhmm || reachout.lastRun === day) return;
+    if (reachout.days && reachout.days !== 'daily') {
+      const dow = new Date().toLocaleDateString('en-US', { timeZone: 'America/Chicago', weekday: 'short' }).toLowerCase().slice(0, 3);
+      if (!String(reachout.days).toLowerCase().includes(dow)) return;
+    }
+    reachout.lastRun = day; saveReachout(); // set first so a slow generate can't double-fire
+    const r = await fireReachout(false);
+    console.log(`[reachout] fired: ${r.ok ? ('sent=' + (r.delivery && r.delivery.sent) + ' blocked=' + ((r.delivery && r.delivery.blocked) || '-')) : ('error=' + r.error)}`);
+  } catch (e) {
+    console.error('[reachout] tick error:', e.message);
+  }
+}, 60 * 1000);
 
 
 
