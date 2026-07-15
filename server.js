@@ -490,6 +490,71 @@ app.post('/push-send', async (req, res) => {
   res.json({ ok: true, sent, total: targets.length, pruned, statuses: results.map((r) => r.status) });
 });
 
+// ── Agent notification primitive (guardrailed) ─────────────────────────────────
+// Any agent calls POST /notify with who it is + a message. The BRIDGE enforces the
+// anti-spam rules here, server-side, where no agent can bypass them: quiet hours,
+// per-agent + global daily caps, a cooldown, and mute controls (see /notify-prefs).
+const NOTIFY_PREFS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'bridge-notify-prefs.json');
+function loadNotifyPrefs() {
+  try { if (fs.existsSync(NOTIFY_PREFS_FILE)) return JSON.parse(fs.readFileSync(NOTIFY_PREFS_FILE, 'utf8')); } catch {}
+  return { enabled: true, mutedAgents: [], perAgentDailyCap: 3, globalDailyCap: 6, cooldownMin: 30, quietStart: '21:00', quietEnd: '08:00' };
+}
+let notifyPrefs = loadNotifyPrefs();
+function saveNotifyPrefs() { try { fs.writeFileSync(NOTIFY_PREFS_FILE, JSON.stringify(notifyPrefs)); } catch (e) { console.error('[notify] prefs save:', e.message); } }
+let notifyCounts = { day: '', global: 0, perAgent: {}, lastSentMs: 0 };
+function centralClock() {
+  const s = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const m = s.match(/(\d{2})\/(\d{2})\/(\d{4}),?\s+(\d{2}):(\d{2})/);
+  return m ? { day: `${m[3]}-${m[1]}-${m[2]}`, hhmm: `${m[4]}:${m[5]}` } : { day: 'x', hhmm: '12:00' };
+}
+function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhmm < notifyPrefs.quietEnd; }
+
+// Any agent -> user push. Body: { secret, agentId, agentName, title?, body, urgent? }
+app.post('/notify', async (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const agentId = String(b.agentId || 'unknown');
+  const agentName = String(b.agentName || 'Kade-AI').slice(0, 40);
+  const message = String(b.body || '').trim().slice(0, 300);
+  if (!message) return res.status(400).json({ error: 'body required' });
+  const title = String(b.title || agentName).slice(0, 40);
+  const { day, hhmm } = centralClock();
+  if (notifyCounts.day !== day) notifyCounts = { day, global: 0, perAgent: {}, lastSentMs: notifyCounts.lastSentMs };
+  // ── guardrails (server-side, unbypassable by agents) ──
+  if (!notifyPrefs.enabled) return res.json({ ok: false, blocked: 'notifications are globally muted' });
+  if (notifyPrefs.mutedAgents.includes(agentId)) return res.json({ ok: false, blocked: 'this agent is muted' });
+  if (!b.urgent && notifyInQuietHours(hhmm)) return res.json({ ok: false, blocked: 'quiet hours (Central)' });
+  if (Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return res.json({ ok: false, blocked: 'cooldown active' });
+  if (notifyCounts.global >= notifyPrefs.globalDailyCap) return res.json({ ok: false, blocked: 'daily total cap reached' });
+  if ((notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return res.json({ ok: false, blocked: 'per-agent daily cap reached' });
+
+  const targets = [...pushTokens];
+  if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no device tokens registered yet' });
+  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
+  let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
+  const sent = results.filter((r) => r.status === 200).length;
+  if (sent > 0) { notifyCounts.global++; notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1; notifyCounts.lastSentMs = Date.now(); }
+  console.log(`[notify] ${agentName} (${agentId}) sent=${sent} global=${notifyCounts.global}/${notifyPrefs.globalDailyCap}`);
+  res.json({ ok: true, sent, from: agentName, remainingToday: Math.max(0, notifyPrefs.globalDailyCap - notifyCounts.global) });
+});
+
+// View / change notification preferences (admin). Body/query: secret; POST body may set
+// enabled, perAgentDailyCap, globalDailyCap, cooldownMin, quietStart, quietEnd, muteAgent, unmuteAgent.
+app.get('/notify-prefs', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({ prefs: notifyPrefs, today: notifyCounts });
+});
+app.post('/notify-prefs', (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  ['enabled', 'perAgentDailyCap', 'globalDailyCap', 'cooldownMin', 'quietStart', 'quietEnd'].forEach((k) => { if (b[k] !== undefined) notifyPrefs[k] = b[k]; });
+  if (b.muteAgent) notifyPrefs.mutedAgents = [...new Set([...notifyPrefs.mutedAgents, String(b.muteAgent)])];
+  if (b.unmuteAgent) notifyPrefs.mutedAgents = notifyPrefs.mutedAgents.filter((a) => a !== String(b.unmuteAgent));
+  saveNotifyPrefs();
+  res.json({ ok: true, prefs: notifyPrefs });
+});
+
+
 
 // ── SMS webhook ────────────────────────────────────────────────────────────────
 app.post('/sms', async (req, res) => {
