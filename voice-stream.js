@@ -55,6 +55,7 @@ function applyDirectionCarry(sentence, dirState) {
 // SHARED voice-command brain (July 13 2026): one copy for both engines.
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
         fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
+const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1095,9 +1096,12 @@ async function streamReply(session, userText) {
   const deepSuffix = session.deepThink ? ` [DEEP THINK ${Date.now()}]` : '';
   const gameSuffix = (typeof session.lastGameTokenAt === 'number'
     && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS) ? GAME_SUFFIX : '';
+  // LIVE CAMERA (web video calls): take a fresh look if the camera has a
+  // newer frame than the last scene description — bounded, fail-soft.
+  if (session.videoOn) { try { await videoSight.onTurn(session); } catch { /* a blind turn is still a turn */ } }
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + (session.outboundSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + (session.outboundSuffix || '') + deepSuffix }
       : m
   );
 
@@ -2492,6 +2496,26 @@ async function postWebVoiceUsage(session) {
   } catch (e) { console.log('[web-voice] usage post failed:', e && e.message); }
 }
 
+async function postVideoUsage(session) {
+  try {
+    const { minutes, costUSD, mode } = videoSight.usageSummary(session);
+    if (!(minutes > 0) && !(costUSD > 0)) return;
+    const secret = process.env.KADE_USAGE_EVENT_SECRET;
+    if (!secret || !session.userId) return;
+    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    const axios = require('axios');
+    await axios.post(`${base}/api/kade/usage-event`, {
+      secret,
+      userId: session.userId,
+      service: 'video',
+      quantity: minutes,
+      unit: 'minutes',
+      costUSD,
+      metadata: { agent: session.agentName, surface: 'web', mode },
+    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
+  } catch (e) { console.log('[video-sight] usage post failed:', e && e.message); }
+}
+
 function attachWebVoice(server) {
   const wss = new WebSocket.Server({ noServer: true });
   installUpgradeRouter(server).set('/ws/web-voice', wss);
@@ -2597,12 +2621,15 @@ function attachWebVoice(server) {
         }
         return;
       }
+      if (msg.type === 'video') { videoSight.handleVideoMsg(session, msg, speak); return; }
+      if (msg.type === 'frame') { videoSight.handleFrameMsg(session, msg); return; }
       if (msg.type === 'bye') { try { ws.close(1000, 'bye'); } catch {} return; }
     });
 
     ws.on('close', () => {
       clearTimeout(helloTimer);
       if (session) {
+        try { if (session.videoOn || session.videoSeconds) { videoSight.stopVideo(session, 'hangup'); postVideoUsage(session); } } catch {}
         try { logCallTranscript(session); } catch {}
         try { postWebVoiceUsage(session); } catch {}
         session.llmAbort = true;
