@@ -316,6 +316,25 @@ function looksLikeEcho(heard, currentlySpeaking, threshold = 0.6) {
   return overlap / heardWords.length > threshold;
 }
 
+// ── Single-word barge-in allow-list ────────────────────────────────────────────
+// (July 16 2026, Kade: "I slide my finger over the mic and she stops like she
+// thinks I'm about to talk"). looksLikeEcho above NEVER suppresses a single-word
+// hit by design (a real "wait"/"stop" must always get through) -- but that also
+// means a single word Deepgram mis-transcribes from mic-bump/scratch noise (a
+// known ASR failure mode for non-speech transients) always passed through as a
+// real interruption too. Now a lone recognized word only counts as a real
+// barge-in if it's actually on this list; multi-word hits are untouched (they
+// already go through the word-overlap echo check above, which is a much more
+// reliable signal than length alone). Plain lowercase words, tune freely.
+const BARGE_IN_SINGLE_WORDS = new Set([
+  'wait', 'stop', 'hold', 'no', 'wow', 'actually', 'sorry', 'hey', 'wrong',
+]);
+function isPlausibleBargeIn(heard) {
+  const words = normalizeWords(heard);
+  if (words.length !== 1) return true; // 2+ words: the echo-overlap check above already covers this
+  return BARGE_IN_SINGLE_WORDS.has(words[0]);
+}
+
 // ── SentenceStreamer ──────────────────────────────────────────────────────────
 class SentenceStreamer extends EventEmitter {
   constructor() {
@@ -610,7 +629,7 @@ function openDeepgramFlux(session, key) {
       // + once-per-reply flag). All the July 1-4 lessons live in these checks.
       const graceOk = Date.now() - session.speakStartedAt > 1000;
       if (session.isSpeaking && !session.bargedIn && graceOk) {
-        if (!looksLikeEcho(text, session._currentSpokenText)) {
+        if (!looksLikeEcho(text, session._currentSpokenText) && isPlausibleBargeIn(text)) {
           session.bargedIn = true;
           console.log(`[voice-stream] barge-in trigger (flux): "${text.slice(0, 50)}"`);
           bargeIn(session);
@@ -721,6 +740,10 @@ function openDeepgram(session) {
         if (looksLikeEcho(text, session._currentSpokenText)) {
           // Almost certainly her own voice coming back through the mic --
           // ignore this check, keep listening for a real interruption.
+        } else if (!isPlausibleBargeIn(text)) {
+          // Single recognized word that isn't a real interruption word -- most
+          // likely mic-bump/scratch noise Deepgram mis-transcribed as one short
+          // word, not an actual attempt to talk. Keep listening.
         } else {
           session.bargedIn = true;
           console.log(`[voice-stream] barge-in trigger: "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
