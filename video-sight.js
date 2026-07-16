@@ -218,7 +218,13 @@ function handleVideoMsg(session, msg, speak) {
       if (speak) speak(session, OUT_OF_MINUTES_LINE, session.voice).catch(() => {});
       return;
     }
-    const mode = msg.mode === 'hq' ? 'hq' : 'standard';
+    // KADE July 16 2026 (later still): child-registered accounts are capped
+    // to standard video regardless of what they ask for -- HQ is the
+    // expensive best-eyes lane meant for blind/low-vision describe-on-demand,
+    // kids on the account are mostly sighted family poking around. Client UI
+    // reflects whatever mode the server actually returns (onVideoEvent reads
+    // m.mode, not what it requested), so this is never a silent mismatch.
+    const mode = (msg.mode === 'hq' && !session.childCaller) ? 'hq' : 'standard';
     if (!hasAck(session.userId) && !msg.ack) {
       const text = firstUseNotice();
       session.jsonSend({ type: 'video-notice', text, mode });
