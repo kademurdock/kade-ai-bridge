@@ -63,6 +63,7 @@ const videoSight = require('./video-sight'); // caller camera -> agent vision (J
 // exception to "only speaks when spoken to" -- the caller armed it on purpose.
 // It never talks over anyone: it waits for busy/isSpeaking to clear first.
 videoSight.onAlert((session, alertText) => { watchAlertTurn(session, alertText).catch(() => {}); });
+const videoLive = require('./video-live'); // EXPERIMENTAL Gemini Live lane (July 16 2026) — hard-inert unless LIVE_ENABLED=true + GOOGLE_LIVE_API_KEY set
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -2686,7 +2687,8 @@ function attachWebVoice(server) {
         return;
       }
       if (msg.type === 'video') { videoSight.handleVideoMsg(session, msg, speak); return; }
-      if (msg.type === 'frame') { videoSight.handleFrameMsg(session, msg); return; }
+      if (msg.type === 'live') { videoLive.handleLiveMsg(session, msg, speak); return; } // experimental live lane (no client button yet)
+      if (msg.type === 'frame') { videoSight.handleFrameMsg(session, msg); if (session.liveOn) videoLive.forwardFrame(session, msg.data); return; }
       if (msg.type === 'bye') { try { ws.close(1000, 'bye'); } catch {} return; }
     });
 
@@ -2694,6 +2696,7 @@ function attachWebVoice(server) {
       clearTimeout(helloTimer);
       if (session) {
         try { if (session.videoOn || session.videoSeconds) { videoSight.stopVideo(session, 'hangup'); postVideoUsage(session); } } catch {}
+        try { if (session.liveOn) videoLive.stopLive(session, 'hangup'); } catch {}
         try { logCallTranscript(session); } catch {}
         try { postWebVoiceUsage(session); } catch {}
         session.llmAbort = true;
