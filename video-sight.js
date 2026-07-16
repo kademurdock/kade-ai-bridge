@@ -35,7 +35,7 @@ const modelFor = (mode) =>
     : (process.env.KADE_VIDEO_MODEL_STANDARD || 'google/gemini-3.1-flash-lite');
 const ambientMsFor = (mode) =>
   mode === 'hq'
-    ? parseInt(process.env.VIDEO_AMBIENT_MS_HQ || '10000', 10)
+    ? parseInt(process.env.VIDEO_AMBIENT_MS_HQ || '20000', 10)
     : parseInt(process.env.VIDEO_AMBIENT_MS_STANDARD || '15000', 10);
 const MAX_FRAME_B64 = parseInt(process.env.VIDEO_MAX_FRAME_B64 || String(400 * 1024), 10);
 const TURN_LOOK_TIMEOUT_MS = parseInt(process.env.VIDEO_TURN_LOOK_TIMEOUT_MS || '6500', 10);
