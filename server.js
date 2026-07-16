@@ -1167,12 +1167,29 @@ const USAGE_EVENT_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
 // Fail-soft by design: any error/timeout -> null -> existing voice chain rules.
 async function lookupVoicePref(identity, agentId) {
   if (!USAGE_EVENT_SECRET || !agentId || !identity) return null;
+  // July 17 2026 (proposal A): route through the fork's UNIFIED RESOLVER
+  // (/api/kade/resolve-voice) — same contract as before (the caller's
+  // PERSONAL pick or null; the bridge's own local chain stays in charge of
+  // builder/name/default), but the personal pick is now validated against
+  // the LIVE voice catalog fork-side, so a stale row pointing at a dead
+  // label can't hijack a call anymore. Fail-soft: any resolver trouble
+  // falls back to the legacy /voice-pref-lookup endpoint (kept for compat).
+  const params = new URLSearchParams({ agentId });
+  if (identity.email) params.set('email', identity.email);
+  if (identity.phone) params.set('phone', identity.phone);
+  if (identity.userId) params.set('userId', identity.userId);
   try {
-    // July 13 2026: secret rides a HEADER now (query strings land in edge logs).
-    const params = new URLSearchParams({ agentId });
-    if (identity.email) params.set('email', identity.email);
-    if (identity.phone) params.set('phone', identity.phone);
-    if (identity.userId) params.set('userId', identity.userId);
+    const p2 = new URLSearchParams(params);
+    p2.set('surface', identity.surface || 'phone');
+    const r = await axios.get(`${FORK_USAGE_URL}/api/kade/resolve-voice?${p2}`, {
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 1500,
+    });
+    if (r.data && r.data.source) {
+      return r.data.source === 'personal' && r.data.voice ? r.data.voice : null;
+    }
+  } catch { /* fall through to legacy endpoint */ }
+  try {
+    // Legacy path (pre-July-17 fork, or resolver error).
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/voice-pref-lookup?${params}`, {
       headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 1500,
     });
