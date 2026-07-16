@@ -121,7 +121,11 @@ function memoryLine(session) {
   if (!session.callerMemories) return '';
   return (
     `\n\n[WHAT YOU REMEMBER ABOUT ${session.callerName || 'this caller'} — their own saved memory ` +
-    `cards from the app. Use them naturally like a friend who remembers; never recite or list them:\n` +
+    `cards from the app. Use them naturally like a friend who remembers; never recite or list them. ` +
+    `DISCRETION: this is a live call that may be on speaker with others listening -- do NOT bring up ` +
+    `the private or sensitive cards (health, relationships, money, confessions, anything embarrassing ` +
+    `overheard) until the caller mentions the topic themselves this call; until then stick to the ` +
+    `everyday ones:\n` +
     session.callerMemories + ']'
   );
 }
