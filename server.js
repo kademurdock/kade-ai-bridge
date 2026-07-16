@@ -2053,6 +2053,139 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+// ── Per-agent SCHEDULED OUTREACH ("your agent checks in on you") ───────────────
+// Any agent can be told to reach out to the user on a recurring schedule. The
+// bridge asks that agent (headless) for a short warm line and delivers it via the
+// shared guardrailed runNotify (quiet hours + caps + cooldown apply). Schedules
+// carry the requesting user; delivery targets the registered device pool for now
+// (per-user device targeting lands when the app tags push tokens by user).
+// Auth: scoped NOTIFY_AGENT_SECRET or admin BRIDGE_SECRET.
+const OUTREACH_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outreach.json');
+const outreach = new Map(Object.entries(loadJsonFile(OUTREACH_FILE, {})));
+function saveOutreach() { saveJsonFile(OUTREACH_FILE, Object.fromEntries(outreach)); }
+const OUTREACH_MAX_PER_USER = Number(process.env.OUTREACH_MAX_PER_USER || 5);
+const OUTREACH_MAX_TOTAL = Number(process.env.OUTREACH_MAX_TOTAL || 30);
+const OUTREACH_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+function buildOutreachPrompt(sub) {
+  const topic = String(sub.topic || '').trim();
+  return (
+    'You are reaching out to the user on your own initiative — a scheduled check-in they asked you to send. ' +
+    'Write ONE short, warm message (1 to 2 sentences, under 200 characters, easy to hear read aloud, no emoji, in your natural voice) ' +
+    'that gently checks in or shares a small thought to brighten their day.' +
+    (topic ? ` Weave in this, naturally, not as a checklist: ${topic}.` : '') +
+    ' Reply with ONLY the message text, nothing else.'
+  );
+}
+
+async function fireOutreach(sub, { urgent = false } = {}) {
+  const text = await askAgentRich(sub.agentId, buildOutreachPrompt(sub));
+  if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
+  const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
+  const delivery = await runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName || 'Ki', body, urgent });
+  return { ok: true, generated: body, delivery };
+}
+
+// POST /outreach — create/update. Body: {secret, id?, agentId, agentName, userId, userName,
+//   time 'HH:mm' CT, days? ('daily' or ['mon',..]), topic?, title?, enabled?}
+app.post('/outreach', (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const existing = b.id ? outreach.get(String(b.id)) : null;
+  if (b.id && !existing) return res.status(404).json({ error: 'No schedule with that id' });
+  const userId = String(b.userId || (existing && existing.userId) || '').slice(0, 64);
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const userName = String(b.userName || (existing && existing.userName) || 'the user').slice(0, 80);
+  const time = String(b.time || (existing && existing.time) || '').trim();
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return res.status(400).json({ error: 'time must be HH:mm, 24-hour, US Central' });
+  if (notifyInQuietHours(time)) return res.status(400).json({ error: `That time is inside quiet hours (${notifyPrefs.quietStart}-${notifyPrefs.quietEnd} Central) — pick a time when notifications are allowed.` });
+  let days = b.days !== undefined ? b.days : (existing ? existing.days : 'daily');
+  if (typeof days === 'string' && days.toLowerCase() !== 'daily') days = days.split(/[,\s]+/).filter(Boolean);
+  if (Array.isArray(days)) {
+    days = days.map((d) => String(d).toLowerCase().slice(0, 3)).filter((d) => OUTREACH_DAYS.includes(d));
+    if (!days.length) return res.status(400).json({ error: "days must be 'daily' or day names like ['mon','thu']" });
+  } else { days = 'daily'; }
+  if (!existing) {
+    const mine = [...outreach.values()].filter((o) => o.userId === userId).length;
+    if (mine >= OUTREACH_MAX_PER_USER) return res.status(429).json({ error: `Limit reached: ${OUTREACH_MAX_PER_USER} check-in schedules per person.` });
+    if (outreach.size >= OUTREACH_MAX_TOTAL) return res.status(429).json({ error: 'Platform-wide check-in schedule limit reached.' });
+  }
+  const id = existing ? existing.id : crypto.randomBytes(6).toString('hex');
+  const sub = {
+    id,
+    agentId: b.agentId !== undefined ? String(b.agentId || DEFAULT_AGENT) : (existing ? existing.agentId : DEFAULT_AGENT),
+    agentName: b.agentName !== undefined ? String(b.agentName || DEFAULT_AGENT_NAME).slice(0, 60) : (existing ? existing.agentName : DEFAULT_AGENT_NAME),
+    userId, userName, time, days,
+    topic: b.topic !== undefined ? String(b.topic || '').slice(0, 400) : (existing ? existing.topic : ''),
+    title: b.title !== undefined ? String(b.title || '').slice(0, 40) : (existing ? existing.title : ''),
+    enabled: b.enabled !== undefined ? !!b.enabled : (existing ? existing.enabled : true),
+    createdAt: existing ? existing.createdAt : new Date().toISOString(),
+    lastRun: existing ? existing.lastRun : null,
+  };
+  outreach.set(id, sub);
+  saveOutreach();
+  console.log(`[outreach] ${existing ? 'updated' : 'created'} ${id}: ${sub.agentName} -> user ${userId} ${sub.days === 'daily' ? 'daily' : sub.days.join(',')} at ${sub.time} CT`);
+  res.json({ ok: true, schedule: sub });
+});
+
+app.get('/outreach', (req, res) => {
+  if (!notifySecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  let rows = [...outreach.values()];
+  if (req.query.userId) rows = rows.filter((o) => o.userId === String(req.query.userId));
+  res.json({ count: rows.length, schedules: rows });
+});
+
+app.post('/outreach/toggle', (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const sub = outreach.get(String(b.id || ''));
+  if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
+  sub.enabled = b.enabled !== undefined ? !!b.enabled : !sub.enabled;
+  saveOutreach();
+  res.json({ ok: true, schedule: sub });
+});
+
+app.delete('/outreach', (req, res) => {
+  const id = String((req.query.id || (req.body || {}).id) || '');
+  const secret = req.query.secret || (req.body || {}).secret;
+  if (!notifySecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
+  if (!outreach.has(id)) return res.status(404).json({ error: 'No schedule with that id' });
+  outreach.delete(id);
+  saveOutreach();
+  console.log(`[outreach] deleted ${id}`);
+  res.json({ ok: true, deleted: id });
+});
+
+app.post('/outreach/fire', async (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const sub = outreach.get(String(b.id || ''));
+  if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
+  try { res.json(await fireOutreach(sub, { urgent: b.urgent === true })); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Minute tick — fire each due schedule through the guardrailed notify path.
+setInterval(() => {
+  if (outreach.size === 0) return;
+  try {
+    const { today, hhmm, day } = centralNowParts();
+    for (const sub of outreach.values()) {
+      const dayOk = sub.days === 'daily' || (Array.isArray(sub.days) && sub.days.includes(day));
+      if (sub.enabled && dayOk && sub.time === hhmm && sub.lastRun !== today) {
+        sub.lastRun = today;
+        saveOutreach();
+        fireOutreach(sub)
+          .then((r) => console.log(`[outreach] fired ${sub.id}: ${r.ok ? ('sent=' + (r.delivery && r.delivery.sent) + ' blocked=' + ((r.delivery && r.delivery.blocked) || '-')) : ('err=' + r.error)}`))
+          .catch((e) => console.error(`[outreach] fire failed ${sub.id}: ${e.message}`));
+      }
+    }
+  } catch (e) {
+    console.error('[outreach] scheduler tick error:', e.message);
+  }
+}, 60 * 1000);
+
+
 /** Plain proxy chat call (NO phone-brevity suffix — summaries should be rich). */
 async function askAgentRich(agentId, userMessage) {
   const r = await axios.post(
