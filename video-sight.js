@@ -35,7 +35,7 @@ const modelFor = (mode) =>
     : (process.env.KADE_VIDEO_MODEL_STANDARD || 'google/gemini-3.1-flash-lite');
 const ambientMsFor = (mode) =>
   mode === 'hq'
-    ? parseInt(process.env.VIDEO_AMBIENT_MS_HQ || '30000', 10)
+    ? parseInt(process.env.VIDEO_AMBIENT_MS_HQ || '10000', 10)
     : parseInt(process.env.VIDEO_AMBIENT_MS_STANDARD || '15000', 10);
 const MAX_FRAME_B64 = parseInt(process.env.VIDEO_MAX_FRAME_B64 || String(400 * 1024), 10);
 const TURN_LOOK_TIMEOUT_MS = parseInt(process.env.VIDEO_TURN_LOOK_TIMEOUT_MS || '6500', 10);
@@ -85,17 +85,18 @@ const OUT_OF_MINUTES_LINE =
   "You've used up today's video minutes — video is the expensive kind of call, so it gets a daily allowance. Voice is still unlimited, and video refills at midnight.";
 function firstUseNotice() {
   return (
-    `Quick heads-up, first time only: video uses more of the site's resources than voice, so it gets a daily allowance of ${capMinutes()} minutes. ` +
-    'Standard video is the everyday kind. HQ video looks much harder — best when you need my eyes on labels, text, or details — and uses the allowance the same way. ' +
-    'Voice calls stay unlimited. Confirm to turn the camera on.'
+    `Quick heads-up, first time only: video uses more of the site's resources than voice, so it gets a daily allowance of ${capMinutes()} minutes — voice calls themselves stay unlimited, and you can turn the camera off anytime without hanging up to stop the clock. ` +
+    'Standard video uses your front camera for everyday presence. HQ video uses your rear camera and looks much harder — best when you need my eyes on labels, text, or small details. ' +
+    "Either way: point the camera at what you want me to see and hold it steady a moment, especially in good light. I'll check in on my own as we talk, and the moment you ask me anything, I always take a brand-new look first. " +
+    'Confirm to turn the camera on.'
   );
 }
 
 /* ---------- the describer */
 const SCENE_PROMPT_STANDARD =
-  'You are the live eyes on a video call. In 1-3 plain sentences, say what the camera shows right now: who or what is in frame, what they are doing, anything notable. If there is readable text, read it. No preamble.';
+  'You are the live eyes on a video call. In 1-3 plain sentences, say what the camera shows right now: who or what is in frame, what they are doing, anything notable, and roughly where it is (left, right, center, near, far) if that is not obvious. If there is readable text, read it. No preamble.';
 const SCENE_PROMPT_HQ =
-  'You are the live eyes on a video call for a blind caller. Describe what the camera shows right now, concretely and completely: people (expression, clothing, actions), objects (what they are, condition, position), and ANY text — labels, screens, signs, packaging — read word for word. If something is too blurry or cut off to read, say so plainly. No preamble.';
+  'You are the live eyes on a video call for a blind caller who may be using this to get oriented in a space. Describe what the camera shows right now, concretely and completely: people (expression, clothing, actions), objects (what they are, condition, position), and ANY text — labels, screens, signs, packaging — read word for word. Always include plain spatial layout: what is to the left, right, and straight ahead, and roughly how far away (arm\'s reach, across the room, etc.); call out anything that matters for moving safely (steps, drop-offs, obstacles, doorways, furniture edges) if visible. If something is too blurry, too close, cut off, or badly lit to read or place confidently, say so plainly and suggest what would help (hold steadier, back up, more light). No preamble.';
 
 function describeFrame(session) {
   // One describe at a time per session; callers can AWAIT the in-flight one
