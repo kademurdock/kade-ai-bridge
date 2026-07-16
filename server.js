@@ -2239,6 +2239,155 @@ setInterval(() => {
 }, 60 * 1000);
 
 
+// ── One-off reminders (Notify Phase 3a) ─────────────────────────────────────
+// Different shape from /outreach on purpose: outreach is RECURRING (daily/
+// weekly) and the agent improvises fresh wording each time it fires; a
+// reminder is a SINGLE future moment with TEXT THE AGENT ALREADY WROTE at
+// creation time (e.g. "take your meds"). Reliability matters more than
+// in-the-moment personality here, so firing just delivers the stored text
+// verbatim instead of calling the agent again — no live LLM call on the
+// delivery path at all. Fires once, then is deleted (no reason to keep a
+// fired one-off around the way a recurring outreach schedule is kept).
+const REMINDERS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'reminders.json');
+const reminders = new Map(Object.entries(loadJsonFile(REMINDERS_FILE, {})));
+function saveReminders() { saveJsonFile(REMINDERS_FILE, Object.fromEntries(reminders)); }
+const REMINDER_MAX_PER_USER = Number(process.env.REMINDER_MAX_PER_USER || 10);
+const REMINDER_MAX_TOTAL = Number(process.env.REMINDER_MAX_TOTAL || 300);
+const REMINDER_MAX_MINUTES_OUT = Number(process.env.REMINDER_MAX_MINUTES_OUT || 129600); // 90 days
+
+// Convert a Central-time wall clock (date 'YYYY-MM-DD', time 'HH:mm') to a real
+// UTC Date, correct across the DST boundary, with no timezone library: guess,
+// then measure how the guess reads back in America/Chicago vs the target and
+// correct the difference — converges in 1-2 passes for any date, tested against
+// both CST (UTC-6) and CDT (UTC-5) before shipping.
+function centralWallTimeToUtc(dateStr, hhmm) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || '')) || !/^([01]\d|2[0-3]):([0-5]\d)$/.test(String(hhmm || ''))) {
+    return null;
+  }
+  const [y, mo, d] = String(dateStr).split('-').map(Number);
+  const [h, mi] = String(hhmm).split(':').map(Number);
+  let guess = new Date(Date.UTC(y, mo - 1, d, h, mi));
+  for (let i = 0; i < 3; i++) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(guess).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+    const hh = parts.hour === '24' ? '00' : parts.hour;
+    const asIfUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(hh), Number(parts.minute));
+    const target = Date.UTC(y, mo - 1, d, h, mi);
+    guess = new Date(guess.getTime() + (target - asIfUtc));
+  }
+  return guess;
+}
+
+// Friendly Central-time display string for a Date, for confirmations back to
+// the agent/user (e.g. "Jul 16, 2026, 3:00 PM Central") -- fireAt itself stays
+// ISO/UTC as the source of truth for the firing tick.
+function formatCentralDisplay(date) {
+  const s = date.toLocaleString('en-US', {
+    timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+  return `${s} Central`;
+}
+
+// POST /reminders — create. Body: {secret, agentId, agentName, userId, userName,
+//   text (required, the literal reminder message), title?,
+//   in_minutes? (simplest — relative, no timezone math) OR fire_date+fire_time
+//   ('YYYY-MM-DD' + 'HH:mm', 24-hour Central, for a specific calendar moment)}
+app.post('/reminders', (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(b.userId || '').slice(0, 64);
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const text = String(b.text || '').trim().slice(0, 300);
+  if (!text) return res.status(400).json({ error: 'text required -- the reminder message itself' });
+
+  let fireAt;
+  if (b.in_minutes !== undefined && b.in_minutes !== null && String(b.in_minutes) !== '') {
+    const mins = Number(b.in_minutes);
+    if (!Number.isFinite(mins) || mins < 1) return res.status(400).json({ error: 'in_minutes must be a positive number' });
+    fireAt = new Date(Date.now() + mins * 60000);
+  } else if (b.fire_date && b.fire_time) {
+    fireAt = centralWallTimeToUtc(b.fire_date, b.fire_time);
+    if (!fireAt) return res.status(400).json({ error: "fire_date must be 'YYYY-MM-DD' and fire_time 'HH:mm' (24-hour, Central)" });
+  } else {
+    return res.status(400).json({ error: "Provide either in_minutes, or both fire_date ('YYYY-MM-DD') and fire_time ('HH:mm' Central)" });
+  }
+
+  const minMs = Date.now() + 30 * 1000; // at least 30s out -- if it's "now", just use action=send
+  const maxMs = Date.now() + REMINDER_MAX_MINUTES_OUT * 60000;
+  if (fireAt.getTime() < minMs) return res.status(400).json({ error: 'That time has already passed (or is only seconds away) -- pick a moment at least a minute out, or use action=send for right now.' });
+  if (fireAt.getTime() > maxMs) return res.status(400).json({ error: `Too far out -- reminders can be scheduled up to ${Math.floor(REMINDER_MAX_MINUTES_OUT / 1440)} days ahead.` });
+
+  const mine = [...reminders.values()].filter((r) => r.userId === userId).length;
+  if (mine >= REMINDER_MAX_PER_USER) return res.status(429).json({ error: `Limit reached: ${REMINDER_MAX_PER_USER} pending reminders per person. Cancel one first.` });
+  if (reminders.size >= REMINDER_MAX_TOTAL) return res.status(429).json({ error: 'Platform-wide pending reminder limit reached.' });
+
+  const id = crypto.randomBytes(6).toString('hex');
+  const sub = {
+    id,
+    agentId: String(b.agentId || 'unknown'),
+    agentName: String(b.agentName || 'Kade-AI').slice(0, 60),
+    userId,
+    userName: String(b.userName || 'the user').slice(0, 80),
+    text,
+    title: String(b.title || '').slice(0, 40),
+    fireAt: fireAt.toISOString(),
+    createdAt: new Date().toISOString(),
+  };
+  reminders.set(id, sub);
+  saveReminders();
+  console.log(`[reminders] created ${id}: ${sub.agentName} -> user ${userId} at ${sub.fireAt} ("${text.slice(0, 60)}")`);
+  res.json({ ok: true, reminder: { ...sub, fireAtCentral: formatCentralDisplay(fireAt) } });
+});
+
+app.get('/reminders', (req, res) => {
+  if (!notifySecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  let rows = [...reminders.values()];
+  if (req.query.userId) rows = rows.filter((r) => r.userId === String(req.query.userId));
+  rows.sort((a, b) => new Date(a.fireAt) - new Date(b.fireAt));
+  rows = rows.map((r) => ({ ...r, fireAtCentral: formatCentralDisplay(new Date(r.fireAt)) }));
+  res.json({ count: rows.length, reminders: rows });
+});
+
+app.delete('/reminders', (req, res) => {
+  const id = String((req.query.id || (req.body || {}).id) || '');
+  const secret = req.query.secret || (req.body || {}).secret;
+  if (!notifySecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
+  if (!reminders.has(id)) return res.status(404).json({ error: 'No reminder with that id' });
+  reminders.delete(id);
+  saveReminders();
+  console.log(`[reminders] cancelled ${id}`);
+  res.json({ ok: true, deleted: id });
+});
+
+// Minute tick -- fire each due reminder through the guardrailed notify path,
+// then delete it. urgent:true so a reminder actually fires at the moment the
+// user picked even inside quiet hours -- unlike outreach check-ins
+// (agent-initiated, optional timing), a reminder is a specific ask for a
+// specific moment, so quiet hours shouldn't silently eat it. Cooldown and
+// daily caps still apply (shared runNotify) -- only the quiet-hours window is
+// bypassed.
+setInterval(() => {
+  if (reminders.size === 0) return;
+  try {
+    const now = Date.now();
+    for (const sub of reminders.values()) {
+      if (new Date(sub.fireAt).getTime() <= now) {
+        reminders.delete(sub.id);
+        saveReminders();
+        runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName, body: sub.text, urgent: true, userId: sub.userId })
+          .then((r) => console.log(`[reminders] fired ${sub.id}: ${r.ok ? ('sent=' + r.sent) : ('err=' + r.error)}`))
+          .catch((e) => console.error(`[reminders] fire failed ${sub.id}: ${e.message}`));
+      }
+    }
+  } catch (e) {
+    console.error('[reminders] scheduler tick error:', e.message);
+  }
+}, 60 * 1000);
+
+
 /** Plain proxy chat call (NO phone-brevity suffix — summaries should be rich). */
 async function askAgentRich(agentId, userMessage) {
   const r = await axios.post(
