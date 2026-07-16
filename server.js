@@ -413,21 +413,38 @@ app.get('/users', (req, res) => {
 
 // ── Push notifications (APNs) ───────────────────────────────────────────────────
 // Device tokens come from the native iOS app (POST /push-register, no secret —
-// a device token carries no privileges). Sending is admin-only (BRIDGE_SECRET).
+// a device token carries no privileges). Sending is admin-only (BRIDGE_SECRET),
+// except the guardrailed agent path (see runNotify below).
 // APNs auth is an ES256 JWT signed with the .p8 key; built-ins only (http2+crypto).
+//
+// pushTokens: Map<token, { userId: string|null, platform, registeredAt }>.
+// userId links a device to a LibreChat user id (added July 2026 for multi-user
+// check-ins — see /outreach). A token with userId===null is "unlinked": it still
+// receives admin (/push-send) and global (/reachout) broadcasts for back-compat,
+// but is invisible to per-user targeting (runNotify with a userId won't hit it).
 const PUSH_FILE = path.join(
   process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
   'bridge-push-tokens.json'
 );
 function loadPushTokens() {
-  try { if (fs.existsSync(PUSH_FILE)) return new Set(JSON.parse(fs.readFileSync(PUSH_FILE, 'utf8'))); }
-  catch {}
-  return new Set();
+  try {
+    if (fs.existsSync(PUSH_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(PUSH_FILE, 'utf8'));
+      // Back-compat: the old file format was a plain array of tokens (no userId).
+      if (Array.isArray(parsed)) return new Map(parsed.map((t) => [t, { userId: null, platform: 'ios', registeredAt: null }]));
+      return new Map(Object.entries(parsed));
+    }
+  } catch {}
+  return new Map();
 }
 const pushTokens = loadPushTokens();
 function savePushTokens() {
-  try { fs.writeFileSync(PUSH_FILE, JSON.stringify([...pushTokens])); }
+  try { fs.writeFileSync(PUSH_FILE, JSON.stringify(Object.fromEntries(pushTokens))); }
   catch (e) { console.error('[push] Could not save tokens:', e.message); }
+}
+// All registered tokens belonging to one LibreChat user (for per-user targeting).
+function tokensForUser(userId) {
+  return [...pushTokens.entries()].filter(([, meta]) => meta && meta.userId === userId).map(([t]) => t);
 }
 
 const APNS_HOST      = process.env.APNS_HOST || 'https://api.push.apple.com';
@@ -473,12 +490,34 @@ function sendApnsPush(deviceToken, title, body) {
 }
 
 // App posts its device token here on launch. Public + validated (hex only).
+// Optional `userId` (LibreChat user id) links the device to a person so agent
+// check-ins can target them specifically; omit it and the token stays "unlinked"
+// (back-compat: still reachable by admin/global broadcasts, not by per-user ones).
+// CORS is scoped open here (and only here) because the web app itself calls this
+// from inside the Capacitor webview at https://kademurdock.com, to attach the
+// userId the native layer doesn't know (see PushTokenRegistrar in the fork).
+app.options('/push-register', (req, res) => {
+  res.set('Access-Control-Allow-Origin', 'https://kademurdock.com');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.sendStatus(204);
+});
 app.post('/push-register', (req, res) => {
+  res.set('Access-Control-Allow-Origin', 'https://kademurdock.com');
   const token = String((req.body && req.body.token) || '').trim().toLowerCase();
   if (!/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
-  if (!pushTokens.has(token)) { pushTokens.add(token); savePushTokens(); }
-  console.log(`[push] Registered a device token (total ${pushTokens.size})`);
-  res.json({ ok: true, count: pushTokens.size });
+  const userId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
+  const platform = (req.body && req.body.platform ? String(req.body.platform) : 'ios').slice(0, 20);
+  const existing = pushTokens.get(token);
+  pushTokens.set(token, {
+    userId: userId || (existing && existing.userId) || null,
+    platform: platform || (existing && existing.platform) || 'ios',
+    registeredAt: (existing && existing.registeredAt) || new Date().toISOString(),
+  });
+  savePushTokens();
+  const linked = pushTokens.get(token).userId;
+  console.log(`[push] Registered a device token${linked ? ' (linked to a user)' : ' (unlinked)'} (total ${pushTokens.size})`);
+  res.json({ ok: true, count: pushTokens.size, linked: !!linked });
 });
 
 // Admin: send a push to all devices (or one via `token`). Body: { secret, title?, body?, token? }
@@ -490,7 +529,7 @@ app.post('/push-send', async (req, res) => {
   }
   const title   = b.title || 'Kade-AI';
   const message = b.body  || 'Ki was thinking about you.';
-  const targets = b.token ? [String(b.token).toLowerCase()] : [...pushTokens];
+  const targets = b.token ? [String(b.token).toLowerCase()] : [...pushTokens.keys()];
   if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no device tokens registered yet' });
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0;
@@ -499,6 +538,15 @@ app.post('/push-send', async (req, res) => {
   const sent = results.filter((r) => r.status === 200).length;
   console.log(`[push] Sent ${sent}/${targets.length} (pruned ${pruned})`);
   res.json({ ok: true, sent, total: targets.length, pruned, statuses: results.map((r) => r.status) });
+});
+
+// Admin: list registered device tokens + which user (if any) each is linked to.
+// Mirrors the /users pattern above. Useful for confirming a device linked after
+// the app posts {token, userId}, or for manually linking one (re-POST /push-register
+// with the same token + a userId — it upserts).
+app.get('/push-tokens', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({ count: pushTokens.size, tokens: Object.fromEntries(pushTokens) });
 });
 
 // ── Agent notification primitive (guardrailed) ─────────────────────────────────
@@ -522,7 +570,7 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId }) {
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   const message = String(body || '').trim().slice(0, 300);
@@ -537,8 +585,12 @@ async function runNotify({ agentId, agentName, title, body, urgent }) {
   if (Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return { ok: false, blocked: 'cooldown active' };
   if (notifyCounts.global >= notifyPrefs.globalDailyCap) return { ok: false, blocked: 'daily total cap reached' };
   if ((notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return { ok: false, blocked: 'per-agent daily cap reached' };
-  const targets = [...pushTokens];
-  if (!targets.length) return { ok: true, sent: 0, note: 'no device tokens registered yet' };
+  // Per-user targeting: a userId restricts delivery to THAT person's linked
+  // device(s) only — it never falls back to the full pool, so an unlinked or
+  // not-yet-registered user gets zero targets, never someone else's phone.
+  // No userId = legacy broadcast (admin tools, the global "Ki reaches out" timer).
+  const targets = userId ? tokensForUser(userId) : [...pushTokens.keys()];
+  if (!targets.length) return { ok: true, sent: 0, note: userId ? 'no device linked to this user yet' : 'no device tokens registered yet' };
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
@@ -551,7 +603,7 @@ async function runNotify({ agentId, agentName, title, body, urgent }) {
 app.post('/notify', async (req, res) => {
   const b = req.body || {};
   if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
@@ -2057,8 +2109,9 @@ setInterval(() => {
 // Any agent can be told to reach out to the user on a recurring schedule. The
 // bridge asks that agent (headless) for a short warm line and delivers it via the
 // shared guardrailed runNotify (quiet hours + caps + cooldown apply). Schedules
-// carry the requesting user; delivery targets the registered device pool for now
-// (per-user device targeting lands when the app tags push tokens by user).
+// carry the requesting user; delivery targets ONLY that user's linked device(s)
+// (see tokensForUser / runNotify above) — wired up July 2026 once /push-register
+// started accepting userId, so this is safe to open to every user, not just admin.
 // Auth: scoped NOTIFY_AGENT_SECRET or admin BRIDGE_SECRET.
 const OUTREACH_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outreach.json');
 const outreach = new Map(Object.entries(loadJsonFile(OUTREACH_FILE, {})));
@@ -2082,7 +2135,7 @@ async function fireOutreach(sub, { urgent = false } = {}) {
   const text = await askAgentRich(sub.agentId, buildOutreachPrompt(sub));
   if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
   const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
-  const delivery = await runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName || 'Ki', body, urgent });
+  const delivery = await runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName || 'Ki', body, urgent, userId: sub.userId });
   return { ok: true, generated: body, delivery };
 }
 
