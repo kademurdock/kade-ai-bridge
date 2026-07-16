@@ -56,6 +56,13 @@ function applyDirectionCarry(sentence, dirState) {
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
         fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
 const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
+// Watch-and-alert delivery (July 16 2026, Kade's yes -- character-voice
+// alerts): when an armed watch fires (or expires), video-sight hands the
+// engine a system-authored alert message and the engine runs it as a REAL
+// character turn the moment the line is quiet. This is the one sanctioned
+// exception to "only speaks when spoken to" -- the caller armed it on purpose.
+// It never talks over anyone: it waits for busy/isSpeaking to clear first.
+videoSight.onAlert((session, alertText) => { watchAlertTurn(session, alertText).catch(() => {}); });
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1079,6 +1086,44 @@ async function handleUtterance(session, text) {
   }
 }
 
+// ── Watch-and-alert turn (July 16 2026) ──────────────────────────────────────
+// Delivers an automatic alert as a real character turn once the line is quiet.
+// Mirrors handleUtterance's busy bookkeeping exactly (busy gate, pending
+// drain) so a caller who starts talking mid-alert gets the normal barge-in /
+// queue behavior -- the alert turn is interruptible like any other turn.
+const WATCH_ALERT_MAX_WAIT_MS = parseInt(process.env.VIDEO_WATCH_ALERT_MAX_WAIT_MS || '60000', 10);
+async function watchAlertTurn(session, alertText) {
+  const started = Date.now();
+  const attempt = async () => {
+    if (!session.ws || session.ws.readyState !== WebSocket.OPEN) return; // call ended
+    if (!session.videoOn) return; // video stopped while waiting -- alert is stale, drop it
+    if (session.busy || session.isSpeaking) {
+      if (Date.now() - started < WATCH_ALERT_MAX_WAIT_MS) {
+        setTimeout(() => { attempt().catch(() => {}); }, 1200);
+      } else {
+        console.log('[voice-stream] watch alert dropped -- line never went quiet within the wait window');
+      }
+      return;
+    }
+    console.log(`[voice-stream] delivering watch alert on ${session.streamSid || session.callSid || 'web session'}`);
+    session.busy = true;
+    if (session.sendState) session.sendState('thinking');
+    try {
+      await streamReply(session, alertText);
+    } catch (err) {
+      console.error('[voice-stream] watch alert turn error:', err.message);
+    } finally {
+      session.busy = false;
+      if (session._pending) {
+        const next = session._pending;
+        session._pending = null;
+        handleUtterance(session, next);
+      }
+    }
+  };
+  await attempt();
+}
+
 // ── Stream LLM reply ──────────────────────────────────────────────────────────
 // KADE July 2 2026 (round 5): bare acknowledgments that should NOT restart a
 // turn that's still generating. Strictly short/pure — anything with real
@@ -1196,6 +1241,25 @@ async function streamReply(session, userText) {
         })
         .replace(/[ \t]{2,}/g, ' ')
         .trim();
+    }
+    // Watch-and-alert (July 16 2026): pull [watch: ...] / [watch off] tags out
+    // of the sentence -- they arm/disarm the video watcher and are never spoken,
+    // captioned, or sent to TTS (same treatment as [sound:] cues).
+    if (/\[watch\b/i.test(sentence)) {
+      let armCond = null;
+      let watchOff = false;
+      sentence = sentence
+        .replace(/\[watch\s*:\s*([^\]]{1,160})\]/gi, (_m, c) => {
+          const cond = String(c || '').trim();
+          if (/^off$/i.test(cond)) watchOff = true;
+          else if (cond) armCond = cond;
+          return ' ';
+        })
+        .replace(/\[watch\s+off\]/gi, () => { watchOff = true; return ' '; })
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+      if (watchOff) { try { videoSight.disarmWatch(session, 'agent tag'); } catch { /* fail-soft */ } }
+      if (armCond) { try { videoSight.armWatch(session, armCond); } catch { /* fail-soft */ } }
     }
     const hasSpeech = sentence.length >= 2;
     if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak

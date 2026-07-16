@@ -45,6 +45,20 @@ const TURN_LOOK_TIMEOUT_MS = parseInt(process.env.VIDEO_TURN_LOOK_TIMEOUT_MS || 
 // any new API calls (the diff below is a cheap local heuristic).
 const SCENE_LOG_MAX_ENTRIES = parseInt(process.env.VIDEO_SCENE_LOG_MAX_ENTRIES || '6', 10);
 const SCENE_LOG_MAX_AGE_MS = parseInt(process.env.VIDEO_SCENE_LOG_MAX_AGE_MS || String(5 * 60 * 1000), 10);
+// (July 16 2026, watch-and-alert -- Kade's yes, character-voice alerts): the
+// caller can say "watch for my cat and tell me when it shows up." The agent
+// arms a watch via an invisible [watch: ...] tag; a CHEAP dedicated checker
+// (flash-lite, one word back) looks at a frame every few seconds; the moment
+// the condition is visibly true the engine hands the character an automatic
+// alert turn -- the ONLY deliberate exception to strict turn-taking, and it
+// exists because the caller explicitly asked to be interrupted. Costs:
+// ~$0.00003 per check (under a nickel per hour armed), one normal LLM turn
+// per fired alert. One watch at a time; one-shot (disarms after firing);
+// auto-expires; dies with video off. Kill switch: VIDEO_WATCH_ENABLED=false.
+const watchEnabled = () => process.env.VIDEO_WATCH_ENABLED !== 'false';
+const WATCH_INTERVAL_MS = parseInt(process.env.VIDEO_WATCH_INTERVAL_MS || '5000', 10);
+const watchModel = () => process.env.KADE_VIDEO_WATCH_MODEL || 'google/gemini-3.1-flash-lite';
+const WATCH_MAX_AGE_MS = parseInt(process.env.VIDEO_WATCH_MAX_AGE_MS || String(30 * 60 * 1000), 10);
 
 /* ---------- tiny fail-soft JSON stores (same style as the other meters) */
 function loadJson(file, fallback) {
@@ -178,6 +192,85 @@ async function _describeFrame(session) {
   }
 }
 
+/* ---------- watch-and-alert (July 16 2026) ------------------------------- */
+// The engine (voice-stream.js) registers HOW an alert gets delivered -- a
+// callback that runs a real character turn when the line is quiet. Kept as a
+// registration to avoid a circular require (voice-stream requires this file).
+let _deliverAlert = null;
+function onAlert(fn) { _deliverAlert = fn; }
+
+function disarmWatch(session, reason) {
+  if (session._videoWatchTimer) { clearInterval(session._videoWatchTimer); session._videoWatchTimer = null; }
+  if (session.watch) {
+    console.log(`[video-sight] watch disarmed (${reason || 'off'}): "${session.watch.condition}" user=${session.userId}`);
+    session.watch = null;
+  }
+}
+
+function armWatch(session, condition) {
+  if (!watchEnabled() || !session.videoOn || !condition) return;
+  const cond = String(condition).trim().slice(0, 160);
+  if (!cond) return;
+  disarmWatch(session, 'replaced'); // one watch at a time -- new one wins
+  session.watch = { condition: cond, armedAt: Date.now(), firing: false };
+  session._videoWatchTimer = setInterval(() => { checkWatch(session).catch(() => {}); }, WATCH_INTERVAL_MS);
+  console.log(`[video-sight] watch ARMED: "${cond}" user=${session.userId} every ${WATCH_INTERVAL_MS}ms`);
+}
+
+async function checkWatch(session) {
+  const w = session.watch;
+  const key = process.env.OPENROUTER_KEY;
+  if (!w || w.firing || !session.videoOn || !key) return;
+  if (Date.now() - w.armedAt > WATCH_MAX_AGE_MS) {
+    const cond = w.condition;
+    disarmWatch(session, 'expired');
+    // Say so -- a watch the caller is counting on must never die silently.
+    if (_deliverAlert) {
+      _deliverAlert(session,
+        `[AUTOMATIC WATCH NOTICE — system message, not the caller speaking. The watch for "${cond}" has been running ${Math.round(WATCH_MAX_AGE_MS / 60000)} minutes without seeing it, so it just switched itself off to save resources. Briefly let them know in your own voice, and that they can just ask again to re-arm it.]`);
+    }
+    return;
+  }
+  const frame = session.latestFrame;
+  if (!frame || Date.now() - frame.at > 20000) return; // stale camera -- skip this tick
+  try {
+    const body = {
+      model: watchModel(),
+      max_tokens: 4,
+      usage: { include: true },
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: `Watch condition: "${w.condition}". Look at the image. Answer with exactly one word — YES if the condition is clearly and visibly true in this image right now, otherwise NO. If unsure, answer NO.` },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${frame.b64}` } },
+        ],
+      }],
+    };
+    const r = await axios.post('https://openrouter.ai/api/v1/chat/completions', body, {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-Title': 'Kade-AI Video Watch' },
+      timeout: 15000,
+    });
+    const cost = r.data?.usage?.cost;
+    if (typeof cost === 'number' && cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
+    const answer = String(r.data?.choices?.[0]?.message?.content || '').trim();
+    if (!/^YES\b/i.test(answer)) return;
+    // Condition is TRUE. Take one fresh, full look (best available detail for
+    // the alert itself), then hand the character an automatic alert turn.
+    w.firing = true;
+    console.log(`[video-sight] watch HIT: "${w.condition}" user=${session.userId}`);
+    try { await describeFrame(session); } catch { /* alert still fires without a fresh look */ }
+    const desc = session.sceneDesc && session.sceneDesc.text ? session.sceneDesc.text : 'no fresh description available';
+    const cond = w.condition;
+    disarmWatch(session, 'fired');
+    if (_deliverAlert) {
+      _deliverAlert(session,
+        `[AUTOMATIC WATCH ALERT — system message, not the caller speaking. The thing they asked you to watch for — "${cond}" — just became visible on camera. Fresh look: ${desc} — Speak up right now and tell them, briefly and naturally, in your own voice; they asked for exactly this interruption. The watch is now off — mention in passing that they can say "keep watching" or ask again if they want you to keep looking.]`);
+    }
+  } catch (e) {
+    console.log('[video-sight] watch check failed (will retry next tick):', e && e.message);
+  }
+}
+
 /* ---------- suffix block for the LLM turn (in-block instruction — recency) */
 function visionLine(session) {
   if (!session.videoOn || !session.sceneDesc) return '';
@@ -196,12 +289,21 @@ function visionLine(session) {
         .map((e) => `${Math.round((Date.now() - e.at) / 1000)}s ago, ${e.text}`)
         .join(' | ')}.`
     : '';
+  // (July 16 2026, watch-and-alert) the model needs to know it CAN watch,
+  // how to arm/disarm (invisible tags, stripped before speech/captions), and
+  // what is currently armed so it never re-arms or denies an active watch.
+  const watchBlock = watchEnabled()
+    ? (session.watch
+        ? ` A WATCH IS ARMED: you are watching for "${session.watch.condition}" (armed ${Math.round((Date.now() - session.watch.armedAt) / 60000)}m ago; an automatic checker looks every few seconds and will hand you an alert the moment it's seen — trust it, don't keep bringing it up). If they ask you to stop watching, include the tag [watch off] in your reply.`
+        : ` If the caller asks you to WATCH for something and let them know when it appears or happens (like "tell me when my cat comes into frame"), acknowledge briefly and include the exact tag [watch: what to look for, a few plain words] in your reply — the tag is invisible to them and arms an automatic checker that looks every few seconds, then prompts you to speak up the moment it's seen, even mid-quiet. One watch at a time; a new [watch: ...] replaces the old.`)
+    : '';
   return (
     `\n\n[LIVE CAMERA — the caller's camera is ON (${session.videoMode === 'hq' ? 'HQ' : 'standard'} video). ` +
     `What you can see right now (looked ${ageS}s ago): ${session.sceneDesc.text}` +
     `${recentBlock} ` +
     `— Use your sight naturally, like a friend on a video call: mention what you see when it fits or when asked. ` +
-    `If asked to read or identify something and this look isn't enough, ask them to hold it closer, steadier, or into better light.]`
+    `If asked to read or identify something and this look isn't enough, ask them to hold it closer, steadier, or into better light.` +
+    `${watchBlock}]`
   );
 }
 
@@ -250,6 +352,7 @@ function stopVideo(session, reason) {
   session.videoOn = false;
   session.latestFrame = null;
   session.sceneLog = []; // (July 16 2026, gap-coverage) clean slate per on/off cycle
+  disarmWatch(session, reason || 'video off'); // (watch-and-alert) watches die with video
   try {
     session.jsonSend({ type: 'video-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) });
   } catch { /* socket may be gone */ }
@@ -310,4 +413,4 @@ function usageSummary(session) {
   return { minutes, costUSD, mode: session.videoMode || null };
 }
 
-module.exports = { handleVideoMsg, handleFrameMsg, visionLine, onTurn, stopVideo, usageSummary, enabled };
+module.exports = { handleVideoMsg, handleFrameMsg, visionLine, onTurn, stopVideo, usageSummary, enabled, armWatch, disarmWatch, onAlert };
