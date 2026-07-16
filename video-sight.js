@@ -97,12 +97,21 @@ const SCENE_PROMPT_STANDARD =
 const SCENE_PROMPT_HQ =
   'You are the live eyes on a video call for a blind caller. Describe what the camera shows right now, concretely and completely: people (expression, clothing, actions), objects (what they are, condition, position), and ANY text — labels, screens, signs, packaging — read word for word. If something is too blurry or cut off to read, say so plainly. No preamble.';
 
-async function describeFrame(session) {
+function describeFrame(session) {
+  // One describe at a time per session; callers can AWAIT the in-flight one
+  // (fixes the first-turn race: frame arrival kicks off the first look, and
+  // the user's first utterance must wait for THAT, not skip seeing at all).
+  if (session._videoDescribePromise) return session._videoDescribePromise;
+  session._videoDescribePromise = _describeFrame(session).finally(() => {
+    session._videoDescribePromise = null;
+  });
+  return session._videoDescribePromise;
+}
+
+async function _describeFrame(session) {
   const key = process.env.OPENROUTER_KEY;
   const frame = session.latestFrame;
   if (!key || !frame || !frame.b64 || !session.videoOn) return;
-  if (session._videoDescribing) return;
-  session._videoDescribing = true;
   try {
     const model = modelFor(session.videoMode);
     const body = {
@@ -130,8 +139,6 @@ async function describeFrame(session) {
     if (typeof cost === 'number' && cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
   } catch (e) {
     console.log('[video-sight] describe failed (call continues blind):', e && e.message);
-  } finally {
-    session._videoDescribing = false;
   }
 }
 
@@ -152,9 +159,10 @@ function visionLine(session) {
 async function onTurn(session) {
   if (!session.videoOn || !session.latestFrame) return;
   const descAt = session.sceneDesc ? session.sceneDesc.frameAt || 0 : 0;
-  if (session.latestFrame.at <= descAt + 3000) return; // scene is current enough
+  const inFlight = session._videoDescribePromise;
+  if (!inFlight && session.latestFrame.at <= descAt + 3000) return; // scene is current enough
   await Promise.race([
-    describeFrame(session),
+    inFlight || describeFrame(session),
     new Promise((res) => setTimeout(res, TURN_LOOK_TIMEOUT_MS)),
   ]);
 }
