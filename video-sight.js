@@ -39,6 +39,12 @@ const ambientMsFor = (mode) =>
     : parseInt(process.env.VIDEO_AMBIENT_MS_STANDARD || '15000', 10);
 const MAX_FRAME_B64 = parseInt(process.env.VIDEO_MAX_FRAME_B64 || String(400 * 1024), 10);
 const TURN_LOOK_TIMEOUT_MS = parseInt(process.env.VIDEO_TURN_LOOK_TIMEOUT_MS || '6500', 10);
+// (July 16 2026, gap-coverage): a short rolling log of DETECTED CHANGES, not
+// every raw snapshot -- covers "did anything happen while I wasn't looking"
+// without breaking turn-taking (still only surfaced when asked) and without
+// any new API calls (the diff below is a cheap local heuristic).
+const SCENE_LOG_MAX_ENTRIES = parseInt(process.env.VIDEO_SCENE_LOG_MAX_ENTRIES || '6', 10);
+const SCENE_LOG_MAX_AGE_MS = parseInt(process.env.VIDEO_SCENE_LOG_MAX_AGE_MS || String(5 * 60 * 1000), 10);
 
 /* ---------- tiny fail-soft JSON stores (same style as the other meters) */
 function loadJson(file, fallback) {
@@ -98,6 +104,26 @@ const SCENE_PROMPT_STANDARD =
 const SCENE_PROMPT_HQ =
   'You are the live eyes on a video call for a blind caller who may be using this to get oriented in a space. Describe what the camera shows right now, concretely and completely: people (expression, clothing, actions), objects (what they are, condition, position), and ANY text — labels, screens, signs, packaging — read word for word. Always include plain spatial layout: what is to the left, right, and straight ahead, and roughly how far away (arm\'s reach, across the room, etc.); call out anything that matters for moving safely (steps, drop-offs, obstacles, doorways, furniture edges) if visible. If something is too blurry, too close, cut off, or badly lit to read or place confidently, say so plainly and suggest what would help (hold steadier, back up, more light). No preamble.';
 
+/* ---------- cheap local change-detector (no API call, pure text compare) */
+function sceneChanged(prevText, newText) {
+  if (!prevText) return true;
+  const words = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const a = new Set(words(prevText));
+  const b = new Set(words(newText));
+  if (!a.size || !b.size) return true;
+  let shared = 0;
+  for (const w of a) if (b.has(w)) shared++;
+  const overlap = shared / Math.max(a.size, b.size);
+  return overlap < 0.6; // under 60% word overlap counts as a real change
+}
+
+/* ---------- prune the rolling change-log by age + count */
+function pruneSceneLog(session) {
+  if (!session.sceneLog) { session.sceneLog = []; return; }
+  const cutoff = Date.now() - SCENE_LOG_MAX_AGE_MS;
+  session.sceneLog = session.sceneLog.filter((e) => e.at >= cutoff).slice(-SCENE_LOG_MAX_ENTRIES);
+}
+
 function describeFrame(session) {
   // One describe at a time per session; callers can AWAIT the in-flight one
   // (fixes the first-turn race: frame arrival kicks off the first look, and
@@ -134,7 +160,16 @@ async function _describeFrame(session) {
     });
     const text = r.data?.choices?.[0]?.message?.content;
     if (typeof text === 'string' && text.trim()) {
+      const prev = session.sceneDesc;
       session.sceneDesc = { text: text.trim().slice(0, 1600), at: Date.now(), frameAt: frame.at };
+      // (July 16 2026, gap-coverage) only log a NEW entry when the scene
+      // actually changed -- keeps the log from filling up with repeat
+      // "empty room" looks while still catching "a car pulled up".
+      if (sceneChanged(prev && prev.text, session.sceneDesc.text)) {
+        if (!session.sceneLog) session.sceneLog = [];
+        session.sceneLog.push({ text: session.sceneDesc.text, at: session.sceneDesc.at });
+      }
+      pruneSceneLog(session);
     }
     const cost = r.data?.usage?.cost;
     if (typeof cost === 'number' && cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
@@ -148,9 +183,23 @@ function visionLine(session) {
   if (!session.videoOn || !session.sceneDesc) return '';
   const ageS = Math.round((Date.now() - session.sceneDesc.at) / 1000);
   if (ageS > 120) return '';
+  // (July 16 2026, gap-coverage) anything logged BEFORE the current look --
+  // lets a turn answer "did anything happen" even though a snapshot used to
+  // just overwrite the last one with nothing kept. Capped small on purpose:
+  // this is for answering a direct question, not a transcript, and the
+  // instruction below is explicit that it's not a cue to narrate on its own.
+  const recent = (session.sceneLog || [])
+    .filter((e) => e.at < session.sceneDesc.at)
+    .slice(-3);
+  const recentBlock = recent.length
+    ? ` Earlier changes noticed since the camera came on (only mention these if asked something like "did anything happen" or "what changed" -- do not volunteer this list on your own): ${recent
+        .map((e) => `${Math.round((Date.now() - e.at) / 1000)}s ago, ${e.text}`)
+        .join(' | ')}.`
+    : '';
   return (
     `\n\n[LIVE CAMERA — the caller's camera is ON (${session.videoMode === 'hq' ? 'HQ' : 'standard'} video). ` +
-    `What you can see right now (looked ${ageS}s ago): ${session.sceneDesc.text} ` +
+    `What you can see right now (looked ${ageS}s ago): ${session.sceneDesc.text}` +
+    `${recentBlock} ` +
     `— Use your sight naturally, like a friend on a video call: mention what you see when it fits or when asked. ` +
     `If asked to read or identify something and this look isn't enough, ask them to hold it closer, steadier, or into better light.]`
   );
@@ -200,6 +249,7 @@ function stopVideo(session, reason) {
   }
   session.videoOn = false;
   session.latestFrame = null;
+  session.sceneLog = []; // (July 16 2026, gap-coverage) clean slate per on/off cycle
   try {
     session.jsonSend({ type: 'video-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) });
   } catch { /* socket may be gone */ }
