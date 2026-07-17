@@ -295,7 +295,7 @@ function visionLine(session) {
   const watchBlock = watchEnabled()
     ? (session.watch
         ? ` A WATCH IS ARMED: you are watching for "${session.watch.condition}" (armed ${Math.round((Date.now() - session.watch.armedAt) / 60000)}m ago; an automatic checker looks every few seconds and will hand you an alert the moment it's seen — trust it, don't keep bringing it up). If they ask you to stop watching, include the tag [watch off] in your reply.`
-        : ` If the caller asks you to WATCH for something and let them know when it appears or happens (like "tell me when my cat comes into frame"), acknowledge briefly and include the exact tag [watch: what to look for, a few plain words] in your reply — the tag is invisible to them and arms an automatic checker that looks every few seconds, then prompts you to speak up the moment it's seen, even mid-quiet. One watch at a time; a new [watch: ...] replaces the old.`)
+        : ` If the caller asks you to WATCH for something and let them know when it appears or happens (like "tell me when the dryer light goes off" or "watch for a car in the driveway"), acknowledge briefly and include the exact tag [watch: what to look for, a few plain words] in your reply — the tag is invisible to them and arms an automatic checker that looks every few seconds, then prompts you to speak up the moment it's seen, even mid-quiet. One watch at a time; a new [watch: ...] replaces the old.`)
     : '';
   return (
     `\n\n[LIVE CAMERA — the caller's camera is ON (${session.videoMode === 'hq' ? 'HQ' : 'standard'} video). ` +

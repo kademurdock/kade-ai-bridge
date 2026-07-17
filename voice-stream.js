@@ -827,6 +827,17 @@ function releaseGreetingLock(session) {
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
+  // LIVE MODE GATE: while the Gemini Live session is on, IT owns the
+  // conversation (it hears the same mic audio directly). The normal
+  // Deepgram→LLM→Inworld turn pipeline stays parked, except for the spoken
+  // escape hatch promised in the first-use notice ("say live off").
+  if (session.liveOn) {
+    if (/\b(?:live\s*(?:mode\s*)?(?:off|stop|end|quit|done)|(?:stop|end|turn\s+off|kill)\s+live(?:\s+mode)?)\b/i.test(text)) {
+      try { videoLive.stopLive(session, 'voice-off'); } catch {}
+      try { await speak(session, 'Live mode off — back to normal. Go ahead.', session.voice); } catch {}
+    }
+    return;
+  }
   // July 12 2026: voicemail mode — the "person" is a recording. No turns,
   // no thinking sounds; handleAmdResult speaks one message and hangs up.
   if (session.voicemailMode) return;
@@ -2581,6 +2592,28 @@ async function postVideoUsage(session) {
   } catch (e) { console.log('[video-sight] usage post failed:', e && e.message); }
 }
 
+async function postLiveUsage(session) {
+  try {
+    const secs = Number(session.liveSecondsTotal || 0);
+    if (!(secs > 0)) return;
+    const minutes = Math.round((secs / 60) * 100) / 100;
+    const costUSD = Math.round(minutes * Number(process.env.LIVE_COST_PER_MIN_USD || '0.055') * 10000) / 10000;
+    const secret = process.env.KADE_USAGE_EVENT_SECRET;
+    if (!secret || !session.userId) return;
+    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    const axios = require('axios');
+    await axios.post(`${base}/api/kade/usage-event`, {
+      secret,
+      userId: session.userId,
+      service: 'video_live',
+      quantity: minutes,
+      unit: 'minutes',
+      costUSD,
+      metadata: { agent: session.agentName, surface: 'web', mode: 'live' },
+    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
+  } catch (e) { console.log('[video-live] usage post failed:', e && e.message); }
+}
+
 function attachWebVoice(server) {
   const wss = new WebSocket.Server({ noServer: true });
   installUpgradeRouter(server).set('/ws/web-voice', wss);
@@ -2606,6 +2639,10 @@ function attachWebVoice(server) {
         // Twilio media case (which is what makes listening continuous:
         // the mic NEVER stops, even while the agent is talking).
         if (session && session.dgWs?.readyState === WebSocket.OPEN) session.dgWs.send(raw);
+        // LIVE lane: same 16k PCM16 chunks the mic already ships for Deepgram
+        // get forwarded to Google (Deepgram stays open for captions + the
+        // "live off" voice escape hatch — its turns are gated in handleUtterance).
+        if (session && session.liveOn) { try { videoLive.forwardAudio(session, Buffer.from(raw).toString('base64')); } catch {} }
         return;
       }
       let msg;
@@ -2687,8 +2724,25 @@ function attachWebVoice(server) {
         return;
       }
       if (msg.type === 'video') { videoSight.handleVideoMsg(session, msg, speak); return; }
-      if (msg.type === 'live') { videoLive.handleLiveMsg(session, msg, speak); return; } // experimental live lane (no client button yet)
-      if (msg.type === 'frame') { videoSight.handleFrameMsg(session, msg); if (session.liveOn) videoLive.forwardFrame(session, msg.data); return; }
+      if (msg.type === 'live') {
+        // Live owns sight AND speech. If the snapshot video lane is armed it
+        // bills wall-clock minutes underneath live — stand it down the moment
+        // live actually comes up (hook fires on setupComplete, not on the
+        // notice), and settle its usage right then so nothing is lost if the
+        // socket later dies uncleanly.
+        session.onLiveUp = () => {
+          try { if (session.videoOn) { videoSight.stopVideo(session, 'live-handoff'); postVideoUsage(session); session.videoSeconds = 0; session.videoCostUSD = 0; } } catch {}
+        };
+        videoLive.handleLiveMsg(session, msg, speak);
+        return;
+      }
+      if (msg.type === 'frame') {
+        // While the Live lane is on it OWNS vision — forwarding the frame to
+        // the snapshot lane too would pay for the same second of sight twice.
+        if (session.liveOn) { videoLive.forwardFrame(session, msg.data); return; }
+        videoSight.handleFrameMsg(session, msg);
+        return;
+      }
       if (msg.type === 'bye') { try { ws.close(1000, 'bye'); } catch {} return; }
     });
 
@@ -2697,6 +2751,7 @@ function attachWebVoice(server) {
       if (session) {
         try { if (session.videoOn || session.videoSeconds) { videoSight.stopVideo(session, 'hangup'); postVideoUsage(session); } } catch {}
         try { if (session.liveOn) videoLive.stopLive(session, 'hangup'); } catch {}
+        try { postLiveUsage(session); } catch {}
         try { logCallTranscript(session); } catch {}
         try { postWebVoiceUsage(session); } catch {}
         session.llmAbort = true;

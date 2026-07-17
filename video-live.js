@@ -39,6 +39,10 @@ const os = require('os');
 let WebSocketClient = null;
 try { WebSocketClient = require('ws'); } catch { /* ws is a bridge dep already */ }
 
+// Binary WS frame prefix for raw Live PCM shipped to the browser ("RIFF" = WAV
+// clip, "LIVE" = raw 24kHz PCM16 chunk). Keep in sync with useStreamingCall.ts.
+const LIVE_AUDIO_MAGIC = Buffer.from('LIVE');
+
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const LIVE_MINUTES_FILE = path.join(DATA_DIR, 'live-minutes.json');
 const LIVE_ACK_FILE = path.join(DATA_DIR, 'live-ack.json');
@@ -47,10 +51,13 @@ const enabled = () => process.env.LIVE_ENABLED === 'true' && !!process.env.GOOGL
 const capMinutes = () => parseInt(process.env.LIVE_DAILY_MINUTES_CAP || '15', 10);
 const liveModel = () => process.env.LIVE_MODEL || 'models/gemini-3.1-flash-live-preview';
 const LIVE_HOST = process.env.LIVE_WS_HOST || 'generativelanguage.googleapis.com';
-// Documented Live API bidi endpoint (v1beta BidiGenerateContent). Re-verify
-// against ai.google.dev/api/live at first-activation time.
+// Live API bidi endpoint. VERIFIED LIVE July 16 2026 (sandbox WS round-trip,
+// real audio back): v1alpha accepts `proactivity` at setup top level and
+// returned audio/pcm;rate=24000; v1beta REJECTS the proactivity field
+// entirely (1007 close). Stay on v1alpha until proactivity graduates.
+const LIVE_API_VERSION = process.env.LIVE_API_VERSION || 'v1alpha';
 const liveUrl = () =>
-  `wss://${LIVE_HOST}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GOOGLE_LIVE_API_KEY}`;
+  `wss://${LIVE_HOST}/ws/google.ai.generativelanguage.${LIVE_API_VERSION}.GenerativeService.BidiGenerateContent?key=${process.env.GOOGLE_LIVE_API_KEY}`;
 
 /* ---------- meters (same fail-soft style as video-sight) */
 function loadJson(file, fallback) {
@@ -111,9 +118,10 @@ function buildSetupMessage(session) {
         // speechConfig / voice selection: pick at tuning time.
       },
       systemInstruction: { parts: [{ text: personaText }] },
-      // Proactive audio — the model decides when to speak. Field name has
-      // moved between preview revisions (proactivity / proactiveAudio):
-      // verify at first activation. Harmless if ignored by the server.
+      // Proactive audio — the model decides when to speak. VERIFIED July 16
+      // 2026: on v1alpha this field lives at the TOP LEVEL of `setup` (NOT
+      // inside generationConfig — both nestings 1007-close on v1beta, and
+      // generationConfig nesting closes on v1alpha too).
       proactivity: { proactiveAudio: true },
     },
   };
@@ -154,24 +162,36 @@ function handleGoogleMessage(session, raw) {
     session._liveTick = setInterval(() => {
       if (!session.liveOn) return;
       const now = Date.now();
-      addSeconds(session.userId, (now - session._liveTickAt) / 1000);
+      const secs = (now - session._liveTickAt) / 1000;
+      addSeconds(session.userId, secs);
+      session.liveSecondsTotal = Number(session.liveSecondsTotal || 0) + secs;
       session._liveTickAt = now;
       if (minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
     }, 15000);
     try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)) }); } catch {}
+    // Hand-off hook (set by voice-stream): stands the snapshot video lane
+    // down so its wall-clock meter stops while live owns the camera. Fired
+    // AFTER the live-state send so the client flips its live flag first and
+    // knows to keep the camera rolling through the video-state off event.
+    try { session.onLiveUp && session.onLiveUp(); } catch {}
     console.log(`[video-live] LIVE session up user=${session.userId} model=${liveModel()}`);
     return;
   }
-  // Spoken audio back from Google: 24kHz PCM chunks in serverContent.
-  // Shipping these to the browser needs a small client change (schedule raw
-  // PCM chunks via Web Audio, same pattern as the existing WAV path but
-  // chunked) — marked for the tuning session; until then we log receipt.
+  // Spoken audio back from Google: 24kHz PCM16 chunks (verified live:
+  // mime audio/pcm;rate=24000). Ship each chunk to the browser as a binary
+  // WS frame prefixed with the 4-byte magic "LIVE" — WAV clips start with
+  // "RIFF", so the client can route unambiguously and schedule raw PCM via
+  // Web Audio (fork useStreamingCall.ts, same gapless chain as WAV clips).
   const parts = msg.serverContent && msg.serverContent.modelTurn && msg.serverContent.modelTurn.parts;
   if (Array.isArray(parts)) {
     for (const p of parts) {
       if (p.inlineData && p.inlineData.data) {
-        // TODO(tuning session): forward to client — session.sendLiveAudio(p.inlineData)
-        if (!session._liveAudioLogged) { session._liveAudioLogged = true; console.log('[video-live] receiving audio from Live API (client forwarding not wired yet)'); }
+        try {
+          const pcm = Buffer.from(p.inlineData.data, 'base64');
+          if (pcm.length && session.ws && session.ws.readyState === 1) {
+            session.ws.send(Buffer.concat([LIVE_AUDIO_MAGIC, pcm]), { binary: true });
+          }
+        } catch { /* one dropped chunk ≠ dead lane */ }
       }
     }
   }
@@ -185,7 +205,9 @@ function forwardAudio(session, b64pcm16k) {
   const gws = session._liveWs;
   if (!session.liveOn || !gws || gws.readyState !== 1) return;
   try {
-    gws.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: b64pcm16k }] } }));
+    // realtimeInput.mediaChunks is DEPRECATED-REJECTED (verified July 16 2026:
+    // server 1007-closes with "Use audio, video, or text instead").
+    gws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: 'audio/pcm;rate=16000', data: b64pcm16k } } }));
   } catch { /* fail-soft */ }
 }
 
@@ -194,14 +216,20 @@ function forwardFrame(session, b64jpeg) {
   const gws = session._liveWs;
   if (!session.liveOn || !gws || gws.readyState !== 1) return;
   try {
-    gws.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: b64jpeg }] } }));
+    gws.send(JSON.stringify({ realtimeInput: { video: { mimeType: 'image/jpeg', data: b64jpeg } } }));
   } catch { /* fail-soft */ }
 }
 
 function stopLive(session, reason) {
   if (session._liveTick) { clearInterval(session._liveTick); session._liveTick = null; }
-  if (session.liveOn && session._liveTickAt) addSeconds(session.userId, (Date.now() - session._liveTickAt) / 1000);
+  if (session.liveOn && session._liveTickAt) {
+    const secs = (Date.now() - session._liveTickAt) / 1000;
+    addSeconds(session.userId, secs);
+    session.liveSecondsTotal = Number(session.liveSecondsTotal || 0) + secs;
+  }
   session.liveOn = false;
+  // Flush any Live audio still queued in the browser so "live off" is instant.
+  try { session.sendClear && session.sendClear(); } catch {}
   const gws = session._liveWs;
   session._liveWs = null;
   if (gws) { try { gws.close(); } catch {} }
@@ -227,3 +255,5 @@ function handleLiveMsg(session, msg, speak) {
 }
 
 module.exports = { enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft };
+// Exported for the pre-push test harness only — not called across modules.
+module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl };
