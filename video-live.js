@@ -49,6 +49,17 @@ const LIVE_ACK_FILE = path.join(DATA_DIR, 'live-ack.json');
 
 const enabled = () => process.env.LIVE_ENABLED === 'true' && !!process.env.GOOGLE_LIVE_API_KEY;
 const capMinutes = () => parseInt(process.env.LIVE_DAILY_MINUTES_CAP || '15', 10);
+// ADMIN CAP EXEMPTION (July 17 2026, Kade's call: "remove the fifteen minute
+// limit on video calls for the admin. Me."): accounts listed here ignore the
+// daily live-minutes cap entirely. Metering still records their seconds (the
+// usage dashboard stays honest) -- they just never get cut off. Env-tunable,
+// comma-separated emails, no redeploy of code needed to add someone.
+const exemptEmails = () => String(process.env.LIVE_CAP_EXEMPT_EMAILS || 'kademurdock@gmail.com')
+  .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
+const capExempt = (session) => {
+  try { return !!session && exemptEmails().includes(String(session.lcEmail || '').toLowerCase()); }
+  catch { return false; }
+};
 const liveModel = () => process.env.LIVE_MODEL || 'models/gemini-3.1-flash-live-preview';
 const LIVE_HOST = process.env.LIVE_WS_HOST || 'generativelanguage.googleapis.com';
 // Live API bidi endpoint. VERIFIED LIVE July 16 2026 (sandbox WS round-trip,
@@ -169,7 +180,7 @@ function startLive(session, speak) {
     try { session.jsonSend({ type: 'live-state', on: false, reason: 'disabled', message: "Live mode isn't switched on for this site yet — regular video works as always." }); } catch {}
     return;
   }
-  if (minutesLeft(session.userId) <= 0) {
+  if (!capExempt(session) && minutesLeft(session.userId) <= 0) {
     try { session.jsonSend({ type: 'live-state', on: false, reason: 'cap', message: OUT_OF_LIVE_LINE }); } catch {}
     if (speak) speak(session, OUT_OF_LIVE_LINE, session.voice).catch(() => {});
     return;
@@ -203,9 +214,13 @@ function handleGoogleMessage(session, raw) {
       addSeconds(session.userId, secs);
       session.liveSecondsTotal = Number(session.liveSecondsTotal || 0) + secs;
       session._liveTickAt = now;
-      if (minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
+      if (!capExempt(session) && minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
     }, 15000);
-    try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)), spotterName: effectiveSpotter(session).name }); } catch {}
+    try {
+      const st = { type: 'live-state', on: true, spotterName: effectiveSpotter(session).name };
+      if (!capExempt(session)) st.minutesLeft = Math.round(minutesLeft(session.userId));
+      session.jsonSend(st);
+    } catch {}
     // Hand-off hook (set by voice-stream): stands the snapshot video lane
     // down so its wall-clock meter stops while live owns the camera. Fired
     // AFTER the live-state send so the client flips its live flag first and

@@ -29,6 +29,14 @@ const ACK_FILE = path.join(DATA_DIR, 'video-ack.json');
 
 const enabled = () => process.env.VIDEO_ENABLED === 'true';
 const capMinutes = () => parseInt(process.env.VIDEO_DAILY_MINUTES_CAP || '45', 10);
+// ADMIN CAP EXEMPTION (July 17 2026, mirrors video-live.js): listed accounts
+// ignore the daily video-minutes cap; metering still records for the dashboard.
+const exemptEmails = () => String(process.env.VIDEO_CAP_EXEMPT_EMAILS || 'kademurdock@gmail.com')
+  .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
+const capExempt = (session) => {
+  try { return !!session && exemptEmails().includes(String(session.lcEmail || '').toLowerCase()); }
+  catch { return false; }
+};
 const modelFor = (mode) =>
   mode === 'hq'
     ? (process.env.KADE_VIDEO_MODEL_HQ || 'google/gemini-3.1-pro-preview')
@@ -329,7 +337,7 @@ function startMeters(session, speak) {
     session._videoTickAt = now;
     addSeconds(session.userId, delta);
     session.videoSeconds = (session.videoSeconds || 0) + delta;
-    if (minutesLeft(session.userId) <= 0) {
+    if (!capExempt(session) && minutesLeft(session.userId) <= 0) {
       stopVideo(session, 'cap');
       if (speak) speak(session, OUT_OF_MINUTES_LINE, session.voice).catch(() => {});
     }
@@ -366,7 +374,7 @@ function handleVideoMsg(session, msg, speak) {
       session.jsonSend({ type: 'video-state', on: false, reason: 'disabled', message: "Video calls aren't switched on for this site yet — voice works as always." });
       return;
     }
-    if (minutesLeft(session.userId) <= 0) {
+    if (!capExempt(session) && minutesLeft(session.userId) <= 0) {
       session.jsonSend({ type: 'video-state', on: false, reason: 'cap', message: OUT_OF_MINUTES_LINE });
       if (speak) speak(session, OUT_OF_MINUTES_LINE, session.voice).catch(() => {});
       return;
@@ -390,7 +398,11 @@ function handleVideoMsg(session, msg, speak) {
     session.videoMode = mode;
     session.sceneDesc = null;
     startMeters(session, speak);
-    session.jsonSend({ type: 'video-state', on: true, mode, minutesLeft: Math.round(minutesLeft(session.userId)) });
+    {
+      const st = { type: 'video-state', on: true, mode };
+      if (!capExempt(session)) st.minutesLeft = Math.round(minutesLeft(session.userId));
+      session.jsonSend(st);
+    }
     console.log(`[video-sight] video ON (${mode}) user=${session.userId} left=${Math.round(minutesLeft(session.userId))}min model=${modelFor(mode)}`);
   } catch (e) {
     console.log('[video-sight] toggle failed:', e && e.message);
