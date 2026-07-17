@@ -1397,6 +1397,30 @@ app.post('/outbound-call', async (req, res) => {
   //   family     -> "Hey — it's Kiana, Kade's A I. <mission>"
   //   stranger   -> full disclosure, exactly as before
   const calleeRec = users.get(e164);
+  // July 17 2026 (Kade caught this live: a real call went out to a registered
+  // family number while the greeting/purpose were built around a DIFFERENT
+  // name -- the model wanted to reach someone it called "Iris" but the number
+  // it dialed actually belongs to a different registered contact). Cheap,
+  // fail-soft sanity check, runs BEFORE any TTS synth or Twilio dialing: if
+  // this number belongs to someone in the registry, the name the model
+  // thinks it is calling has to actually match that record.
+  if (calleeRec && calleeName) {
+    const norm = (s) => String(s || '').toLowerCase().trim();
+    const registeredFirst = norm(calleeRec.name).split(/\s+/)[0];
+    const saidFirst = norm(calleeName).split(/\s+/)[0];
+    const matches = registeredFirst && saidFirst && (
+      registeredFirst === saidFirst ||
+      norm(calleeRec.name).includes(saidFirst) ||
+      norm(calleeName).includes(registeredFirst)
+    );
+    if (!matches) {
+      console.warn(`[outbound] BLOCKED name mismatch: ${e164} belongs to "${calleeRec.name}" in the registry, call was built for "${calleeName}"`);
+      return res.status(409).json({
+        error: `That number belongs to ${calleeRec.name} in your registry, not ${calleeName}. Double-check who you mean to call -- if you do not have a real number for ${calleeName}, say so instead of guessing.`,
+      });
+    }
+  }
+
   const ownAgent = !!(calleeRec && calleeRec.agentId === (agentId || DEFAULT_AGENT));
   const introText = ownAgent
     ? `It's ${agentName || DEFAULT_AGENT_NAME}! ${framePurpose(purpose)}`
