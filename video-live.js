@@ -92,17 +92,42 @@ function setAck(uid) { if (!uid) return; const a = loadJson(LIVE_ACK_FILE, {}); 
 const OUT_OF_LIVE_LINE =
   "You've used today's live-mode minutes — live mode is the most expensive thing on the site, so it gets a small daily allowance. Regular video and voice still work, and live mode refills at midnight.";
 function firstUseNotice(session) {
-  const nm = session && session.spotter && session.spotter.name ? session.spotter.name : null;
+  const eff = effectiveSpotter(session);
   return (
-    `Quick heads-up, first time only: live mode hands this call to ${nm ? nm + ', your Spotter' : 'your Spotter'} — a live companion with continuous sight and instant back-and-forth, running on a different, more expensive engine with its own small daily allowance of ${capMinutes()} minutes, separate from regular video. ` +
-    `${nm ? nm + ' has' : 'They have'} their own voice, and they may chime in on their own when something's worth mentioning — that's the point. ` +
-    (nm ? '' : 'You can name them, pick their voice, and shape their personality anytime under Explore, Your Spotter. ') +
-    `Say "live off" or press the button again anytime and I'll take the call back. Want me to put ${nm || 'them'} on?`
+    `Quick heads-up, first time only: live mode hands this call to ${eff.name}, your Spotter — a live companion with continuous sight and instant back-and-forth, running on a different, more expensive engine with its own small daily allowance of ${capMinutes()} minutes, separate from regular video. ` +
+    `${eff.name} has their own voice, and they may chime in on their own when something's worth mentioning — that's the point. ` +
+    (eff.isCustom ? '' : `${eff.name} is the starter Spotter everyone gets — you can rename them, pick their voice, and shape their personality anytime under Explore, Your Spotter. `) +
+    `Say "live off" or press the button again anytime and I'll take the call back. Want me to put ${eff.name} on?`
   );
 }
 
 /* ---------- session plumbing (relay skeleton) */
 const SPOTTER_VOICE_IDS = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr']);
+
+// STARTER SPOTTER (July 16 2026, Kade's call): accounts that never visit
+// /spotter still get a real SOMEBODY — a name to ask for, a consistent voice,
+// a personality — instead of a nameless engine. Scout is deliberately
+// likable-generic; a saved custom Spotter overrides field by field, and the
+// /spotter page tells people Scout is theirs to keep or replace.
+const DEFAULT_SPOTTER = {
+  name: 'Scout',
+  voice: 'Zephyr',
+  persona:
+    'You are warm, quick, and clear — a natural noticer who loves being useful. ' +
+    'You give the headline first, then detail if they want it. You are honest when you are not sure of what you are seeing: say so plainly and suggest what would help (steadier hand, more light, closer). ' +
+    'You are gently funny, never at the caller\'s expense, and you never waste their time.',
+};
+function effectiveSpotter(session) {
+  const sp = (session && session.spotter) || {};
+  const name = String(sp.name || '').trim();
+  const persona = String(sp.persona || '').trim();
+  return {
+    name: name || DEFAULT_SPOTTER.name,
+    voice: SPOTTER_VOICE_IDS.has(sp.voice) ? sp.voice : DEFAULT_SPOTTER.voice,
+    persona: persona || DEFAULT_SPOTTER.persona,
+    isCustom: !!(name || persona),
+  };
+}
 
 function buildSetupMessage(session) {
   // SPOTTER model (July 16 2026, Kade's design): the live lane is NOT the
@@ -111,24 +136,20 @@ function buildSetupMessage(session) {
   // Live voices, all verified accepted), and personality-build at /spotter.
   // Same Spotter no matter which character the call started with, so the
   // voice change is a handoff to somebody they know, not a fourth-wall break.
-  const sp = session.spotter || {};
-  const spotterName = String(sp.name || '').trim().slice(0, 40);
-  const personality = String(sp.persona || '').trim().slice(0, 4000);
+  const eff = effectiveSpotter(session);
   const base =
-    `You are ${spotterName || 'the caller\'s Spotter'}, the personal live companion ("Spotter") of ${session.callerName || 'the caller'}, on a live video call. ` +
+    `You are ${eff.name}, the personal live companion ("Spotter") of ${session.callerName || 'the caller'}, on a live video call. ` +
     'They may be blind or low-vision — describe what matters, read text word for word when asked, give spatial layout (left, right, ahead, rough distance), and warn about hazards. ' +
     'Speak up on your own when something genuinely worth mentioning happens or appears; otherwise let them lead. ' +
-    `You are not ${session.agentName || 'the character'} — you are ${spotterName || 'their Spotter'}, and they know you took over the call for live mode.`;
+    `You are not ${session.agentName || 'the character'} — you are ${eff.name}, and they know you took over the call for live mode.`;
   const personaText =
     (session.livePersona && String(session.livePersona).slice(0, 8000)) ||
-    (personality ? `${base}\n\nYour personality, as they designed you: ${personality}` : base);
+    `${base}\n\nYour personality${eff.isCustom ? ', as they designed you' : ''}: ${eff.persona}`;
   const generationConfig = {
     responseModalities: ['AUDIO'],
-  };
-  if (SPOTTER_VOICE_IDS.has(sp.voice)) {
     // Verified July 16 2026: all 8 prebuilt names accepted on this model.
-    generationConfig.speechConfig = { voiceConfig: { prebuiltVoiceConfig: { voiceName: sp.voice } } };
-  }
+    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: eff.voice } } },
+  };
   return {
     setup: {
       model: liveModel(),
@@ -184,7 +205,7 @@ function handleGoogleMessage(session, raw) {
       session._liveTickAt = now;
       if (minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
     }, 15000);
-    try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)), spotterName: (session.spotter && session.spotter.name) || null }); } catch {}
+    try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)), spotterName: effectiveSpotter(session).name }); } catch {}
     // Hand-off hook (set by voice-stream): stands the snapshot video lane
     // down so its wall-clock meter stops while live owns the camera. Fired
     // AFTER the live-state send so the client flips its live flag first and
@@ -278,7 +299,7 @@ function handleLiveMsg(session, msg, speak) {
     // serial playback chain client-side, so this line finishes before the
     // Spotter's first word. Keep a speak handle for the return line too.
     session._liveSpeak = speak || null;
-    const nm = session.spotter && session.spotter.name ? session.spotter.name : 'your Spotter';
+    const nm = effectiveSpotter(session).name;
     if (speak) speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
     startLive(session, speak);
   } catch (e) {
@@ -286,6 +307,6 @@ function handleLiveMsg(session, msg, speak) {
   }
 }
 
-module.exports = { enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft };
+module.exports = { enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
 // Exported for the pre-push test harness only — not called across modules.
 module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl };

@@ -850,11 +850,11 @@ async function handleUtterance(session, text) {
     // Anything else falls through as a normal turn — treat it as "not now."
   }
   if (session.media === 'wav') { // WEB calls only — the live lane's audio path is browser-shaped, never Twilio's
-    const spotEsc = session.spotter && session.spotter.name
-      ? session.spotter.name.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&')
-      : null;
+    // effectiveSpotter always has a name (Scout, the starter, when the
+    // account never built one) — so "get Scout" works for everybody.
+    const spotEsc = videoLive.effectiveSpotter(session).name.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&');
     const liveAsk = new RegExp(
-      `\\b(?:talk to|get|call|put on|bring(?: on)?|switch(?: me)? to)\\s+(?:my\\s+)?(?:spotter${spotEsc ? '|' + spotEsc : ''})\\b`,
+      `\\b(?:talk to|get|call|put on|bring(?: on)?|switch(?: me)? to)\\s+(?:my\\s+)?(?:spotter|${spotEsc})\\b`,
       'i',
     );
     if (liveAsk.test(text)) {
