@@ -371,13 +371,13 @@ function handleVideoMsg(session, msg, speak) {
       if (speak) speak(session, OUT_OF_MINUTES_LINE, session.voice).catch(() => {});
       return;
     }
-    // KADE July 16 2026 (later still): child-registered accounts are capped
-    // to standard video regardless of what they ask for -- HQ is the
-    // expensive best-eyes lane meant for blind/low-vision describe-on-demand,
-    // kids on the account are mostly sighted family poking around. Client UI
-    // reflects whatever mode the server actually returns (onVideoEvent reads
-    // m.mode, not what it requested), so this is never a silent mismatch.
-    const mode = (msg.mode === 'hq' && !session.childCaller) ? 'hq' : 'standard';
+    // KADE July 16 2026 (late night): ONE video quality — HQ for EVERYONE,
+    // kids included (her explicit call, cost stated: ~$0.007/min vs standard's
+    // ~$0.001, worst case ~$0.32/user/day under the existing 45-min cap).
+    // Three modes (standard/HQ/live) confused people; now it's Video and your
+    // Spotter, that's it. The standard lane's code stays (env-controlled
+    // models/cadence), it just can't be reached from a toggle anymore.
+    const mode = 'hq';
     if (!hasAck(session.userId) && !msg.ack) {
       const text = firstUseNotice();
       session.jsonSend({ type: 'video-notice', text, mode });

@@ -91,32 +91,48 @@ function setAck(uid) { if (!uid) return; const a = loadJson(LIVE_ACK_FILE, {}); 
 
 const OUT_OF_LIVE_LINE =
   "You've used today's live-mode minutes — live mode is the most expensive thing on the site, so it gets a small daily allowance. Regular video and voice still work, and live mode refills at midnight.";
-function firstUseNotice() {
+function firstUseNotice(session) {
+  const nm = session && session.spotter && session.spotter.name ? session.spotter.name : null;
   return (
-    `Quick heads-up, first time only: live mode streams continuous video and audio to a different, more expensive engine — it gets its own small daily allowance of ${capMinutes()} minutes, separate from regular video. ` +
-    'Two honest differences while live mode is on: my voice will sound different (the live engine speaks for itself), and I may occasionally chime in on my own when I see something worth mentioning — that is the point of live mode. ' +
-    'Say "live off" or press the button again to go back to normal anytime. Confirm to start.'
+    `Quick heads-up, first time only: live mode hands this call to ${nm ? nm + ', your Spotter' : 'your Spotter'} — a live companion with continuous sight and instant back-and-forth, running on a different, more expensive engine with its own small daily allowance of ${capMinutes()} minutes, separate from regular video. ` +
+    `${nm ? nm + ' has' : 'They have'} their own voice, and they may chime in on their own when something's worth mentioning — that's the point. ` +
+    (nm ? '' : 'You can name them, pick their voice, and shape their personality anytime under Explore, Your Spotter. ') +
+    `Say "live off" or press the button again anytime and I'll take the call back. Want me to put ${nm || 'them'} on?`
   );
 }
 
 /* ---------- session plumbing (relay skeleton) */
+const SPOTTER_VOICE_IDS = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr']);
+
 function buildSetupMessage(session) {
-  // The character's persona carries into the Live session via systemInstruction.
-  // session.persona is not currently threaded into web sessions — the tuning
-  // session should pull the agent's instructions the same way the greeting
-  // path does, or accept a generic live-eyes persona for v1.
+  // SPOTTER model (July 16 2026, Kade's design): the live lane is NOT the
+  // character wearing a different voice — it's the caller's own SPOTTER, a
+  // personal live companion they name, voice (one of Google's 8 prebuilt
+  // Live voices, all verified accepted), and personality-build at /spotter.
+  // Same Spotter no matter which character the call started with, so the
+  // voice change is a handoff to somebody they know, not a fourth-wall break.
+  const sp = session.spotter || {};
+  const spotterName = String(sp.name || '').trim().slice(0, 40);
+  const personality = String(sp.persona || '').trim().slice(0, 4000);
+  const base =
+    `You are ${spotterName || 'the caller\'s Spotter'}, the personal live companion ("Spotter") of ${session.callerName || 'the caller'}, on a live video call. ` +
+    'They may be blind or low-vision — describe what matters, read text word for word when asked, give spatial layout (left, right, ahead, rough distance), and warn about hazards. ' +
+    'Speak up on your own when something genuinely worth mentioning happens or appears; otherwise let them lead. ' +
+    `You are not ${session.agentName || 'the character'} — you are ${spotterName || 'their Spotter'}, and they know you took over the call for live mode.`;
   const personaText =
     (session.livePersona && String(session.livePersona).slice(0, 8000)) ||
-    `You are ${session.agentName || 'the caller\'s AI companion'} on a live video call with ${session.callerName || 'the caller'}, who may be blind or low-vision. ` +
-    'Describe what matters, read text word for word when asked, give spatial layout (left/right/ahead, rough distance), and warn about hazards. ' +
-    'Speak up on your own only when something genuinely worth mentioning happens or appears; otherwise let the caller lead.';
+    (personality ? `${base}\n\nYour personality, as they designed you: ${personality}` : base);
+  const generationConfig = {
+    responseModalities: ['AUDIO'],
+  };
+  if (SPOTTER_VOICE_IDS.has(sp.voice)) {
+    // Verified July 16 2026: all 8 prebuilt names accepted on this model.
+    generationConfig.speechConfig = { voiceConfig: { prebuiltVoiceConfig: { voiceName: sp.voice } } };
+  }
   return {
     setup: {
       model: liveModel(),
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        // speechConfig / voice selection: pick at tuning time.
-      },
+      generationConfig,
       systemInstruction: { parts: [{ text: personaText }] },
       // Proactive audio — the model decides when to speak. VERIFIED July 16
       // 2026: on v1alpha this field lives at the TOP LEVEL of `setup` (NOT
@@ -168,7 +184,7 @@ function handleGoogleMessage(session, raw) {
       session._liveTickAt = now;
       if (minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
     }, 15000);
-    try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)) }); } catch {}
+    try { session.jsonSend({ type: 'live-state', on: true, minutesLeft: Math.round(minutesLeft(session.userId)), spotterName: (session.spotter && session.spotter.name) || null }); } catch {}
     // Hand-off hook (set by voice-stream): stands the snapshot video lane
     // down so its wall-clock meter stops while live owns the camera. Fired
     // AFTER the live-state send so the client flips its live flag first and
@@ -234,6 +250,15 @@ function stopLive(session, reason) {
   session._liveWs = null;
   if (gws) { try { gws.close(); } catch {} }
   try { session.jsonSend({ type: 'live-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) }); } catch {}
+  // The RETURN, in the character's own voice — closes the handoff fiction.
+  // Skipped when the socket is going away (hangup/close/error) — nobody's
+  // listening and speak would race the teardown.
+  if (session._liveSpeak && !['hangup', 'closed', 'error'].includes(String(reason))) {
+    const back = reason === 'cap'
+      ? `${OUT_OF_LIVE_LINE} It's ${session.agentName || 'me'} again — I've got you from here.`
+      : `It's ${session.agentName || 'me'} again — I've got you.`;
+    try { session._liveSpeak(session, back, session.voice).catch(() => {}); } catch {}
+  }
 }
 
 /** WS {type:'live'} toggle from the client (client button not built yet). */
@@ -242,12 +267,19 @@ function handleLiveMsg(session, msg, speak) {
     if (!msg.on) { stopLive(session, 'off'); return; }
     if (!enabled()) { startLive(session, speak); return; } // sends the disabled notice
     if (!hasAck(session.userId) && !msg.ack) {
-      const text = firstUseNotice();
+      const text = firstUseNotice(session);
       try { session.jsonSend({ type: 'live-notice', text }); } catch {}
       if (speak) speak(session, text, session.voice).catch(() => {});
       return;
     }
     if (msg.ack) setAck(session.userId);
+    // The HANDOFF, in the character's own voice — the realism dressing Kade
+    // asked for. Ordering is safe: Inworld clips and Live PCM share one
+    // serial playback chain client-side, so this line finishes before the
+    // Spotter's first word. Keep a speak handle for the return line too.
+    session._liveSpeak = speak || null;
+    const nm = session.spotter && session.spotter.name ? session.spotter.name : 'your Spotter';
+    if (speak) speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
     startLive(session, speak);
   } catch (e) {
     console.log('[video-live] toggle failed:', e && e.message);

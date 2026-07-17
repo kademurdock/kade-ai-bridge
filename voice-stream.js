@@ -834,9 +834,34 @@ async function handleUtterance(session, text) {
   if (session.liveOn) {
     if (/\b(?:live\s*(?:mode\s*)?(?:off|stop|end|quit|done)|(?:stop|end|turn\s+off|kill)\s+live(?:\s+mode)?)\b/i.test(text)) {
       try { videoLive.stopLive(session, 'voice-off'); } catch {}
-      try { await speak(session, 'Live mode off — back to normal. Go ahead.', session.voice); } catch {}
     }
     return;
+  }
+  // SPOTTER voice invocation (July 16 2026): "get/talk to/call my Spotter" —
+  // or their custom name — hands the call to the live lane, same path as the
+  // client's radio button. First use still walks through the spoken cost
+  // notice; the caller confirms BY VOICE (below) or with the on-screen button.
+  if (session._awaitLiveConfirm && session.media === 'wav') {
+    session._awaitLiveConfirm = false;
+    if (/\b(?:yes|yeah|yep|sure|confirm|do it|go ahead|start it|okay|ok)\b/i.test(text) && text.length < 60) {
+      try { videoLive.handleLiveMsg(session, { on: true, ack: true }, speak); } catch {}
+      return;
+    }
+    // Anything else falls through as a normal turn — treat it as "not now."
+  }
+  if (session.media === 'wav') { // WEB calls only — the live lane's audio path is browser-shaped, never Twilio's
+    const spotEsc = session.spotter && session.spotter.name
+      ? session.spotter.name.replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&')
+      : null;
+    const liveAsk = new RegExp(
+      `\\b(?:talk to|get|call|put on|bring(?: on)?|switch(?: me)? to)\\s+(?:my\\s+)?(?:spotter${spotEsc ? '|' + spotEsc : ''})\\b`,
+      'i',
+    );
+    if (liveAsk.test(text)) {
+      session._awaitLiveConfirm = true; // harmless if the lane starts immediately (already acked)
+      try { videoLive.handleLiveMsg(session, { on: true }, speak); } catch {}
+      return;
+    }
   }
   // July 12 2026: voicemail mode — the "person" is a recording. No turns,
   // no thinking sounds; handleAmdResult speaks one message and hangs up.
@@ -2669,7 +2694,17 @@ function attachWebVoice(server) {
           userId:      t.uid || null,
         };
         session = new WebCallSession(`web:${t.email}`, user, ws, cfg);
-        console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice}`);
+        // SPOTTER (July 16 2026): the account's personal live companion rides
+        // in on the ticket (name + one of the 8 Google Live voices + persona,
+        // designed at kademurdock.com/spotter). Missing/null = generic Spotter.
+        session.spotter = (t.spotter && typeof t.spotter === 'object')
+          ? {
+              name: String(t.spotter.name || '').slice(0, 40),
+              voice: String(t.spotter.voice || '').slice(0, 24),
+              persona: String(t.spotter.persona || '').slice(0, 4000),
+            }
+          : null;
+        console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice} spotter=${session.spotter ? session.spotter.name + '/' + session.spotter.voice : 'none'}`);
         // July 13 2026 drift audit: web streaming calls never got the July 12
         // caller-memories fix — the phone had it, the sibling engine surface
         // didn't. Same fetch, and a web caller is live by definition, so
