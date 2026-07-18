@@ -2646,11 +2646,59 @@ async function clockPoke(job) {
 
 setInterval(async () => {
   if (process.env.CLOCK_ENABLED !== 'true' || !BRIDGE_SECRET) return;
-  // 1) Nudge sweep — every tick. Exact-minute delivery is the contract.
+  // 1) Nudge sweep. Default: every tick (exact-minute delivery, app stays
+  // awake). CLOCK_NUDGE_SMART=true (Phase 2, App Sleeping): only poke when
+  // (a) a reported reminder due-time has arrived, (b) the daily Central-time
+  // windows open (birthdays 9am / phone prompts 10am — the app's own
+  // once-per-day guards do the rest), or (c) the safety net says it's been
+  // CLOCK_SAFETY_HOURS (default 6) since the last sweep. A pre-wake /health
+  // ping fires ~2 min before a due reminder so a cold boot can't make it late.
   try {
-    await clockPoke('nudges');
-    clockLastPoke.nudges = new Date().toISOString();
-    clockLastPoke.ok = true;
+    let poke = true;
+    let why = 'everyTick';
+    if (process.env.CLOCK_NUDGE_SMART === 'true') {
+      poke = false;
+      why = '';
+      const nowMs = Date.now();
+      const dueMs = clockState.nextDueAt ? Date.parse(clockState.nextDueAt) : NaN;
+      if (!Number.isNaN(dueMs) && dueMs - nowMs > 0 && dueMs - nowMs <= 120000) {
+        // pre-wake: any HTTP request un-sleeps the Railway app; don't await
+        axios.get(`${LIBRECHAT_URL}/health`, { headers: { 'User-Agent': BROWSER_UA }, timeout: 110000 }).catch(() => {});
+      }
+      if (!Number.isNaN(dueMs) && nowMs >= dueMs) { poke = true; why = 'due'; }
+      const cp = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Chicago', hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit',
+      }).formatToParts(new Date()).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+      const cDay = `${cp.year}-${cp.month}-${cp.day}`;
+      const cHour = Number(cp.hour === '24' ? 0 : cp.hour);
+      const wantAM = cHour >= 9 && clockState.nudgesDailyAM !== cDay;
+      const wantPhone = cHour >= 10 && clockState.nudgesDailyPhone !== cDay;
+      if (wantAM || wantPhone) { poke = true; why = why || (wantAM ? 'dailyAM' : 'dailyPhone'); }
+      const safetyMs = (Number(process.env.CLOCK_SAFETY_HOURS) > 0 ? Number(process.env.CLOCK_SAFETY_HOURS) : 6) * 3600000;
+      const lastMs = clockLastPoke.nudges ? Date.parse(clockLastPoke.nudges) : 0;
+      if (nowMs - lastMs >= safetyMs) { poke = true; why = why || 'safety'; }
+      if (poke) {
+        // mark the daily windows served only once the poke SUCCEEDS (below);
+        // stash which ones this attempt covers
+        clockLastPoke.pendingAM = wantAM ? cDay : null;
+        clockLastPoke.pendingPhone = wantPhone ? cDay : null;
+      }
+    }
+    if (poke) {
+      const data = await clockPoke('nudges');
+      clockLastPoke.nudges = new Date().toISOString();
+      clockLastPoke.ok = true;
+      clockLastPoke.why = why;
+      let dirty = false;
+      if (clockLastPoke.pendingAM) { clockState.nudgesDailyAM = clockLastPoke.pendingAM; clockLastPoke.pendingAM = null; dirty = true; }
+      if (clockLastPoke.pendingPhone) { clockState.nudgesDailyPhone = clockLastPoke.pendingPhone; clockLastPoke.pendingPhone = null; dirty = true; }
+      if (data && Object.prototype.hasOwnProperty.call(data, 'nextDueAt')) {
+        const v = data.nextDueAt || null;
+        if (v !== clockState.nextDueAt) { clockState.nextDueAt = v; dirty = true; }
+      }
+      if (dirty) { try { fs.writeFileSync(CLOCK_FILE, JSON.stringify(clockState)); } catch { /* non-fatal */ } }
+    }
   } catch (e) {
     clockLastPoke.ok = false;
     console.error('[clock] nudges poke failed:', e.message);
@@ -2673,14 +2721,31 @@ setInterval(async () => {
   }
 }, 60 * 1000);
 
+// Phase 2 (App Sleeping): the fork's due-time reporter posts here whenever
+// the earliest pending reminder changes. null/absent = nothing scheduled.
+app.post('/clock/next-due', (req, res) => {
+  const h = req.get('x-kade-secret') || (req.body && req.body.secret);
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  const v = req.body ? req.body.nextDueAt : undefined;
+  if (v !== null && v !== undefined && Number.isNaN(Date.parse(v))) {
+    return res.status(400).json({ error: 'Bad nextDueAt' });
+  }
+  clockState.nextDueAt = v || null;
+  try { fs.writeFileSync(CLOCK_FILE, JSON.stringify(clockState)); } catch { /* non-fatal */ }
+  res.json({ ok: true, nextDueAt: clockState.nextDueAt });
+});
+
 // Observability: GET /clock/status?secret=... (or x-kade-secret header)
 app.get('/clock/status', (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
   if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   res.json({
     enabled: process.env.CLOCK_ENABLED === 'true',
+    smartNudges: process.env.CLOCK_NUDGE_SMART === 'true',
+    nextDueAt: clockState.nextDueAt || null,
     lastNudgePoke: clockLastPoke.nudges,
     lastNudgeOk: clockLastPoke.ok,
+    lastNudgeWhy: clockLastPoke.why || null,
     lastRuns: clockState,
   });
 });
