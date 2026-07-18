@@ -2545,6 +2545,65 @@ attachMediaStreams(server, users, {
 // above, so this call must stay AFTER it.
 attachWebVoice(server);
 
+// ── WEEKLY MEMORY CONSOLIDATION (July 18 2026) ────────────────────────────────
+// The "weekly Sunday consolidation" existed in docs and memories but NOTHING
+// ever scheduled it — the fork's /api/memories/consolidate is on-demand only,
+// which is why duplicate memories accumulated unchecked (the July 12 wave sat
+// in Cadence's per-agent bucket). This timer makes the myth real: Sundays at
+// 04:00 Central it consolidates the shared bucket plus the agent buckets that
+// demonstrably accumulate copies. Fail-soft everywhere: a failed pass logs and
+// waits for next Sunday; it can never touch a call. Env overrides:
+//   MEMCONSOLIDATE_ENABLED=false          — kill switch (default on)
+//   MEMCONSOLIDATE_HOUR=4                 — Central hour to run
+//   MEMCONSOLIDATE_AGENT_IDS=id1,id2,...  — extra buckets (replaces default list)
+const MEMCONSOLIDATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'memconsolidate.json');
+const MEMCONSOLIDATE_DEFAULT_AGENTS = [
+  'agent_6llV0eMu4fmIaj8f2x1Sb', // Kiana (default agent — most sessions)
+  'agent_CTNCCJTVgl8XZnI1TTvNu', // Cadence (carried the July-12 dupe wave)
+  'agent_9YHpms0vJoApICwshh0mR', // Lyric (audio sessions)
+  'agent_fvTgx_UX145npdwfcP5e7', // Rio (video/animation sessions)
+  'agent_FFecOqZ6hHCVpY507-VAD', // Forge (ops memories must stay clean)
+];
+setInterval(async () => {
+  try {
+    if (process.env.MEMCONSOLIDATE_ENABLED === 'false') return;
+    const now = new Date();
+    const dow = now.toLocaleDateString('en-US', { timeZone: 'America/Chicago', weekday: 'short' }).toLowerCase().slice(0, 3);
+    const hour = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', hour12: false }), 10);
+    if (dow !== 'sun' || hour !== parseInt(process.env.MEMCONSOLIDATE_HOUR || '4', 10)) return;
+    const day = now.toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
+    let state = {};
+    try { state = JSON.parse(fs.readFileSync(MEMCONSOLIDATE_FILE, 'utf8')); } catch { /* first run */ }
+    if (state.lastRun === day) return;
+    state.lastRun = day; // set first so a slow pass can't double-fire
+    try { fs.writeFileSync(MEMCONSOLIDATE_FILE, JSON.stringify(state)); } catch { /* meter loss ≠ job loss */ }
+    const token = await getLCToken();
+    const buckets = [null].concat(
+      (process.env.MEMCONSOLIDATE_AGENT_IDS
+        ? process.env.MEMCONSOLIDATE_AGENT_IDS.split(',').map((s) => s.trim()).filter(Boolean)
+        : MEMCONSOLIDATE_DEFAULT_AGENTS),
+    );
+    let ran = 0, skipped = 0, failed = 0;
+    for (const agentId of buckets) {
+      try {
+        const r = await axios.post(
+          `${LIBRECHAT_URL}/api/memories/consolidate`,
+          agentId ? { agentId } : {},
+          { headers: { Authorization: `Bearer ${token}`, 'User-Agent': BROWSER_UA }, timeout: 60000 },
+        );
+        if (r.data && r.data.ran) ran++; else skipped++;
+      } catch (e) {
+        failed++;
+        console.error(`[memconsolidate] bucket ${agentId || 'shared'} failed: ${e.message}`);
+      }
+      await new Promise((res) => setTimeout(res, 5000)); // pace like everything else on this site
+    }
+    console.log(`[memconsolidate] weekly pass done: ran=${ran} empty=${skipped} failed=${failed}`);
+  } catch (e) {
+    console.error('[memconsolidate] tick error:', e.message);
+  }
+}, 10 * 60 * 1000); // check every 10 min; the lastRun guard makes it fire once per Sunday
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
