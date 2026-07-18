@@ -2554,7 +2554,13 @@ class WebCallSession extends CallSession {
 
 function verifyWebTicket(ticket) {
   const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
-  if (!secret || !ticket || typeof ticket !== 'string' || ticket.length > 4096) return null;
+  // July 18 2026: guard raised 4096 -> 20480. The ticket carries the caller's
+  // Spotter persona (cap 12,000 chars since July 17), and base64url inflates
+  // the payload by 4/3 — a full-length persona makes a ~17KB ticket. The old
+  // 4096 guard silently 4401'd every streaming call from any account with a
+  // long custom Spotter (Kade's, since the Whittney upgrade), dropping the app
+  // to the classic engine (no barge-in) with the Spotter ask never sent.
+  if (!secret || !ticket || typeof ticket !== 'string' || ticket.length > 20480) return null;
   const dot = ticket.lastIndexOf('.');
   if (dot < 1) return null;
   const body = ticket.slice(0, dot);
