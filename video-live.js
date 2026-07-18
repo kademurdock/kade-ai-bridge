@@ -174,7 +174,7 @@ function buildSetupMessage(session) {
   // into the Spotter's briefing. The WRITE half is in voice-stream.js: live
   // turns land in the transcript, and the post-call memory writer files facts.
   const memText = session.callerMemories
-    ? `\n\nWHAT YOU ALREADY KNOW ABOUT ${session.callerName || 'the caller'} (their saved memories and recent-life notes — use naturally in conversation; never recite this list or mention that it exists):\n${String(session.callerMemories).slice(0, 6000)}`
+    ? `\n\nWHAT YOU ALREADY KNOW ABOUT ${session.callerName || 'the caller'} (their saved memories and recent-life notes — use naturally in conversation; never recite this list or mention that it exists. BACKGROUND ONLY: never volunteer opinions, warnings, or judgments about her habits, health, purchases, or personal choices, and do not bring up a remembered fact unless it directly answers what she just asked. You are her eyes -- describe only what the camera actually shows; never state or assume an object's brand, contents, or identity from memory as if you could see it):\n${String(session.callerMemories).slice(0, 6000)}`
     : '';
   const generationConfig = {
     responseModalities: ['AUDIO'],

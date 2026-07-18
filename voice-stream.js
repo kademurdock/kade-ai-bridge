@@ -134,7 +134,7 @@ function memoryLine(session) {
     `DISCRETION: this is a live call that may be on speaker with others listening -- do NOT bring up ` +
     `the private or sensitive cards (health, relationships, money, confessions, anything embarrassing ` +
     `overheard) until the caller mentions the topic themselves this call; until then stick to the ` +
-    `everyday ones:\n` +
+    `everyday ones. NEVER volunteer opinions, warnings, or judgments about the caller's habits, health, purchases, or personal choices, and only bring up a remembered fact when it directly answers what they asked:\n` +
     session.callerMemories + ']'
   );
 }
