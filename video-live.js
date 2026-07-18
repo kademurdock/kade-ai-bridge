@@ -191,6 +191,15 @@ function buildSetupMessage(session) {
       // inside generationConfig — both nestings 1007-close on v1beta, and
       // generationConfig nesting closes on v1alpha too).
       proactivity: { proactiveAudio: true },
+      // OUTPUT TRANSCRIPTION (July 18 2026, Kade: "after a voice chat I can
+      // only see my half"): ask Google for a text transcript of the model's
+      // OWN spoken audio so the Spotter/live side lands in session.history too.
+      // The post-call ingest -> mint ("Voice chat with...") + memory writer
+      // then see BOTH halves instead of only the caller's Deepgram turns.
+      // Empty object = on; sits at setup TOP LEVEL (sibling of proactivity) on
+      // v1alpha. Fail-soft: if the field is ignored or no outputTranscription
+      // ever arrives, we simply fall back to today's caller-only transcript.
+      outputAudioTranscription: {},
     },
   };
 }
@@ -278,8 +287,25 @@ function handleGoogleMessage(session, raw) {
       }
     }
   }
-  if (msg.serverContent && msg.serverContent.interrupted) {
-    try { session.sendClear && session.sendClear(); } catch {}
+  // The model's OWN words, transcribed by Google from its spoken audio
+  // (present only because outputAudioTranscription is on in the setup). Text
+  // arrives incrementally across a turn, so accumulate, then commit ONE
+  // assistant message to session.history when the turn ends (or is cut off by
+  // a barge-in). This mirrors the caller's user turns (pushed in voice-stream
+  // handleUtterance) so the post-call transcript/mint/memory see both halves.
+  const sc = msg.serverContent;
+  if (sc) {
+    if (sc.outputTranscription && typeof sc.outputTranscription.text === 'string') {
+      session._liveModelText = (session._liveModelText || '') + sc.outputTranscription.text;
+    }
+    if (sc.turnComplete || sc.generationComplete || sc.interrupted) {
+      const t = (session._liveModelText || '').trim();
+      session._liveModelText = '';
+      if (t) { try { session.history.push({ role: 'assistant', content: t }); } catch {} }
+    }
+    if (sc.interrupted) {
+      try { session.sendClear && session.sendClear(); } catch {}
+    }
   }
 }
 
@@ -305,6 +331,12 @@ function forwardFrame(session, b64jpeg) {
 
 function stopLive(session, reason) {
   if (session._liveTick) { clearInterval(session._liveTick); session._liveTick = null; }
+  // Commit any half-finished model turn so a hangup mid-sentence still lands
+  // the Spotter's last words in the post-call transcript. Fail-soft.
+  if (session._liveModelText && session._liveModelText.trim()) {
+    try { session.history.push({ role: 'assistant', content: session._liveModelText.trim() }); } catch {}
+  }
+  session._liveModelText = '';
   if (session.liveOn && session._liveTickAt) {
     const secs = (Date.now() - session._liveTickAt) / 1000;
     addSeconds(session.userId, secs);
