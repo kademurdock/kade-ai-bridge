@@ -832,6 +832,13 @@ async function handleUtterance(session, text) {
   // Deepgram→LLM→Inworld turn pipeline stays parked, except for the spoken
   // escape hatch promised in the first-use notice ("say live off").
   if (session.liveOn) {
+    // July 18 2026 (Kade: "spotters should have memory too"): what the caller
+    // says while the Spotter has the call still lands in session.history, so
+    // the post-call transcript ingest + memory writer see it — telling the
+    // Spotter "that cat is Kasper" is remembered exactly like telling the
+    // character. (The Spotter's own replies are audio-only; the caller's words
+    // are where the durable facts live.)
+    try { session.history.push({ role: 'user', content: text }); } catch {}
     if (/\b(?:live\s*(?:mode\s*)?(?:off|stop|end|quit|done)|(?:stop|end|turn\s+off|kill)\s+live(?:\s+mode)?)\b/i.test(text)) {
       try { videoLive.stopLive(session, 'voice-off'); } catch {}
     }
@@ -2710,7 +2717,10 @@ function attachWebVoice(server) {
               persona: String(t.spotter.persona || '').slice(0, 12000),
             }
           : null;
-        console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice} spotter=${session.spotter ? session.spotter.name + '/' + session.spotter.voice : 'none'}`);
+        // Direct Spotter call (July 18 2026): the client asked for the Spotter
+        // from the first tap — the character never speaks on this call.
+        session._spotterDirect = msg.spotterDirect === true;
+        console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice} spotter=${session.spotter ? session.spotter.name + '/' + session.spotter.voice : 'none'}${session._spotterDirect ? ' DIRECT' : ''}`);
         // July 13 2026 drift audit: web streaming calls never got the July 12
         // caller-memories fix — the phone had it, the sibling engine surface
         // didn't. Same fetch, and a web caller is live by definition, so
@@ -2743,12 +2753,20 @@ function attachWebVoice(server) {
         // Short spoken greeting: a blind caller needs to HEAR the line is
         // live. One line, invitation LAST (the July 1 greeting lesson), and
         // it doubles as the interrupt orientation.
-        const first = (t.name || '').trim().split(/\s+/)[0] || null;
-        // KADE July 12 2026: interrupt-invite retired — short and natural.
-        const line = first
-          ? `Hey ${first}! ${session.agentName} here — go ahead.`
-          : `Hey! ${session.agentName} here — go ahead.`;
-        speak(session, line, session.voice).catch(() => {});
+        if (session._spotterDirect) {
+          // July 18 2026 (Kade: "do we have to have Ki answer and transfer?"):
+          // on a direct Spotter call the character stays SILENT — the client
+          // fires the live ask the moment the line opens and the Spotter says
+          // hello themselves. If live can't start (cap/disabled), those
+          // notices still speak in the character's voice, so no dead air.
+        } else {
+          const first = (t.name || '').trim().split(/\s+/)[0] || null;
+          // KADE July 12 2026: interrupt-invite retired — short and natural.
+          const line = first
+            ? `Hey ${first}! ${session.agentName} here — go ahead.`
+            : `Hey! ${session.agentName} here — go ahead.`;
+          speak(session, line, session.voice).catch(() => {});
+        }
         return;
       }
 

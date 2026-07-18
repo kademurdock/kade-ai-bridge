@@ -167,6 +167,15 @@ function buildSetupMessage(session) {
     (eff.persona.length >= 1500
       ? eff.persona + callContext
       : `${base}\n\nYour personality${eff.isCustom ? ', as they designed you' : ''}: ${eff.persona}`);
+  // MEMORY (July 18 2026, Kade: "spotters should have memory too — if I tell
+  // Whittney that cat is Kasper, she should remember"): the same formatted
+  // memory block the character lane rides on (shared + agent bucket + the
+  // relationship summary, fetched at hello into session.callerMemories) goes
+  // into the Spotter's briefing. The WRITE half is in voice-stream.js: live
+  // turns land in the transcript, and the post-call memory writer files facts.
+  const memText = session.callerMemories
+    ? `\n\nWHAT YOU ALREADY KNOW ABOUT ${session.callerName || 'the caller'} (their saved memories and recent-life notes — use naturally in conversation; never recite this list or mention that it exists):\n${String(session.callerMemories).slice(0, 6000)}`
+    : '';
   const generationConfig = {
     responseModalities: ['AUDIO'],
     // Verified July 16 2026: all 8 prebuilt names accepted on this model.
@@ -176,7 +185,7 @@ function buildSetupMessage(session) {
     setup: {
       model: liveModel(),
       generationConfig,
-      systemInstruction: { parts: [{ text: personaText }] },
+      systemInstruction: { parts: [{ text: personaText + memText }] },
       // Proactive audio — the model decides when to speak. VERIFIED July 16
       // 2026: on v1alpha this field lives at the TOP LEVEL of `setup` (NOT
       // inside generationConfig — both nestings 1007-close on v1beta, and
@@ -237,6 +246,17 @@ function handleGoogleMessage(session, raw) {
     // AFTER the live-state send so the client flips its live flag first and
     // knows to keep the camera rolling through the video-state off event.
     try { session.onLiveUp && session.onLiveUp(); } catch {}
+    // Direct Spotter call: nobody has spoken yet — the Spotter opens the line
+    // with one short hello instead of dead air. Fail-soft: if this turn is
+    // rejected, proactive audio still speaks on the first worthwhile frame.
+    if (session._liveGreet) {
+      session._liveGreet = false;
+      try {
+        session._liveWs && session._liveWs.send(JSON.stringify({
+          clientContent: { turns: [{ role: 'user', parts: [{ text: '(The call just connected. Greet me briefly by name, as yourself, and ask what I need — one short sentence.)' }] }], turnComplete: true },
+        }));
+      } catch { /* fail-soft */ }
+    }
     console.log(`[video-live] LIVE session up user=${session.userId} model=${liveModel()}`);
     return;
   }
@@ -325,8 +345,16 @@ function handleLiveMsg(session, msg, speak) {
     // serial playback chain client-side, so this line finishes before the
     // Spotter's first word. Keep a speak handle for the return line too.
     session._liveSpeak = speak || null;
-    const nm = effectiveSpotter(session).name;
-    if (speak) speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
+    // Direct Spotter call (July 18 2026): no in-character handoff line — the
+    // caller asked for the Spotter from the first tap, so the character
+    // talking over the transfer is exactly the spam Kade reported. The
+    // Spotter greets first instead (see _liveGreet in handleGoogleMessage).
+    const direct = msg.direct === true;
+    session._liveGreet = direct;
+    if (!direct && speak) {
+      const nm = effectiveSpotter(session).name;
+      speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
+    }
     startLive(session, speak);
   } catch (e) {
     console.log('[video-live] toggle failed:', e && e.message);
