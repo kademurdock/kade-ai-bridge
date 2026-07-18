@@ -2604,6 +2604,87 @@ setInterval(async () => {
   }
 }, 10 * 60 * 1000); // check every 10 min; the lastRun guard makes it fire once per Sunday
 
+// ── KADE CLOCK (July 18 2026) — the bridge is now the platform's alarm clock ──
+// Phase 1 of pulling every recurring timer out of the LibreChat app: the app
+// exposes on-demand sweep endpoints under /api/kade/clock/* (authed with the
+// shared BRIDGE_SECRET), and THIS block owns when they fire. The app's own
+// schedulers stand down once KADE_CLOCK_EXTERNAL=1 is set on the LibreChat
+// service; deleting that env is the instant fork-side revert, CLOCK_ENABLED
+// (unset/false) is the instant bridge-side one.
+//
+// Schedule (all UTC, matching what the fork ran in-process):
+//   nudges         every 60s      (reminders/birthdays/phone prompts — exact-time delivery)
+//   summary        daily  08:00   (KADE DREAMING relationship summaries + decay)
+//   restart        daily  10:00   (memory-hygiene exit; fork refuses if booted <2h)
+//   files          daily  11:00   (expired-file sweep)
+//   consolidation  weekly Sun 09:00 (platform-wide memory consolidation — NOTE:
+//                  this replaces BOTH the fork's sweep and the bucket-list
+//                  MEMCONSOLIDATE timer above; keep MEMCONSOLIDATE_ENABLED=false)
+//
+// Env: CLOCK_ENABLED=true to run; CLOCK_SUMMARY_HOUR / CLOCK_RESTART_HOUR /
+// CLOCK_FILES_HOUR / CLOCK_CONSOLIDATE_HOUR retune (UTC). lastRun state is
+// volume-persisted so redeploys can't double-fire dailies. Fail-soft: a failed
+// poke logs and retries next tick — never touches calls/SMS.
+const CLOCK_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'kadeclock.json');
+const CLOCK_JOBS = [
+  { name: 'summary', hourEnv: 'CLOCK_SUMMARY_HOUR', defHour: 8 },
+  { name: 'restart', hourEnv: 'CLOCK_RESTART_HOUR', defHour: 10 },
+  { name: 'files', hourEnv: 'CLOCK_FILES_HOUR', defHour: 11 },
+  { name: 'consolidation', hourEnv: 'CLOCK_CONSOLIDATE_HOUR', defHour: 9, weeklyDowUTC: 0 },
+];
+let clockState = {};
+try { clockState = JSON.parse(fs.readFileSync(CLOCK_FILE, 'utf8')); } catch { /* first run */ }
+const clockLastPoke = { nudges: null, ok: null };
+
+async function clockPoke(job) {
+  const r = await axios.post(`${LIBRECHAT_URL}/api/kade/clock/${job}`, {}, {
+    headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
+    timeout: 120000,
+  });
+  return r.data;
+}
+
+setInterval(async () => {
+  if (process.env.CLOCK_ENABLED !== 'true' || !BRIDGE_SECRET) return;
+  // 1) Nudge sweep — every tick. Exact-minute delivery is the contract.
+  try {
+    await clockPoke('nudges');
+    clockLastPoke.nudges = new Date().toISOString();
+    clockLastPoke.ok = true;
+  } catch (e) {
+    clockLastPoke.ok = false;
+    console.error('[clock] nudges poke failed:', e.message);
+  }
+  // 2) Dailies/weekly — wall-clock + persisted lastRun guard.
+  const now = new Date();
+  for (const job of CLOCK_JOBS) {
+    try {
+      if (now.getUTCHours() !== parseInt(process.env[job.hourEnv] || String(job.defHour), 10)) continue;
+      if (job.weeklyDowUTC !== undefined && now.getUTCDay() !== job.weeklyDowUTC) continue;
+      const dayKey = now.toISOString().slice(0, 10);
+      if (clockState[job.name] === dayKey) continue;
+      clockState[job.name] = dayKey; // set first so a slow pass can't double-fire
+      try { fs.writeFileSync(CLOCK_FILE, JSON.stringify(clockState)); } catch { /* state loss ≠ job loss */ }
+      const data = await clockPoke(job.name);
+      console.log(`[clock] ${job.name} fired:`, JSON.stringify(data).slice(0, 300));
+    } catch (e) {
+      console.error(`[clock] ${job.name} failed:`, e.message);
+    }
+  }
+}, 60 * 1000);
+
+// Observability: GET /clock/status?secret=... (or x-kade-secret header)
+app.get('/clock/status', (req, res) => {
+  const h = req.get('x-kade-secret') || req.query.secret;
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({
+    enabled: process.env.CLOCK_ENABLED === 'true',
+    lastNudgePoke: clockLastPoke.nudges,
+    lastNudgeOk: clockLastPoke.ok,
+    lastRuns: clockState,
+  });
+});
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
