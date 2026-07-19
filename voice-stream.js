@@ -89,6 +89,29 @@ const GAME_SUFFIX =
 const GAME_ACTIVE_MS = 10 * 60 * 1000;
 // Bigger synth units = better prosody (context batching, July 4 2026).
 const TTS_CHUNK_TARGET = parseInt(process.env.PHONE_TTS_CHUNK || '320', 10);
+/* KADE July 19 2026 (session 14, first confirmed-good native call): "it is
+ * still doing that weird, one sentence, big pause, more sentences, the
+ * sentence chunking thing. I feel like it could be a little speedier."
+ *
+ * That pause is this file's own design, working exactly as written: sentence
+ * one ships alone for fast first audio, and then EVERYTHING after it waits to
+ * accumulate TTS_CHUNK_TARGET (320) characters before a single synth call.
+ * So the caller hears one quick sentence, then a silence that lasts as long
+ * as it takes to generate ~320 characters of speech, then a long run.
+ *
+ * The 320 target itself was HER earlier call and is still right for the
+ * problem it solved (July 4: "make the chunks bigger; it can't remember it
+ * sounds like it's listing games" -- per-sentence synth gives the voice zero
+ * prosodic context, so lists lose their rhythm). Dropping it globally would
+ * just trade her old complaint back for her new one.
+ *
+ * So: RAMP instead of choosing. Sentence 1 alone (unchanged), then ONE short
+ * chunk, then the full target from the third chunk on. The short second chunk
+ * lands while she's still hearing sentence one, which is what actually closes
+ * the audible gap; by the time chunks matter for list rhythm, they're back at
+ * full size. Her pick when asked directly, over "small chunks everywhere."
+ */
+const TTS_CHUNK_RAMP = parseInt(process.env.PHONE_TTS_CHUNK_RAMP || '140', 10);
 // July 4 2026 round 2 ("Still having problems", 17:24 call): arming only on
 // [table:]/[sound:] tokens misses the game REQUEST itself — "let's play
 // cards against reality" got a setup interview instead of a deal, and the
@@ -1397,8 +1420,14 @@ async function streamReply(session, userText) {
   // its own chunk so the tag stays in leading position for the TTS proxy.
   let _chunkBuf = '';
   let _firstShipped = false;
+  // How many chunks have been shipped after the solo first sentence. Drives
+  // the ramp: the first one uses the short target, everything after uses the
+  // full one. Reset per turn (this whole block is per-turn scope), so every
+  // reply gets its own fast opening rather than only the first of a call.
+  let _chunksAfterFirst = 0;
+  const chunkTarget = () => (_chunksAfterFirst === 0 ? TTS_CHUNK_RAMP : TTS_CHUNK_TARGET);
   const flushChunk = () => {
-    if (_chunkBuf) { const c = _chunkBuf; _chunkBuf = ''; processUnit(c); }
+    if (_chunkBuf) { const c = _chunkBuf; _chunkBuf = ''; _chunksAfterFirst++; processUnit(c); }
   };
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
@@ -1414,7 +1443,7 @@ async function streamReply(session, userText) {
       return;
     }
     _chunkBuf = _chunkBuf ? `${_chunkBuf} ${sentence}` : sentence;
-    if (_chunkBuf.length >= TTS_CHUNK_TARGET) flushChunk();
+    if (_chunkBuf.length >= chunkTarget()) flushChunk();
   });
 
   // HARD TURN DEADLINE (July 2 2026, round 4): the proxy's SSE keepalives
