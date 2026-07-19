@@ -191,6 +191,25 @@ function buildSetupMessage(session) {
       // inside generationConfig — both nestings 1007-close on v1beta, and
       // generationConfig nesting closes on v1alpha too).
       proactivity: { proactiveAudio: true },
+      // CONTEXT WINDOW COMPRESSION (July 19 2026, added alongside the
+      // stopLive handoff-line fix in the same session): Google's own docs
+      // (ai.google.dev/gemini-api/docs/live-api/session-management,
+      // checked live this session) state audio+VIDEO Live sessions are
+      // hard-capped at just 2 MINUTES without this -- exactly matching the
+      // ~40-90s real call lengths observed in tonight's bridge logs before
+      // `google ws closed 1000` fired every time. Enabling the sliding-
+      // window compressor is documented to extend a session to effectively
+      // unlimited length. A separate ~10-minute hard CONNECTION lifetime
+      // still applies regardless (Google's own words: "the lifetime of a
+      // connection is limited... to around 10 minutes") -- surviving THAT
+      // needs session resumption (a resumption-token reconnect handshake),
+      // which is NOT built here; sessionResumption is the clear next step
+      // if a caller ever reports a drop on a call past ~10 minutes. This
+      // field alone is expected to make the common case (a caller talking
+      // for a couple of minutes) stop dropping at all, and even if a rarer
+      // long call still eventually drops, the July 19 stopLive fix now
+      // guarantees that drop is always audible instead of silent.
+      contextWindowCompression: { slidingWindow: {} },
       // OUTPUT TRANSCRIPTION (July 18 2026, Kade: "after a voice chat I can
       // only see my half"): ask Google for a text transcript of the model's
       // OWN spoken audio so the Spotter/live side lands in session.history too.
