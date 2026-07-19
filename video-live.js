@@ -350,9 +350,18 @@ function stopLive(session, reason) {
   if (gws) { try { gws.close(); } catch {} }
   try { session.jsonSend({ type: 'live-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) }); } catch {}
   // The RETURN, in the character's own voice — closes the handoff fiction.
-  // Skipped when the socket is going away (hangup/close/error) — nobody's
-  // listening and speak would race the teardown.
-  if (session._liveSpeak && !['hangup', 'closed', 'error'].includes(String(reason))) {
+  // Skipped ONLY on a real hangup (the browser call socket itself is going
+  // away — nobody's listening, speak would race the teardown). 'closed' and
+  // 'error' mean GOOGLE's Live sub-socket dropped while the call is still
+  // very much active (observed live July 19 2026: real Spotter calls closing
+  // 1000 after ~40-90s, cause not yet root-caused) — previously these were
+  // wrongly grouped with hangup, so the classic engine silently took the call
+  // back over with ZERO audible cue. For a blind caller that's indistinguishable
+  // from Whittney just... turning into Kiana mid-sentence, which is exactly
+  // what Kade reported (Kiana's slang, and the transcript logging as a Kiana
+  // conversation) — fixed by always speaking the handoff-back line unless the
+  // call itself is actually ending.
+  if (session._liveSpeak && String(reason) !== 'hangup') {
     const back = reason === 'cap'
       ? `${OUT_OF_LIVE_LINE} It's ${session.agentName || 'me'} again — I've got you from here.`
       : `It's ${session.agentName || 'me'} again — I've got you.`;
