@@ -619,6 +619,34 @@ function armBargeRecovery(session) {
 }
 
 // ── Deepgram STT ──────────────────────────────────────────────────────────────
+// ── Keyterm prompting (Deepgram nova-3 + Flux, GA feature; wired 2026-07-20) ──
+// Biases STT toward the family's OWN proper nouns -- the companion names a
+// generic model routinely mangles (Kiana -> "Kiona", Deuce -> "juice",
+// Zadiana -> anything). Verified live 2026-07-20 that BOTH the v1 (nova-3) and
+// v2 (flux) listen endpoints accept `keyterm` as a repeated query param
+// without rejecting the socket. Deepgram requires ONE `keyterm` param per term
+// (commas/semicolons are invalid); URLSearchParams.append encodes each. Tunable
+// WITHOUT a deploy, matching this file's whole env-hatch philosophy:
+//   STT_KEYTERMS unset            -> the baked flagship-name defaults below
+//   STT_KEYTERMS="Ana,Bo,Cy"      -> exactly those (add family FIRST names here)
+//   STT_KEYTERMS="off"/"none"/""  -> disabled entirely
+// keyterm only *biases word choice* -- it cannot disconnect or silence STT, so
+// the blast radius is transcription accuracy, which is the thing being fixed.
+// Capped well under Deepgram's 500-token limit. (keyterm is a nova-3/Flux
+// feature; nova-2 uses the older `keywords` param, so an env step-back to
+// nova-2 would just have Deepgram ignore these -- harmless.)
+const DEFAULT_KEYTERMS = ['Kiana', 'Zadiana', 'Deuce', 'Torch', 'Forge', 'Rio', 'Lux', 'Indie', 'Lilly', 'Scout', 'Kade-AI'];
+function keytermList() {
+  const raw = process.env.STT_KEYTERMS;
+  if (raw === undefined) return DEFAULT_KEYTERMS;
+  const trimmed = raw.trim();
+  if (trimmed === '' || /^(off|none)$/i.test(trimmed)) return [];
+  return trimmed.split(',').map((t) => t.trim()).filter(Boolean).slice(0, 100);
+}
+function appendKeyterms(params) {
+  for (const term of keytermList()) params.append('keyterm', term);
+}
+
 function openDeepgramFlux(session, key) {
   const web = session.media === 'wav';
   const params = new URLSearchParams({
@@ -629,6 +657,7 @@ function openDeepgramFlux(session, key) {
     // spit'): a notch more end-of-turn patience at the model level too.
     eot_threshold: process.env.FLUX_EOT_THRESHOLD || '0.85',
   });
+  appendKeyterms(params);   // family proper nouns -- see keytermList() above
   const dg = new WebSocket(
     `wss://api.deepgram.com/v2/listen?${params}`,
     { headers: { Authorization: `Token ${key}` } }
@@ -753,6 +782,7 @@ function openDeepgram(session) {
     smart_format: 'true', interim_results: 'true',
     utterance_end_ms: '1000', endpointing: '500', vad_events: 'true', // 350->500ms July 1: 350 finalized on natural mid-sentence breaths (cut Kade off); +150ms per turn is the cost
   });
+  appendKeyterms(params);   // family proper nouns -- see keytermList() above
 
   const dg = new WebSocket(
     `wss://api.deepgram.com/v1/listen?${params}`,
