@@ -329,7 +329,19 @@ function handleGoogleMessage(session, raw) {
     if (sc.turnComplete || sc.generationComplete || sc.interrupted) {
       const t = (session._liveModelText || '').trim();
       session._liveModelText = '';
-      if (t) { try { session.history.push({ role: 'assistant', content: t }); } catch {} }
+      // Tag the turn with the SPOTTER's own name (July 2026) so the post-call
+      // transcript/mint credits it to the Spotter (e.g. Whitney), not the base
+      // agent the call started on. effectiveSpotter always resolves a name
+      // (custom Spotter, or the Scout default).
+      if (t) {
+        try {
+          session.history.push({
+            role: 'assistant',
+            content: t,
+            agentName: effectiveSpotter(session).name,
+          });
+        } catch {}
+      }
     }
     if (sc.interrupted) {
       try { session.sendClear && session.sendClear(); } catch {}

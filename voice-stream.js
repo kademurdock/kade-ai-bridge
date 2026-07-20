@@ -2621,7 +2621,13 @@ async function logCallTranscript(session) {
     const axios = require('axios');
     const turns = (session.history || [])
       .filter((m) => m && m.content && String(m.content).trim())
-      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', text: scrubTranscriptText(String(m.content)) }));
+      .map((m) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        text: scrubTranscriptText(String(m.content)),
+        // July 2026: rides per-turn Spotter attribution through to the fork's
+        // mint (kadeCallMerge). Null on ordinary turns -> base agentName.
+        agentName: m.agentName || null,
+      }));
     if (!turns.length) return;
     const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
     if (!secret) return;
