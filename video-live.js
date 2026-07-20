@@ -36,6 +36,12 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// Kade July 20 2026: the caller's name gets woven into systemInstruction
+// (below) as literal text the model reads to understand who it's talking
+// to -- Gemini Live is audio-in/audio-out with no phoneme/SSML hint, so a
+// misspelled-on-purpose respelling is the only lever. Background-only text,
+// never the transcript, so this can't touch what's actually logged.
+const { fixPronunciation } = require('./voice-commands');
 let WebSocketClient = null;
 try { WebSocketClient = require('ws'); } catch { /* ws is a bridge dep already */ }
 
@@ -148,8 +154,11 @@ function buildSetupMessage(session) {
   // Same Spotter no matter which character the call started with, so the
   // voice change is a handoff to somebody they know, not a fourth-wall break.
   const eff = effectiveSpotter(session);
+  // Respelled copy for SPEECH ONLY -- session.callerName itself is left
+  // untouched (it also feeds call logging/transcripts elsewhere).
+  const spokenCallerName = fixPronunciation(session.callerName || 'the caller', session.pronunciationDictionary);
   const base =
-    `You are ${eff.name}, the personal live companion ("Spotter") of ${session.callerName || 'the caller'}, on a live video call. ` +
+    `You are ${eff.name}, the personal live companion ("Spotter") of ${spokenCallerName}, on a live video call. ` +
     'They may be blind or low-vision — describe what matters, read text word for word when asked, give spatial layout (left, right, ahead, rough distance), and warn about hazards. ' +
     'Speak up on your own when something genuinely worth mentioning happens or appears; otherwise let them lead. ' +
     `You are not ${session.agentName || 'the character'} — you are ${eff.name}, and they know you took over the call for live mode.`;
@@ -159,7 +168,7 @@ function buildSetupMessage(session) {
   // the old one-line "Your personality:" frame. Short personas keep the
   // legacy wrapping so casual /spotter customizations still work unchanged.
   const callContext =
-    `\n\nCONTEXT FOR THIS CALL: You are the personal live companion ("Spotter") of ${session.callerName || 'the caller'}. ` +
+    `\n\nCONTEXT FOR THIS CALL: You are the personal live companion ("Spotter") of ${spokenCallerName}. ` +
     `You are not ${session.agentName || 'the character'} — you took over this call for live mode, and the caller knows it. ` +
     'Speak up on your own when something genuinely worth mentioning happens or appears; otherwise let them lead.';
   const personaText =
@@ -174,7 +183,7 @@ function buildSetupMessage(session) {
   // into the Spotter's briefing. The WRITE half is in voice-stream.js: live
   // turns land in the transcript, and the post-call memory writer files facts.
   const memText = session.callerMemories
-    ? `\n\nWHAT YOU ALREADY KNOW ABOUT ${session.callerName || 'the caller'} (their saved memories and recent-life notes — use naturally in conversation; never recite this list or mention that it exists. BACKGROUND ONLY: never volunteer opinions, warnings, or judgments about her habits, health, purchases, or personal choices, and do not bring up a remembered fact unless it directly answers what she just asked. You are her eyes -- describe only what the camera actually shows; never state or assume an object's brand, contents, or identity from memory as if you could see it):\n${String(session.callerMemories).slice(0, 6000)}`
+    ? `\n\nWHAT YOU ALREADY KNOW ABOUT ${spokenCallerName} (their saved memories and recent-life notes — use naturally in conversation; never recite this list or mention that it exists. BACKGROUND ONLY: never volunteer opinions, warnings, or judgments about her habits, health, purchases, or personal choices, and do not bring up a remembered fact unless it directly answers what she just asked. You are her eyes -- describe only what the camera actually shows; never state or assume an object's brand, contents, or identity from memory as if you could see it):\n${String(session.callerMemories).slice(0, 6000)}`
     : '';
   const generationConfig = {
     responseModalities: ['AUDIO'],

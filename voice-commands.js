@@ -141,8 +141,28 @@ module.exports = { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_R
 // hand-copied identically in BOTH engines; identical today, kept that way
 // by living in one place) ──────────────────────────────────────────────────
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fixPronunciation(t) {
-  return t.replace(/\bKade\b/g, 'Kadie').replace(/\bkade\b/g, 'kadie');
+// Kade July 20 2026: now takes an optional per-user dictionary
+// (kade-ai-bridge's own copy of the fork's kadePronunciation.js logic --
+// duplicated rather than shared since the two repos have no common
+// package; keep them in sync by hand if either changes). Dictionary
+// entries are tried FIRST; the hardcoded fallback below still runs
+// afterward as a safety net for anyone without an account/entry yet, and
+// is a harmless no-op once a matching dictionary entry already fired.
+// Corrected "Kadie" -> "Katie" July 20 2026 per Kade's own correction
+// ("I know my name Kade is pronounced Katie") -- the prior guess was close
+// but not quite it.
+function fixPronunciation(t, dictionary) {
+  let out = t;
+  for (const entry of dictionary || []) {
+    const term = entry && entry.term;
+    const pron = entry && entry.pronunciation;
+    if (!term || !pron) continue;
+    const escaped = String(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let re;
+    try { re = new RegExp(`\\b${escaped}\\b`, 'gi'); } catch { continue; }
+    out = out.replace(re, pron);
+  }
+  return out.replace(/\bKade\b/g, 'Katie').replace(/\bkade\b/g, 'katie');
 }
 
 function editDistance(a, b) {

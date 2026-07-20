@@ -643,8 +643,64 @@ function keytermList() {
   if (trimmed === '' || /^(off|none)$/i.test(trimmed)) return [];
   return trimmed.split(',').map((t) => t.trim()).filter(Boolean).slice(0, 100);
 }
-function appendKeyterms(params) {
+function appendKeyterms(params, extraTerms) {
   for (const term of keytermList()) params.append('keyterm', term);
+  for (const term of extraTerms || []) {
+    const t = String(term || '').trim();
+    if (t) params.append('keyterm', t);
+  }
+}
+
+/** Just the `term` half of a session's dictionary, for Deepgram keyterms. */
+function sessionKeyterms(session) {
+  return (session && session.pronunciationDictionary || [])
+    .map((e) => e && e.term)
+    .filter(Boolean);
+}
+
+// ── Per-user pronunciation dictionary (Kade, July 20 2026: "what if
+// everyone had a dictionary they can put their own names in") ──────────────
+// Two-tier cache, same shape as agentTtsCache elsewhere in this file: a
+// SYNCHRONOUS in-memory read (pronunciationCache) so STT socket-open below
+// -- which cannot await a network fetch without adding latency to every
+// single call, phone or web -- gets whatever's already warm, plus a
+// fire-and-forget refresh that both updates the cache for NEXT time and
+// upgrades the CURRENT session's copy the moment it lands (so TTS
+// respelling on a later turn this same call still benefits, exactly like
+// callerMemories a few lines above each call site below). Net effect: a
+// caller's first-ever call gets STT keyterms from the STT_KEYTERMS globals
+// only (cache miss) with TTS respelling attaching mid-call once the fetch
+// resolves; their second call onward gets personalized keyterms from the
+// start too, since the cache is already warm.
+const pronunciationCache = new Map(); // identity key -> entries[]
+
+function pronunciationCacheKey({ userId, email, phone } = {}) {
+  if (userId) return `u:${userId}`;
+  if (email) return `e:${String(email).toLowerCase()}`;
+  if (phone) {
+    const last10 = String(phone).replace(/\D/g, '').slice(-10);
+    if (last10.length === 10) return `p:${last10}`;
+  }
+  return null;
+}
+
+function getCachedDictionary(identity) {
+  const key = pronunciationCacheKey(identity);
+  return (key && pronunciationCache.get(key)) || [];
+}
+
+function refreshPronunciationDictionary(session, identity, cfg) {
+  if (!cfg || !cfg.fetchPronunciationDictionary) return;
+  const key = pronunciationCacheKey(identity);
+  if (!key) return;
+  cfg.fetchPronunciationDictionary(identity)
+    .then((entries) => {
+      if (entries && entries.length) {
+        pronunciationCache.set(key, entries);
+        if (session) session.pronunciationDictionary = entries;
+      }
+    })
+    .catch(() => {});
 }
 
 function openDeepgramFlux(session, key) {
@@ -657,7 +713,7 @@ function openDeepgramFlux(session, key) {
     // spit'): a notch more end-of-turn patience at the model level too.
     eot_threshold: process.env.FLUX_EOT_THRESHOLD || '0.85',
   });
-  appendKeyterms(params);   // family proper nouns -- see keytermList() above
+  appendKeyterms(params, sessionKeyterms(session));   // family + this caller's own names
   const dg = new WebSocket(
     `wss://api.deepgram.com/v2/listen?${params}`,
     { headers: { Authorization: `Token ${key}` } }
@@ -782,7 +838,7 @@ function openDeepgram(session) {
     smart_format: 'true', interim_results: 'true',
     utterance_end_ms: '1000', endpointing: '500', vad_events: 'true', // 350->500ms July 1: 350 finalized on natural mid-sentence breaths (cut Kade off); +150ms per turn is the cost
   });
-  appendKeyterms(params);   // family proper nouns -- see keytermList() above
+  appendKeyterms(params, sessionKeyterms(session));   // family + this caller's own names
 
   const dg = new WebSocket(
     `wss://api.deepgram.com/v1/listen?${params}`,
@@ -1363,7 +1419,7 @@ async function streamReply(session, userText) {
     if (hasSpeech) spokenChars += sentence.length;
     const synthInput = hasSpeech ? applyDirectionCarry(sentence, dirState) : '';
     const synthPromise = hasSpeech
-      ? synthesize(synthInput, session.voice, session.rate, session.media).catch((e) => {
+      ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
           return null;
         })
@@ -1577,9 +1633,9 @@ async function streamReply(session, userText) {
 }
 
 // ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
-async function synthesize(text, voice, rate, format = 'mulaw') {
+async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
   const cfg = global._vsConfig;
-  const input = fixPronunciation(text).slice(0, 4096);
+  const input = fixPronunciation(text, dictionary).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
   const t0 = Date.now();
   console.log(`[voice-stream] synth request: ${input.length} chars, voice "${useVoice}"${typeof rate === 'number' ? `, rate ${rate}` : ''}`);
@@ -1608,7 +1664,7 @@ async function synthesize(text, voice, rate, format = 'mulaw') {
 // ── Speak (one-shot, not streamed) ────────────────────────────────────────────
 async function speak(session, text, voice) {
   try {
-    const buf = await synthesize(text, voice || session.voice, session.rate, session.media);
+    const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
     session._currentSpokenText = text; // for echo detection, see looksLikeEcho
     await playBuffer(session, buf);
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
@@ -2312,6 +2368,15 @@ function attachMediaStreams(server, users, cfg) {
               .catch(() => {});
           }
 
+          // Kade July 20 2026: personal pronunciation dictionary. Cache read
+          // is SYNCHRONOUS (unlike the two async fetches above) so it can
+          // inform the STT keyterms set at socket-open just below -- see
+          // pronunciationCache's own comment for the two-tier cache/refresh
+          // reasoning (first-ever call = defaults only; warm from then on).
+          const pronIdentity = { email: user?.lcEmail, phone: from };
+          session.pronunciationDictionary = getCachedDictionary(pronIdentity);
+          refreshPronunciationDictionary(session, pronIdentity, global._vsConfig);
+
           session.dgWs = openDeepgram(session);
 
           const name      = user?.name || 'there';
@@ -2411,7 +2476,7 @@ function attachMediaStreams(server, users, cfg) {
             (async () => {
               if (sess.ws.readyState !== WebSocket.OPEN) return;
               const buf = outboundCtx.greeting2Buf
-                || await synthesize(outboundCtx.greeting2, sess.voice, sess.rate);
+                || await synthesize(outboundCtx.greeting2, sess.voice, sess.rate, undefined, sess.pronunciationDictionary);
               if (sess.ws.readyState !== WebSocket.OPEN) return;
               sess.history.push({ role: 'assistant', content: outboundCtx.greeting2 });
               await playBuffer(sess, buf);
@@ -2458,7 +2523,7 @@ function attachMediaStreams(server, users, cfg) {
               sess._pending = null;
               const p = outboundCtx.greetingBuf
                 ? playGreeting(outboundCtx.greetingBuf)
-                : synthesize(greeting, sess.voice, sess.rate).then(playGreeting);
+                : synthesize(greeting, sess.voice, sess.rate, sess.media, sess.pronunciationDictionary).then(playGreeting);
               p.catch(greetingFailed);
             };
             sess._startGreeting = startGreeting;
@@ -2480,7 +2545,7 @@ function attachMediaStreams(server, users, cfg) {
                   console.log(`[voice-stream] LLM opener: "${opener.slice(0, 80)}"`);
                 }
               }
-              const buf = await synthesize(text, sess.voice, sess.rate);
+              const buf = await synthesize(text, sess.voice, sess.rate, sess.media, sess.pronunciationDictionary);
               await playGreeting(buf);
             })().catch(greetingFailed);
           }
@@ -2806,6 +2871,13 @@ function attachWebVoice(server) {
             }
           }).catch(() => {});
         }
+        // Kade July 20 2026: personal pronunciation dictionary, same
+        // two-tier cache/refresh as the phone path above -- see
+        // pronunciationCache's own comment.
+        const pronIdentity = { email: t.email, userId: t.uid };
+        session.pronunciationDictionary = getCachedDictionary(pronIdentity);
+        refreshPronunciationDictionary(session, pronIdentity, cfg);
+
         session.dgWs = openDeepgram(session);
         session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice });
         session.sendState('listening');

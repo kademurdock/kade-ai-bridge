@@ -1214,6 +1214,25 @@ async function fetchCallMemories(identity, agentId, opts = {}) {
     return (r.data && r.data.text) || null;
   } catch { return null; }
 }
+// Kade July 20 2026: per-user pronunciation dictionary (Kade: "I know my
+// name Kade is pronounced Katie... what if everyone had a dictionary").
+// Mirrors fetchCallMemories exactly -- same secret, same identity shape,
+// same fail-soft (a lookup miss just means no respelling/keyterms this
+// call, never a broken one). Returns [] (never null) so every call site can
+// treat the result as a plain array with no extra null-check.
+async function fetchPronunciationDictionary(identity) {
+  if (!USAGE_EVENT_SECRET || !identity) return [];
+  try {
+    const params = new URLSearchParams();
+    if (identity.email) params.set('email', identity.email);
+    if (identity.phone) params.set('phone', identity.phone);
+    if (identity.userId) params.set('userId', identity.userId);
+    const r = await axios.get(`${FORK_USAGE_URL}/api/kade/pronunciation-lookup?${params}`, {
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 1500,
+    });
+    return (r.data && r.data.entries) || [];
+  } catch { return []; }
+}
 function ingestVoicePref(identity, agentId, voice) {
   if (!USAGE_EVENT_SECRET || !agentId || !identity) return;
   axios.post(`${FORK_USAGE_URL}/api/kade/voice-pref-ingest`, {
@@ -2537,6 +2556,7 @@ attachMediaStreams(server, users, {
   lookupVoicePref,   // July 12 2026: per-caller per-agent voice picks (fork)
   ingestVoicePref,
   fetchCallMemories, // July 12 2026: caller's own memory cards on calls
+  fetchPronunciationDictionary, // July 20 2026: per-user name/word respellings
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
