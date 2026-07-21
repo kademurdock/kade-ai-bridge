@@ -2883,6 +2883,15 @@ function attachWebVoice(server) {
               name: String(t.spotter.name || '').slice(0, 40),
               voice: String(t.spotter.voice || '').slice(0, 24),
               persona: String(t.spotter.persona || '').slice(0, 12000),
+              // July 21 2026: the ticket has carried the Spotter's OWN agent id
+              // since session 21i built spotter-attributed transcripts — but
+              // this copy never picked the field up, so _useSpotter in
+              // logCallTranscript could never be true and every Spotter call
+              // minted under the BASE agent (Kade's report: "Whitney says"
+              // turns living in a Kiana conversation). One field, whole fix.
+              agentId: typeof t.spotter.agentId === 'string' && t.spotter.agentId
+                ? String(t.spotter.agentId).slice(0, 64)
+                : null,
             }
           : null;
         // Direct Spotter call (July 18 2026): the client asked for the Spotter
