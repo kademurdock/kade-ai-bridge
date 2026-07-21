@@ -263,6 +263,7 @@ function handleGoogleMessage(session, raw) {
   try { msg = JSON.parse(raw.toString()); } catch { return; }
   if (msg.setupComplete) {
     session.liveOn = true;
+    session._liveStartedAt = Date.now(); // greeting-grace anchor, see sc.interrupted below
     session._liveTickAt = Date.now();
     session._liveTick = setInterval(() => {
       if (!session.liveOn) return;
@@ -344,7 +345,21 @@ function handleGoogleMessage(session, raw) {
       }
     }
     if (sc.interrupted) {
-      try { session.sendClear && session.sendClear(); } catch {}
+      // SPOTTER GREETING GRACE (July 21 2026, same ask as the phone-greeting
+      // lock): for the first few seconds of the lane, an "interrupted" from
+      // Gemini does NOT flush the audio already buffered to the caller — so
+      // the Spotter's hello plays out even if room noise tripped Google's
+      // VAD at lane start. Honest scope: Gemini itself may still stop
+      // GENERATING server-side (its barge detection is theirs, not ours);
+      // what this controls is our flush of what was already said. After the
+      // grace window, interruption behaves exactly as before — callers can
+      // barge the Spotter any time. Env LIVE_GREETING_GRACE_MS (default
+      // 5000, 0 = old always-flush behavior).
+      const graceMs = parseInt(process.env.LIVE_GREETING_GRACE_MS || '5000', 10);
+      const inGrace = graceMs > 0 && session._liveStartedAt && (Date.now() - session._liveStartedAt) < graceMs;
+      if (!inGrace) {
+        try { session.sendClear && session.sendClear(); } catch {}
+      }
     }
   }
 }

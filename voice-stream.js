@@ -2595,8 +2595,19 @@ function attachMediaStreams(server, users, cfg) {
           // and lock barge-in until the disclosure finishes playing.
           if (outboundCtx) {
             session.history.push({ role: 'assistant', content: greeting });
-            session._greetingLock = true;
           }
+          // GREETING LOCK, BOTH DIRECTIONS (July 21 2026 — Kade: "the hey
+          // keighty shit won't get interrupted by noise"): this lock was
+          // born July 2 for OUTBOUND disclosures only, and inbound greetings
+          // never got it — her own inbound test call tonight shows the
+          // opener barged at t=0 by her reflexive pickup "Hey." The caller's
+          // words are still HELD (handleUtterance's greeting-lock branch)
+          // and replayed by releaseGreetingLock the moment the greeting
+          // ends, so nothing they say is lost — the greeting just finishes.
+          // Every inbound exit already releases: playGreeting's else branch,
+          // greetingFailed, and the 35s safety valve below. Normal turns
+          // stay interruptible any time — this covers ONLY the greeting.
+          session._greetingLock = true;
 
           // ── Greeting playback ────────────────────────────────────────────
           // INBOUND: ringback covers the synth wait (caller expects ringing).
