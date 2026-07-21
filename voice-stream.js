@@ -940,8 +940,10 @@ function releaseGreetingLock(session) {
 // A deterministic, LLM-free state machine for signing up by voice — the LLM
 // never sees or invents any part of it. Steps: confirmStart -> askName (only
 // for callers the registry doesn't know) -> askEmail -> confirmEmail (read
-// back SPELLED) -> askPassword ("pick one for me" works) -> confirmPassword
-// -> creating. Cancel words exit cleanly at any step; 3 failed attempts on
+// back SPELLED) -> offerPassword (a friendly password is generated and
+// OFFERED first -- okay keeps it, another re-rolls, saying one of your own
+// still works and goes through confirmPassword's spelled read-back) ->
+// creating. Cancel words exit cleanly at any step; 3 failed attempts on
 // one step exits gracefully. Design + receipts:
 // PHONE_REGISTRATION_REBUILD_2026-07-21.md in the project folder.
 /// Picks (or re-picks) a friendly password and offers it. The words are
