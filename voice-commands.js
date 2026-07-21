@@ -461,6 +461,11 @@ function parseSpokenPassword(text) {
   let s = String(text || '').toLowerCase().trim()
     .replace(/[.,!?]+$/g, '')
     .replace(/^(?:my password is|the password is|password is|make it|i want|it's|its)\s+/i, '');
+  // Case-marker words are instructions, never content ("capital r and then
+  // lowercase rainbow", Kade's own July 21 test call) — and spoken
+  // passwords are all-lowercase BY DESIGN, so the markers can't be honored
+  // anyway. Dropped before joining; the spelled read-back confirms the rest.
+  s = s.replace(/\b(?:capital|uppercase|lowercase|letter)\b/g, ' ');
   let toks = collapseSpokenNumbers(s.split(/\s+/).filter(Boolean));
   const pwd = toks.join('').replace(/[^a-z0-9]/g, '');
   return pwd.length >= 8 ? pwd : null;

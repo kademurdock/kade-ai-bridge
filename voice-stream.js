@@ -954,6 +954,11 @@ async function handleRegistrationTurn(session, text) {
   };
   switch (reg.step) {
     case 'confirmStart':
+      if (/\balready\b/i.test(t) && !REG_YES_RE.test(t)) {
+        session.reg = null;
+        await speak(session, "You might — if you signed up on the website, your phone just isn't linked to it yet. You can link it yourself: say sign me up, then give the SAME email and password you use on the website. Or ask Kade to link it. Want to keep chatting instead? Go ahead.", session.voice);
+        return;
+      }
       if (REG_YES_RE.test(t)) {
         reg.attempts = 0;
         if (reg.name) { reg.step = 'askEmail'; await speak(session, `Alright ${reg.name}! What's your email address? Say it like: john at gmail dot com. You can spell it out letter by letter — numbers are fine too.`, session.voice); }
@@ -985,7 +990,7 @@ async function handleRegistrationTurn(session, text) {
       let pwd = null;
       if (REG_PICK_RE.test(t)) pwd = friendlyPassword();
       else pwd = parseSpokenPassword(t);
-      if (!pwd) { await strike('That came out shorter than 8 characters. Try a longer one — words plus numbers work great. Or say: pick one for me.'); return; }
+      if (!pwd) { await strike('Just say the password itself and nothing else — like: maple creek four two. At least 8 characters, letters and numbers. Or say: pick one for me.'); return; }
       reg.password = pwd; reg.step = 'confirmPassword'; reg.attempts = 0;
       await speak(session, `Your password would be: ${pwd.split('').join(', ')}. All lowercase, no spaces. Good — yes or no?`, session.voice);
       return;

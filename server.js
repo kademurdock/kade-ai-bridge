@@ -2644,7 +2644,11 @@ attachMediaStreams(server, users, {
     users.set(phone, u); saveUsers();
     console.log(`[reg] linked ${phone} -> ${email}`);
   },
-  hasAccount: (phone) => { const u = users.get(phone); return !!(u && u.lcEmail && u.lcPass); },
+  // lcEmail ALONE means "this caller has a site account" — lcPass only
+  // affects whether calls ride their own token. Requiring both here (the
+  // first draft) made the flow offer Kade herself a brand-new account,
+  // live on her July 21 test call: 4 of 6 registry rows are email-only.
+  hasAccount: (phone) => { const u = users.get(phone); return !!(u && u.lcEmail); },
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
