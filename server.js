@@ -528,9 +528,16 @@ app.post('/push-send', async (req, res) => {
     return res.status(500).json({ error: 'APNs not configured (APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID)' });
   }
   const title   = b.title || 'Kade-AI';
-  const message = b.body  || 'Ki was thinking about you.';
-  const targets = b.token ? [String(b.token).toLowerCase()] : [...pushTokens.keys()];
-  if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no device tokens registered yet' });
+  const message = b.body;
+  if (!message) return res.status(400).json({ error: 'body required' });
+  // July 21 2026: no more silent everyone-blast (and no baked-in persona copy).
+  // token = one device, userId = that user's linked devices, all:true = explicit broadcast.
+  const targets = b.token ? [String(b.token).toLowerCase()]
+    : b.userId ? tokensForUser(String(b.userId))
+    : b.all === true ? [...pushTokens.keys()]
+    : null;
+  if (targets === null) return res.status(400).json({ error: 'target required: token, userId, or all:true (explicit broadcast)' });
+  if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no matching device tokens' });
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0;
   results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); // 410 = dead token
@@ -570,7 +577,7 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent, userId }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast }) {
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   const message = String(body || '').trim().slice(0, 300);
@@ -588,9 +595,15 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId }) {
   // Per-user targeting: a userId restricts delivery to THAT person's linked
   // device(s) only — it never falls back to the full pool, so an unlinked or
   // not-yet-registered user gets zero targets, never someone else's phone.
-  // No userId = legacy broadcast (admin tools, the global "Ki reaches out" timer).
-  const targets = userId ? tokensForUser(userId) : [...pushTokens.keys()];
-  if (!targets.length) return { ok: true, sent: 0, note: userId ? 'no device linked to this user yet' : 'no device tokens registered yet' };
+  // July 21 2026: the old "no userId = broadcast to every registered device"
+  // fallback is GONE — it delivered one person's private check-in to every
+  // family phone (confirmed live: sent=3). Broadcast now requires the ADMIN
+  // secret plus an explicit broadcast:true, and is never reachable by agents.
+  const targets = userId ? tokensForUser(userId) : (broadcast === true ? [...pushTokens.keys()] : []);
+  if (!targets.length) {
+    if (!userId && broadcast !== true) return { ok: false, blocked: 'no target user (per-user sends need a userId; broadcast needs admin broadcast:true)' };
+    return { ok: true, sent: 0, note: userId ? 'no device linked to this user yet' : 'no device tokens registered yet' };
+  }
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
@@ -603,7 +616,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId }) {
 app.post('/notify', async (req, res) => {
   const b = req.body || {};
   if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: bridgeSecretOk(req, b.secret) && b.broadcast === true });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
@@ -648,7 +661,9 @@ async function fireReachout(urgent) {
   const text = await askAgentRich(REACHOUT_AGENT_ID, reachout.prompt);
   if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
   const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
-  const delivery = await runNotify({ agentId: REACHOUT_AGENT_ID, agentName: REACHOUT_AGENT_NAME, title: reachout.title || 'Ki', body, urgent: urgent === true });
+  // "Ki reaches out" is Kade's own personal check-in — deliver ONLY to her
+  // linked devices (ADMIN_USER_ID env can override the baked-in default).
+  const delivery = await runNotify({ agentId: REACHOUT_AGENT_ID, agentName: REACHOUT_AGENT_NAME, title: reachout.title || 'Ki', body, urgent: urgent === true, userId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7' });
   return { ok: true, generated: body, delivery };
 }
 
@@ -2195,7 +2210,7 @@ async function fireOutreach(sub, { urgent = false } = {}) {
   const text = await askAgentRich(sub.agentId, buildOutreachPrompt(sub));
   if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
   const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
-  const delivery = await runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName || 'Ki', body, urgent, userId: sub.userId });
+  const delivery = await runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName || 'Kade-AI', body, urgent, userId: sub.userId });
   return { ok: true, generated: body, delivery };
 }
 
