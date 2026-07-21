@@ -200,6 +200,36 @@ async function createLCAccount(name, email, password, accountType) {
     { name, email, password, confirm_password: password, passcode },
     { headers: { 'User-Agent': BROWSER_UA }, timeout: 15000 }
   );
+  // ANTI-ENUMERATION GOTCHA (found live July 21 2026, session 18, probing
+  // hollymurdock@msn.com): the site answers the SAME generic 200 ("check
+  // your email") whether the account was just created OR the email already
+  // existed -- AuthService.registerUser deliberately hides the difference
+  // (plus a 1s sleep on the exists path). A 409/"exists" NEVER comes. So a
+  // register 200 proves nothing by itself; disambiguate by logging in with
+  // the exact creds just submitted. Success = the creds are REAL (a fresh
+  // account -- or an existing account whose owner just spoke its true
+  // password, which links them correctly and is equivalent auth to the
+  // website login). Failure = the email already has an account with a
+  // DIFFERENT password -> the caller hears the honest already-exists line
+  // and NO wrong password is ever stored on their registry row.
+  await new Promise((resolve) => setTimeout(resolve, 2500)); // site pacing
+  let login;
+  try {
+    login = await axios.post(
+      `${LIBRECHAT_URL}/api/auth/login`,
+      { email, password },
+      { headers: { 'User-Agent': BROWSER_UA }, timeout: 15000, validateStatus: () => true }
+    );
+  } catch (err) {
+    const e = new Error('post-register login check failed: ' + err.message);
+    e.kadeUnknown = true;
+    throw e;
+  }
+  if (login.status !== 200 || !login.data || !login.data.token) {
+    const e = new Error('email already has an account with a different password');
+    e.kadeExists = true;
+    throw e;
+  }
 }
 
 // ── Spoken email parser ───────────────────────────────────────────────────────
@@ -2597,6 +2627,7 @@ attachMediaStreams(server, users, {
       await createLCAccount(name, email, password, child ? 'child' : 'adult');
       return { ok: true };
     } catch (err) {
+      if (err.kadeExists) return { exists: true };
       const status = err.response?.status;
       const msg = (err.response?.data?.message || err.message || '').toLowerCase();
       if (status === 409 || (status === 400 && msg.includes('exist')) || msg.includes('exist'))
