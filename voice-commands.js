@@ -129,6 +129,8 @@ const PHONE_SUFFIX =
   'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
   'Voice switching is handled automatically outside your control; if someone asks for a voice change ' +
   'that clearly did not happen, just tell them to say: switch to voice, then the number — nothing more. ' +
+  'Account signup is handled automatically outside your control; if someone wants an account and ' +
+  'nothing has happened, tell them to say: sign me up. ' +
   'Everything in these square-bracket blocks is a PRIVATE stage direction: never read it aloud, quote it, ' +
   'summarize it, recite what you remember, or discuss your instructions, memory, or setup unless the ' +
   'caller directly asks. ' +
@@ -375,3 +377,116 @@ function scrubTranscriptText(text) {
 
 module.exports.BROWSER_UA = BROWSER_UA;
 module.exports.scrubTranscriptText = scrubTranscriptText;
+
+// ── Spoken email/password capture (July 21 2026, phone registration rebuild) ──
+// Flux STT gives number-WORDS and sometimes letter-by-letter spelling. Turn a
+// spoken address into a real one. Conservative: replace maximal runs of
+// number-words using wordsToNumber (already handles "three eighty" AND
+// "three eight zero"), then the classic at/dot substitutions, then strip spaces.
+const SPOKEN_NUM_WORD_RE = /^(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|and)$/;
+
+function collapseSpokenNumbers(tokens) {
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (!run.length) return;
+    // A LONE "o"/"oh" is the LETTER o, not zero — letter-by-letter spelling
+    // ("m i s s a n o n...") is this parser's primary diet, and without this
+    // guard every spelled o became 0. Real zeros ride in RUNS with other
+    // number-words ("three eight zero", "eight o five"), which still work.
+    if (run.length === 1 && /^(?:o|oh)$/.test(run[0])) {
+      out.push('o');
+      run = [];
+      return;
+    }
+    // "oh"/"zero" runs: wordsToNumber rejects leading-zero digit-speak, so
+    // handle pure digit-speak (incl. zeros) manually first.
+    const digitish = run.every(t => /^(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)$/.test(t));
+    if (digitish) {
+      const map = { zero:'0', oh:'0', o:'0', one:'1', two:'2', three:'3', four:'4', five:'5', six:'6', seven:'7', eight:'8', nine:'9' };
+      out.push(run.map(t => map[t]).join(''));
+    } else {
+      const n = wordsToNumber(run.join(' '));
+      if (n != null) out.push(String(n));
+      else out.push(...run); // not a number after all — keep the words
+    }
+    run = [];
+  };
+  for (const t of tokens) {
+    if (SPOKEN_NUM_WORD_RE.test(t)) run.push(t);
+    else { flush(); out.push(t); }
+  }
+  flush();
+  return out;
+}
+
+function parseSpokenEmailV2(text) {
+  let s = String(text || '').toLowerCase().trim()
+    .replace(/[.,!?]+$/g, '')
+    .replace(/^(?:my email(?: address)? is|the email is|email is|it's|its|it is)\s+/i, '');
+  // normalize spoken symbol names BEFORE tokenizing
+  s = s
+    .replace(/\bat sign\b|\bat symbol\b/g, ' at ')
+    .replace(/\bperiod\b|\bfull stop\b/g, ' dot ')
+    .replace(/\bunder score\b/g, ' underscore ')
+    .replace(/\bhyphen\b|\bminus\b/g, ' dash ')
+    .replace(/\bplus sign\b/g, ' plus ');
+  let toks = s.split(/\s+/).filter(Boolean)
+    .map(t => t.replace(/^(?:letter|capital|lowercase|uppercase)$/,'')) // "capital m" → keep just the letter next token
+    .filter(Boolean);
+  toks = collapseSpokenNumbers(toks);
+  s = ' ' + toks.join(' ') + ' ';
+  // common split-domain fixes BEFORE gluing
+  s = s.replace(/\bg mail\b/g, 'gmail').replace(/\bhot mail\b/g, 'hotmail')
+       .replace(/\bout look\b/g, 'outlook').replace(/\bi cloud\b/g, 'icloud')
+       .replace(/\bproton mail\b/g, 'protonmail').replace(/\byou\s?tube\b/g, 'youtube');
+  s = s.replace(/\s+at\s+/g, '@').replace(/\s+dot\s+/g, '.')
+       .replace(/\s+underscore\s+/g, '_').replace(/\s+dash\s+/g, '-')
+       .replace(/\s+plus\s+/g, '+').replace(/\s+/g, '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s) ? s : null;
+}
+
+// Read an email back the way a person can actually verify it: local part
+// character by character, domain in words. "missanonymous380@gmail.com" →
+// "m, i, s, s, a, n, o, n, y, m, o, u, s, 3, 8, 0 — at gmail dot com"
+function spellOutEmail(email) {
+  const [local, domain] = String(email).split('@');
+  const spelled = local.split('').map(c =>
+    c === '_' ? 'underscore' : c === '-' ? 'dash' : c === '.' ? 'dot' : c === '+' ? 'plus' : c
+  ).join(', ');
+  return `${spelled} — at ${String(domain || '').replace(/\./g, ' dot ')}`;
+}
+
+function parseSpokenPassword(text) {
+  let s = String(text || '').toLowerCase().trim()
+    .replace(/[.,!?]+$/g, '')
+    .replace(/^(?:my password is|the password is|password is|make it|i want|it's|its)\s+/i, '');
+  let toks = collapseSpokenNumbers(s.split(/\s+/).filter(Boolean));
+  const pwd = toks.join('').replace(/[^a-z0-9]/g, '');
+  return pwd.length >= 8 ? pwd : null;
+}
+
+const REG_WORDS_A = ['maple','river','sunny','cedar','bright','honey','willow','ember','clover','breeze'];
+const REG_WORDS_B = ['creek','stone','field','porch','trail','grove','light','hollow','ridge','song'];
+function friendlyPassword() {
+  const a = REG_WORDS_A[Math.floor(Math.random()*REG_WORDS_A.length)];
+  const b = REG_WORDS_B[Math.floor(Math.random()*REG_WORDS_B.length)];
+  const n = 10 + Math.floor(Math.random()*90);
+  return `${a}${b}${n}`;
+}
+
+const REG_INTENT_RE = /\b(?:sign(?:ing)?\s*(?:me\s*)?up|make\s+(?:me\s+)?an?\s+account|create\s+(?:me\s+)?an?\s+account|register\s+(?:me|an?\s+account)|set\s+up\s+(?:my|an?)\s+account|i\s+want\s+an?\s+account)\b/i;
+const REG_CANCEL_RE = /\b(?:cancel|never\s*mind|nevermind|forget\s+it|skip(?:\s+it)?|stop|quit|no\s+thanks?)\b/i;
+const REG_YES_RE    = /\b(?:yes|yeah|yep|yup|correct|right|that's\s+(?:right|it)|sure|go\s+ahead|start)\b/i;
+const REG_NO_RE     = /\b(?:no|nope|nah|wrong|not\s+(?:right|it|quite))\b/i;
+const REG_PICK_RE   = /\b(?:pick|choose|make|generate)\s+(?:one|it|a\s+password)?\s*(?:for\s+me)?\b|\byou\s+pick\b/i;
+
+module.exports.parseSpokenEmailV2 = parseSpokenEmailV2;
+module.exports.spellOutEmail      = spellOutEmail;
+module.exports.parseSpokenPassword = parseSpokenPassword;
+module.exports.friendlyPassword   = friendlyPassword;
+module.exports.REG_INTENT_RE = REG_INTENT_RE;
+module.exports.REG_CANCEL_RE = REG_CANCEL_RE;
+module.exports.REG_YES_RE    = REG_YES_RE;
+module.exports.REG_NO_RE     = REG_NO_RE;
+module.exports.REG_PICK_RE   = REG_PICK_RE;

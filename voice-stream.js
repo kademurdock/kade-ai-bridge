@@ -54,7 +54,9 @@ function applyDirectionCarry(sentence, dirState) {
 
 // SHARED voice-command brain (July 13 2026): one copy for both engines.
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
-        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText, stripAiTells } = require('./voice-commands');
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText, stripAiTells,
+        parseSpokenEmailV2, spellOutEmail, parseSpokenPassword, friendlyPassword,
+        REG_INTENT_RE, REG_CANCEL_RE, REG_YES_RE, REG_NO_RE, REG_PICK_RE } = require('./voice-commands');
 const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
 // Watch-and-alert delivery (July 16 2026, Kade's yes -- character-voice
 // alerts): when an armed watch fires (or expires), video-sight hands the
@@ -933,6 +935,90 @@ function releaseGreetingLock(session) {
   }
 }
 
+// ── Spoken registration flow (July 21 2026) ─────────────────────────────────
+// A deterministic, LLM-free state machine for signing up by voice — the LLM
+// never sees or invents any part of it. Steps: confirmStart -> askName (only
+// for callers the registry doesn't know) -> askEmail -> confirmEmail (read
+// back SPELLED) -> askPassword ("pick one for me" works) -> confirmPassword
+// -> creating. Cancel words exit cleanly at any step; 3 failed attempts on
+// one step exits gracefully. Design + receipts:
+// PHONE_REGISTRATION_REBUILD_2026-07-21.md in the project folder.
+async function handleRegistrationTurn(session, text) {
+  const reg = session.reg;
+  const t = String(text || '').trim();
+  if (REG_CANCEL_RE.test(t)) { session.reg = null; await speak(session, 'No problem — cancelled. What else is on your mind?', session.voice); return; }
+  const strike = async (msg) => {
+    reg.attempts++;
+    if (reg.attempts >= 3) { session.reg = null; await speak(session, "No worries — we can try again another time, or Kade can set you up on the website. Let's just talk.", session.voice); }
+    else await speak(session, msg, session.voice);
+  };
+  switch (reg.step) {
+    case 'confirmStart':
+      if (REG_YES_RE.test(t)) {
+        reg.attempts = 0;
+        if (reg.name) { reg.step = 'askEmail'; await speak(session, `Alright ${reg.name}! What's your email address? Say it like: john at gmail dot com. You can spell it out letter by letter — numbers are fine too.`, session.voice); }
+        else { reg.step = 'askName'; await speak(session, "Let's do it. First — what's your name?", session.voice); }
+      } else if (REG_NO_RE.test(t)) { session.reg = null; await speak(session, 'All good. What else is up?', session.voice); }
+      else await strike('Just say yes to set up your account, or no to skip.');
+      return;
+    case 'askName': {
+      const name = t.replace(/^(?:my name is|i'm|i am|it's|its|this is)\s+/i, '').replace(/[.,!?]+$/g, '').trim();
+      if (!name || name.split(/\s+/).length > 4) { await strike("I didn't catch that — just tell me your first name."); return; }
+      reg.name = name.split(/\s+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      reg.step = 'askEmail'; reg.attempts = 0;
+      await speak(session, `Nice to meet you, ${reg.name}! What's your email address? Say it like: john at gmail dot com. Spelling it out letter by letter works too.`, session.voice);
+      return;
+    }
+    case 'askEmail': {
+      const email = parseSpokenEmailV2(t);
+      if (!email) { await strike("I couldn't make an email out of that. Try again slow — like: m, i, s, s, at gmail dot com. Or say cancel."); return; }
+      reg.email = email; reg.step = 'confirmEmail'; reg.attempts = 0;
+      await speak(session, `Let me read that back: ${spellOutEmail(email)}. Did I get it right — yes or no?`, session.voice);
+      return;
+    }
+    case 'confirmEmail':
+      if (REG_YES_RE.test(t)) { reg.step = 'askPassword'; reg.attempts = 0; await speak(session, 'Now the password you want — at least 8 characters, letters and numbers, no spaces. It will be all lowercase. Say it now, or say: pick one for me.', session.voice); }
+      else if (REG_NO_RE.test(t)) { reg.step = 'askEmail'; await speak(session, 'Okay, scratch that. Say your email again, nice and slow.', session.voice); }
+      else await strike('Yes if I got the email right, no to try again.');
+      return;
+    case 'askPassword': {
+      let pwd = null;
+      if (REG_PICK_RE.test(t)) pwd = friendlyPassword();
+      else pwd = parseSpokenPassword(t);
+      if (!pwd) { await strike('That came out shorter than 8 characters. Try a longer one — words plus numbers work great. Or say: pick one for me.'); return; }
+      reg.password = pwd; reg.step = 'confirmPassword'; reg.attempts = 0;
+      await speak(session, `Your password would be: ${pwd.split('').join(', ')}. All lowercase, no spaces. Good — yes or no?`, session.voice);
+      return;
+    }
+    case 'confirmPassword':
+      if (REG_YES_RE.test(t)) { reg.step = 'creating'; await finishRegistration(session); }
+      else if (REG_NO_RE.test(t)) { reg.step = 'askPassword'; await speak(session, 'Okay — say the password you want, or say: pick one for me.', session.voice); }
+      else await strike('Yes to lock that password in, no to pick a different one.');
+      return;
+    default: session.reg = null; return;
+  }
+}
+
+async function finishRegistration(session) {
+  const reg = session.reg;
+  const res = await session.cfg.createAccount({
+    name: reg.name || session.callerName || 'Friend',
+    email: reg.email, password: reg.password, child: !!session.childCaller,
+  });
+  session.reg = null;
+  if (res && res.ok) {
+    try { session.cfg.linkAccount(session.from, reg.email, reg.password, reg.name); } catch (e) { console.error('[reg] link failed:', e.message); }
+    session.lcEmail = reg.email; // same-call attribution where the pipeline reads it
+    await speak(session, `You're all set${reg.name ? ', ' + reg.name : ''}! Your account is live at kademurdock dot com — log in with your email and that password, and change it there anytime. From your next call on, I'll know you by your own account. Now — where were we?`, session.voice);
+  } else if (res && res.exists) {
+    await speak(session, `Looks like ${spellOutEmail(reg.email)} already has an account. If that's yours, you're already good on the website — let's just keep talking.`, session.voice);
+  } else if (res && res.passcode) {
+    await speak(session, "Hm — signups are code-locked right now and my code isn't working. Kade will fix that; let's keep chatting and try later.", session.voice);
+  } else {
+    await speak(session, 'Something went wrong on my end setting that up. Not your fault — Kade will check the logs. We can still talk!', session.voice);
+  }
+}
+
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
@@ -1044,6 +1130,23 @@ async function handleUtterance(session, text) {
   if (session.sendState) session.sendState('thinking');
   session.busy = true;
   try {
+    // ── Spoken registration (July 21 2026) — deterministic, never the LLM. ──
+    // Phone lane only (media !== 'wav'): web callers are signed in by
+    // construction, and the registry gate below is keyed by phone number.
+    // Placed BEFORE every other spoken command so a mid-registration "switch
+    // to voice two" is treated as registration input, and the cancel words
+    // are the one documented exit. See PHONE_REGISTRATION_REBUILD doc.
+    if (session.reg) { await handleRegistrationTurn(session, text); return; }
+    if (session.media !== 'wav' && REG_INTENT_RE.test(text)
+        && session.cfg && session.cfg.hasAccount && session.cfg.createAccount) {
+      if (session.cfg.hasAccount(session.from)) {
+        await speak(session, "You're already set up with your own account — you're good.", session.voice);
+      } else {
+        session.reg = { step: 'confirmStart', attempts: 0, name: session.callerName || null };
+        await speak(session, 'Want me to set up your own kademurdock account right here on the call? Say yes to start, or no to skip.', session.voice);
+      }
+      return;
+    }
     const rateCmd = extractRateCommand(text);
     if (rateCmd) {
       const cur = session.rate ?? BASE_RATE;
@@ -1898,7 +2001,7 @@ async function fetchLlmOpener(session, user) {
   const name = user?.name;
   const instruction = name
     ? `[PHONE CALL SYSTEM NOTE] ${name} is calling you on the phone right now and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello greeting ${name} by name (work your own name in too) — like a real friend answering the phone. Hard rules: 16 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.`
-    : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello introducing yourself by name and noting you do not recognize the number. Hard rules: 20 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
+    : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello introducing yourself by name and noting you do not recognize the number, working in naturally that they can say sign me up any time to get their own account. Hard rules: 30 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
 
   const attempt = (async () => {
     const res = await streamPost(

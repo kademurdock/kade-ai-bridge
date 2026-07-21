@@ -185,10 +185,19 @@ async function getTokenForCall(state) {
 }
 
 // ── LibreChat account creation ────────────────────────────────────────────────
-async function createLCAccount(name, email, password) {
+async function createLCAccount(name, email, password, accountType) {
+  // July 21 2026 (phone registration rebuild): site registration has been
+  // passcode-gated since July 3 (env KADE_REG_CODE_ADULT / KADE_REG_CODE_CHILD
+  // on the LibreChat service; same names mirrored onto this bridge). Without
+  // the code every signup 403s — the exact reason the legacy voice flow died.
+  // Child callers get the child code so the site account carries the child tag.
+  const passcode = accountType === 'child'
+    ? process.env.KADE_REG_CODE_CHILD
+    : process.env.KADE_REG_CODE_ADULT;
+  if (!passcode) throw new Error('KADE_REG_CODE_* env missing on bridge');
   await axios.post(
     `${LIBRECHAT_URL}/api/auth/register`,
-    { name, email, password, confirm_password: password },
+    { name, email, password, confirm_password: password, passcode },
     { headers: { 'User-Agent': BROWSER_UA }, timeout: 15000 }
   );
 }
@@ -2577,6 +2586,34 @@ attachMediaStreams(server, users, {
   ingestVoicePref,
   fetchCallMemories, // July 12 2026: caller's own memory cards on calls
   fetchPronunciationDictionary, // July 20 2026: per-user name/word respellings
+  // ── July 21 2026 (phone registration rebuild — PHONE_REGISTRATION_REBUILD doc) ──
+  // Spoken account signup on calls. createAccount posts the register with the
+  // env passcode; linkAccount updates the registry row IN PLACE (preserving
+  // name/agent/voice/accountType) so the caller's NEXT call rides their own
+  // token via the existing lcEmail/lcPass path; hasAccount gates entry so
+  // account-holders just hear "you're good."
+  createAccount: async ({ name, email, password, child }) => {
+    try {
+      await createLCAccount(name, email, password, child ? 'child' : 'adult');
+      return { ok: true };
+    } catch (err) {
+      const status = err.response?.status;
+      const msg = (err.response?.data?.message || err.message || '').toLowerCase();
+      if (status === 409 || (status === 400 && msg.includes('exist')) || msg.includes('exist'))
+        return { exists: true };
+      if (status === 403) { console.error('[reg] PASSCODE REJECTED — check KADE_REG_CODE_* env on bridge'); return { passcode: true }; }
+      console.error('[reg] account creation failed:', err.message);
+      return { error: msg || 'unknown' };
+    }
+  },
+  linkAccount: (phone, email, password, name) => {
+    const u = users.get(phone) || { name: name || 'Friend', agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME };
+    if (name && (!u.name || u.name === 'Friend')) u.name = name;
+    u.lcEmail = email; u.lcPass = password;
+    users.set(phone, u); saveUsers();
+    console.log(`[reg] linked ${phone} -> ${email}`);
+  },
+  hasAccount: (phone) => { const u = users.get(phone); return !!(u && u.lcEmail && u.lcPass); },
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
