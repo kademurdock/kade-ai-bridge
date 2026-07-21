@@ -434,7 +434,18 @@ app.post('/register', (req, res) => {
   if (!phone) return res.status(400).json({ error: 'phone required' });
   const digits = phone.replace(/\D/g, '');
   const e164   = digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
-  const record = { name: name || 'Friend', agentId: agentId || DEFAULT_AGENT, agentName: agentName || DEFAULT_AGENT_NAME };
+  // MERGE with any existing row (July 21 2026, session 18): this route used
+  // to build a FRESH record, silently dropping any field it doesn't accept
+  // (Kade's own row carries `voice`; spoken rate prefs land on rows too) --
+  // an update-in-place had to remember to resend everything or lose it.
+  // Now: start from the existing row, apply only what the request provides.
+  const existing = users.get(e164) || {};
+  const record = {
+    ...existing,
+    name: name || existing.name || 'Friend',
+    agentId: agentId || existing.agentId || DEFAULT_AGENT,
+    agentName: agentName || existing.agentName || DEFAULT_AGENT_NAME,
+  };
   if (lcEmail) record.lcEmail = lcEmail;
   if (lcPass)  record.lcPass  = lcPass;
   if (accountType === 'child') record.accountType = 'child'; // KADE July 3 2026
