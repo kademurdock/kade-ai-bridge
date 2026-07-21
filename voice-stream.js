@@ -2632,12 +2632,22 @@ async function logCallTranscript(session) {
     const secret = process.env.KADE_CALL_INGEST_SECRET || process.env.KADE_USAGE_EVENT_SECRET;
     if (!secret) return;
     const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    // Session 21i: a DIRECT Spotter call is entirely the Spotter, so mint it
+    // under the Spotter's OWN agent (carried on the ticket as session.spotter.
+    // agentId) instead of the base agent. That lands the caller in the
+    // Spotter's conversation on hangup AND shares the Spotter's per-agent
+    // memory between calls and text. Falls back to the base agent if this
+    // wasn't a direct Spotter call or the Spotter agent isn't linked yet.
+    const _sp = (session.spotter && typeof session.spotter === 'object') ? session.spotter : {};
+    const _useSpotter = !!session._spotterDirect && !!_sp.agentId;
+    const ingestAgentId = _useSpotter ? _sp.agentId : (session.agentId || null);
+    const ingestAgentName = _useSpotter ? (_sp.name || session.agentName || null) : (session.agentName || null);
     await axios.post(`${base}/api/kade/calls/ingest`, {
       secret,
       userEmail: session.lcEmail || null,
       surface: session.surface || 'phone',
-      agentId: session.agentId || null,
-      agentName: session.agentName || null,
+      agentId: ingestAgentId,
+      agentName: ingestAgentName,
       callerName: session.callerName || null,
       from: session.from || null,
       startedAt: session.startedAt || null,
