@@ -54,7 +54,7 @@ function applyDirectionCarry(sentence, dirState) {
 
 // SHARED voice-command brain (July 13 2026): one copy for both engines.
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
-        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
+        fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText, stripAiTells } = require('./voice-commands');
 const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
 // Watch-and-alert delivery (July 16 2026, Kade's yes -- character-voice
 // alerts): when an armed watch fires (or expires), video-sight hands the
@@ -2623,7 +2623,12 @@ async function logCallTranscript(session) {
       .filter((m) => m && m.content && String(m.content).trim())
       .map((m) => ({
         role: m.role === 'user' ? 'user' : 'assistant',
-        text: scrubTranscriptText(String(m.content)),
+        // Session 21j: assistant turns also get the deterministic anti-tell
+        // scrub (sycophancy openers, apology/mask-slip boilerplate, empty
+        // signposts, canned closers). User turns are left verbatim.
+        text: m.role === 'user'
+          ? scrubTranscriptText(String(m.content))
+          : stripAiTells(scrubTranscriptText(String(m.content))),
         // July 2026: rides per-turn Spotter attribution through to the fork's
         // mint (kadeCallMerge). Null on ordinary turns -> base agentName.
         agentName: m.agentName || null,

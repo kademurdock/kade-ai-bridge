@@ -303,6 +303,58 @@ const BROWSER_UA =
 // family the speech path strips (the TTS proxy cleans audio; nothing cleaned
 // the saved words): %%%voice tags, [sound:]/[table:] cues, citation glyphs +
 // literal escape-text, thinking blocks, [END CALL], stray markdown.
+// ── Anti-AI-tells scrubber (session 21j) ────────────────────────────────────
+// Deterministic layer from AI_WRITING_TELLS_STOPGAP_REFERENCE. Removes the
+// PHRASE-based universal [BAN] tells (sycophancy openers, reflexive apology,
+// mask-slips, empty signposts, canned closers) — the mechanical noise a regex
+// can safely delete. Structure-level tells (negation pivot, cadence) are NOT
+// touched here (deleting them deterministically does more harm than good; the
+// prompt layer + a future variance/rewrite pass own those). `companion`
+// loosens/tightens nothing yet — the removals below are universal bans, safe
+// for every class — but the flag is threaded through for future gating.
+const AI_TELL_LEAD_BANS = [
+  /^\s*(?:great|excellent|fantastic|wonderful|brilliant|good|interesting|fascinating|love(?:d)?)\s+(?:question|point|catch|observation|idea|ask)\s*!?[.,]?\s*/i,
+  /^\s*(?:that['’]s|what)\s+(?:a\s+)?(?:great|excellent|fascinating|wonderful|brilliant|interesting)\b[^.!?]*[.!?]\s*/i,
+  /^\s*you['’]re\s+(?:absolutely\s+)?right[^.!?]*[.!?]\s*/i,
+  /^\s*i\s+love\s+(?:that|how)\b[^.!?]*[.!?]\s*/i,
+];
+const AI_TELL_SENTENCE_BANS = [
+  /\bas an ai(?:\s+language model)?\b[^.!?]*[.!?]/gi,
+  /\bi(?:'m| am)\s+(?:just\s+)?an ai\b[^.!?]*[.!?]/gi,
+  /\bi\s+don['’]t\s+have\s+(?:personal\s+)?(?:feelings|opinions|emotions|experiences|a body)\b[^.!?]*[.!?]/gi,
+  /\bas of my last (?:knowledge\s+)?(?:update|training)[^.!?]*[.!?]/gi,
+  /\bi\s+don['’]t\s+have\s+access\s+to\s+real-?time[^.!?]*[.!?]/gi,
+  /\bi\s+(?:can(?:'|no)?t|am unable to)\s+browse[^.!?]*[.!?]/gi,
+  /\bi\s+(?:sincerely\s+|deeply\s+)?apologize(?:\s+for[^.!?]*)?[.!?]/gi,
+  /\b(?:my\s+apologies|i'?m\s+(?:so\s+|really\s+)?sorry\s+for\s+(?:the\s+)?(?:confusion|any confusion|the mix-?up))[^.!?]*[.!?]/gi,
+];
+const AI_TELL_PHRASE_BANS = [
+  /\bit['’]s\s+(?:worth\s+noting|important\s+to\s+(?:note|remember|mention|consider))\s+that\s+/gi,
+  /\bplease\s+note\s+that\s+/gi,
+  /\bkeep\s+in\s+mind\s+that\s+/gi,
+  /\bneedless\s+to\s+say,?\s+/gi,
+  /\bit\s+goes\s+without\s+saying\s+that\s+/gi,
+  /\bat\s+the\s+end\s+of\s+the\s+day,?\s+/gi,
+];
+const AI_TELL_TRAIL_BANS = [
+  /\s*(?:i\s+)?hope\s+(?:this|that)\s+helps?!?\s*$/i,
+  /\s*(?:please\s+)?(?:feel\s+free\s+to|don['’]t\s+hesitate\s+to)\s+reach\s+out[^.!?]*[.!?]?\s*$/i,
+  /\s*let\s+me\s+know\s+if\s+(?:you\s+)?(?:have\s+any\s+questions|(?:you\s+)?need\s+anything(?:\s+else)?)[^.!?]*[.!?]?\s*$/i,
+  /\s*is\s+there\s+anything\s+else\s+i\s+can\s+(?:help|assist)[^.!?]*\??\s*$/i,
+];
+function stripAiTells(text, opts) {
+  if (!text) return text;
+  var t = String(text);
+  for (var i = 0; i < AI_TELL_LEAD_BANS.length; i++) t = t.replace(AI_TELL_LEAD_BANS[i], '');
+  for (var j = 0; j < AI_TELL_SENTENCE_BANS.length; j++) t = t.replace(AI_TELL_SENTENCE_BANS[j], '');
+  for (var k = 0; k < AI_TELL_PHRASE_BANS.length; k++) t = t.replace(AI_TELL_PHRASE_BANS[k], '');
+  for (var m = 0; m < AI_TELL_TRAIL_BANS.length; m++) t = t.replace(AI_TELL_TRAIL_BANS[m], '');
+  // A signpost removal can leave a lowercased sentence start; recapitalize.
+  t = t.replace(/(^|[.!?]\s+)([a-z])/g, function (_all, pre, ch) { return pre + ch.toUpperCase(); });
+  return t.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+module.exports.stripAiTells = stripAiTells;
+
 function scrubTranscriptText(text) {
   if (!text) return text;
   return String(text)
