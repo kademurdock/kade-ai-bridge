@@ -2745,6 +2745,7 @@ function attachMediaStreams(server, users, cfg) {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           if (session) {
             try { logCallTranscript(session); } catch (e) {}
+            try { postVoiceChatUsage(session); } catch (e) {}
             if (session.outbound && global._vsConfig.onCallEnd) {
               try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
             }
@@ -2763,6 +2764,7 @@ function attachMediaStreams(server, users, cfg) {
     ws.on('close', () => {
       if (session) {
         try { logCallTranscript(session); } catch (e) {}
+        try { postVoiceChatUsage(session); } catch (e) {}
         if (session.outbound && global._vsConfig.onCallEnd) {
           try { global._vsConfig.onCallEnd(session.callSid, session.history); } catch {}
         }
@@ -2904,6 +2906,74 @@ function verifyWebTicket(ticket) {
 // inside Deepgram's free tier and TTS chars already flow through the same
 // Inworld proxy as everything else — posting a guessed char-price here risks
 // DOUBLE-counting. Open item: confirm where phone/web TTS chars get billed.
+// Session 22 (Kade: "Hell yes charge for the chats. It doesn't matter where
+// they're happening, if they happen and they make my bill go up, users need
+// to at least know about it"). Voice-lane LLM turns ride the proxy's OWN
+// LibreChat login (admin, balance-exempt), so LibreChat's balance system
+// never bills the caller for them -- web/app TEXT chat pays, voice chat
+// didn't. This posts an ESTIMATE per call so voice thinking lands on the
+// caller's wallet and dashboard like everything else.
+//
+// Estimate shape, stated honestly: each assistant turn's prompt is about
+// (system-prompt overhead + all prior turns), because that IS the rolling
+// history each ask actually sends; the completion is the turn's own text;
+// chars/4 approximates tokens; per-million rates are env-tunable
+// (VOICE_CHAT_IN_USD_PER_MTOK / VOICE_CHAT_OUT_USD_PER_MTOK, defaults 0.60 /
+// 2.50 -- Kimi K2-class). Deterministic state-machine lines (registration)
+// ride session.history too, so this slightly OVER-estimates on signup calls;
+// metadata.estimated = true says so. Unlinked callers (no lcEmail, no
+// userId) have no wallet to bill -- skipped, same boundary as transcripts.
+// Kade's own calls post normally: the fork's deductKadeCredits is
+// ADMIN-exempt, so hers are logged (visible) but never docked.
+async function postVoiceChatUsage(session) {
+  try {
+    if (!session || session._voiceChatPosted) return;
+    session._voiceChatPosted = true;
+    const secret = process.env.KADE_USAGE_EVENT_SECRET;
+    if (!secret) return;
+    const userId = session.userId || null;
+    const userEmail = session.lcEmail || null;
+    if (!userId && !userEmail) return;
+    const hist = (session.history || []).filter((m) => m && m.content && String(m.content).trim());
+    if (!hist.length) return;
+    const OVERHEAD = parseInt(process.env.VOICE_CHAT_PROMPT_OVERHEAD_CHARS || '4000', 10);
+    let inChars = 0;
+    let outChars = 0;
+    let prior = 0;
+    for (const m of hist) {
+      const len = String(m.content).length;
+      if (m.role !== 'user') { inChars += OVERHEAD + prior; outChars += len; }
+      prior += len;
+    }
+    const inTok = Math.ceil(inChars / 4);
+    const outTok = Math.ceil(outChars / 4);
+    const IN = Number(process.env.VOICE_CHAT_IN_USD_PER_MTOK || '0.60');
+    const OUT = Number(process.env.VOICE_CHAT_OUT_USD_PER_MTOK || '2.50');
+    const costUSD = Math.round(((inTok / 1e6) * IN + (outTok / 1e6) * OUT) * 10000) / 10000;
+    const quantity = inTok + outTok;
+    if (!(quantity > 0)) return;
+    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+    const axios = require('axios');
+    await axios.post(`${base}/api/kade/usage-event`, {
+      secret,
+      userId: userId || undefined,
+      userEmail: userEmail || undefined,
+      service: 'voice_chat',
+      quantity,
+      unit: 'tokens',
+      costUSD,
+      metadata: {
+        surface: session.surface || (session.media === 'wav' ? 'web' : 'phone'),
+        agent: session.agentName,
+        estimated: true,
+        inTok,
+        outTok,
+        turns: hist.length,
+      },
+    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
+  } catch (e) { console.log('[voice-chat] usage post failed:', e && e.message); }
+}
+
 async function postWebVoiceUsage(session) {
   try {
     if (session._usagePosted || !session.userId) return;
@@ -3145,6 +3215,7 @@ function attachWebVoice(server) {
         try { postLiveUsage(session); } catch {}
         try { logCallTranscript(session); } catch {}
         try { postWebVoiceUsage(session); } catch {}
+        try { postVoiceChatUsage(session); } catch {}
         session.llmAbort = true;
         session.isSpeaking = false;
         if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
