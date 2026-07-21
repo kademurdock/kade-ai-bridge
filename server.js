@@ -616,6 +616,11 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
 app.post('/notify', async (req, res) => {
   const b = req.body || {};
   if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  // Caller forensics (July 21 2026): one line per request so "who sent this"
+  // never needs to be reconstructed from circumstantial evidence again.
+  console.log(
+    `[notify] caller=${bridgeSecretOk(req, b.secret) ? 'ADMIN' : 'agent-scoped'} agent=${String(b.agentId || '?').slice(0, 40)} userId=${b.userId ? String(b.userId).slice(0, 8) + '...' : 'NONE'} broadcast=${b.broadcast === true}`,
+  );
   const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: bridgeSecretOk(req, b.secret) && b.broadcast === true });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
