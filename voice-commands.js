@@ -473,23 +473,31 @@ function parseSpokenPassword(text) {
 
 const REG_WORDS_A = ['maple','river','sunny','cedar','bright','honey','willow','ember','clover','breeze'];
 const REG_WORDS_B = ['creek','stone','field','porch','trail','grove','light','hollow','ridge','song'];
-function friendlyPassword() {
+function friendlyPasswordParts() {
   const a = REG_WORDS_A[Math.floor(Math.random()*REG_WORDS_A.length)];
   const b = REG_WORDS_B[Math.floor(Math.random()*REG_WORDS_B.length)];
   const n = 10 + Math.floor(Math.random()*90);
-  return `${a}${b}${n}`;
+  return { a, b, n, joined: `${a}${b}${n}` };
 }
+function friendlyPassword() { return friendlyPasswordParts().joined; }
 
 const REG_INTENT_RE = /\b(?:sign(?:ing)?\s*(?:me\s*)?up|make\s+(?:me\s+)?an?\s+account|create\s+(?:me\s+)?an?\s+account|register\s+(?:me|an?\s+account)|set\s+up\s+(?:my|an?)\s+account|i\s+want\s+an?\s+account)\b/i;
 const REG_CANCEL_RE = /\b(?:cancel|never\s*mind|nevermind|forget\s+it|skip(?:\s+it)?|stop|quit|no\s+thanks?)\b/i;
 const REG_YES_RE    = /\b(?:yes|yeah|yep|yup|correct|right|that's\s+(?:right|it)|sure|go\s+ahead|start)\b/i;
 const REG_NO_RE     = /\b(?:no|nope|nah|wrong|not\s+(?:right|it|quite))\b/i;
 const REG_PICK_RE   = /\b(?:pick|choose|make|generate)\s+(?:one|it|a\s+password)?\s*(?:for\s+me)?\b|\byou\s+pick\b/i;
+// Generated-first password offer (July 21 2026, Kade: "Seems complex to make
+// them say a password"): accept/another responses for the offered password.
+const REG_OK_RE      = /\b(?:ok(?:ay)?|keep\s+it|that\s+works|that(?:'s|s)?\s+(?:fine|good|great|perfect)|sounds?\s+good|use\s+(?:it|that)|perfect|love\s+it)\b/i;
+const REG_ANOTHER_RE = /\b(?:another|different|new\s+one|something\s+else|next|again|one\s+more)\b/i;
 
 module.exports.parseSpokenEmailV2 = parseSpokenEmailV2;
 module.exports.spellOutEmail      = spellOutEmail;
 module.exports.parseSpokenPassword = parseSpokenPassword;
 module.exports.friendlyPassword   = friendlyPassword;
+module.exports.friendlyPasswordParts = friendlyPasswordParts;
+module.exports.REG_OK_RE      = REG_OK_RE;
+module.exports.REG_ANOTHER_RE = REG_ANOTHER_RE;
 module.exports.REG_INTENT_RE = REG_INTENT_RE;
 module.exports.REG_CANCEL_RE = REG_CANCEL_RE;
 module.exports.REG_YES_RE    = REG_YES_RE;

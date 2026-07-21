@@ -56,7 +56,8 @@ function applyDirectionCarry(sentence, dirState) {
 const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE_SUFFIX,
         fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText, stripAiTells,
         parseSpokenEmailV2, spellOutEmail, parseSpokenPassword, friendlyPassword,
-        REG_INTENT_RE, REG_CANCEL_RE, REG_YES_RE, REG_NO_RE, REG_PICK_RE } = require('./voice-commands');
+        REG_INTENT_RE, REG_CANCEL_RE, REG_YES_RE, REG_NO_RE, REG_PICK_RE,
+        REG_OK_RE, REG_ANOTHER_RE, friendlyPasswordParts } = require('./voice-commands');
 const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
 // Watch-and-alert delivery (July 16 2026, Kade's yes -- character-voice
 // alerts): when an armed watch fires (or expires), video-sight hands the
@@ -943,6 +944,24 @@ function releaseGreetingLock(session) {
 // -> creating. Cancel words exit cleanly at any step; 3 failed attempts on
 // one step exits gracefully. Design + receipts:
 // PHONE_REGISTRATION_REBUILD_2026-07-21.md in the project folder.
+/// Picks (or re-picks) a friendly password and offers it. The words are
+/// spoken naturally ("maple creek 42") — the final success line spells the
+/// whole thing character by character once, so the exact spelling is heard
+/// exactly when it matters and the offer stays short.
+async function offerPassword(session, mode) {
+  const reg = session.reg;
+  const p = friendlyPasswordParts();
+  reg.password = p.joined;
+  reg.passwordParts = p;
+  reg.step = 'offerPassword';
+  const spokenPwd = `${p.a} ${p.b} ${p.n}`;
+  if (mode === 'first') {
+    await speak(session, `Last thing — a password. I picked one for you: ${spokenPwd} — all one word, all lowercase. Say okay to keep it, another for a different one, or just say a password you'd rather have.`, session.voice);
+  } else {
+    await speak(session, `How about: ${spokenPwd} — all one word, all lowercase. Okay, another, or say your own.`, session.voice);
+  }
+}
+
 async function handleRegistrationTurn(session, text) {
   const reg = session.reg;
   const t = String(text || '').trim();
@@ -982,22 +1001,29 @@ async function handleRegistrationTurn(session, text) {
       return;
     }
     case 'confirmEmail':
-      if (REG_YES_RE.test(t)) { reg.step = 'askPassword'; reg.attempts = 0; await speak(session, 'Now the password you want — at least 8 characters, letters and numbers, no spaces. It will be all lowercase. Say it now, or say: pick one for me.', session.voice); }
+      if (REG_YES_RE.test(t)) { reg.attempts = 0; await offerPassword(session, 'first'); }
       else if (REG_NO_RE.test(t)) { reg.step = 'askEmail'; await speak(session, 'Okay, scratch that. Say your email again, nice and slow.', session.voice); }
       else await strike('Yes if I got the email right, no to try again.');
       return;
-    case 'askPassword': {
-      let pwd = null;
-      if (REG_PICK_RE.test(t)) pwd = friendlyPassword();
-      else pwd = parseSpokenPassword(t);
-      if (!pwd) { await strike('Just say the password itself and nothing else — like: maple creek four two. At least 8 characters, letters and numbers. Or say: pick one for me.'); return; }
-      reg.password = pwd; reg.step = 'confirmPassword'; reg.attempts = 0;
-      await speak(session, `Your password would be: ${pwd.split('').join(', ')}. All lowercase, no spaces. Good — yes or no?`, session.voice);
+    case 'offerPassword': {
+      // Generated-first (Kade's call, July 21: "Seems complex to make them
+      // say a password"). A friendly password is already picked and spoken;
+      // okay keeps it, another/no re-rolls, PICK re-rolls too, and anything
+      // long enough to BE a password is treated as them saying their own.
+      if (REG_ANOTHER_RE.test(t) || REG_PICK_RE.test(t) || REG_NO_RE.test(t)) { await offerPassword(session, 'again'); return; }
+      if (REG_OK_RE.test(t) || REG_YES_RE.test(t)) { reg.step = 'creating'; await finishRegistration(session); return; }
+      const own = parseSpokenPassword(t);
+      if (own) {
+        reg.password = own; reg.passwordParts = null; reg.step = 'confirmPassword'; reg.attempts = 0;
+        await speak(session, `Your password would be: ${own.split('').join(', ')}. All lowercase, no spaces. Good — yes or no?`, session.voice);
+        return;
+      }
+      await strike(`Say okay to keep ${reg.password}, say another for a new one, or say your own password — at least 8 characters.`);
       return;
     }
     case 'confirmPassword':
       if (REG_YES_RE.test(t)) { reg.step = 'creating'; await finishRegistration(session); }
-      else if (REG_NO_RE.test(t)) { reg.step = 'askPassword'; await speak(session, 'Okay — say the password you want, or say: pick one for me.', session.voice); }
+      else if (REG_NO_RE.test(t)) { await offerPassword(session, 'again'); }
       else await strike('Yes to lock that password in, no to pick a different one.');
       return;
     default: session.reg = null; return;
@@ -1014,7 +1040,8 @@ async function finishRegistration(session) {
   if (res && res.ok) {
     try { session.cfg.linkAccount(session.from, reg.email, reg.password, reg.name); } catch (e) { console.error('[reg] link failed:', e.message); }
     session.lcEmail = reg.email; // same-call attribution where the pipeline reads it
-    await speak(session, `You're all set${reg.name ? ', ' + reg.name : ''}! Your account is live at kademurdock dot com — log in with your email and that password, and change it there anytime. From your next call on, I'll know you by your own account. Now — where were we?`, session.voice);
+    const spelledPwd = reg.password.split('').join(', ');
+    await speak(session, `You're all set${reg.name ? ', ' + reg.name : ''}! Your account is live at kademurdock dot com. Your password, spelled out: ${spelledPwd} — all lowercase, one word. You can change it on the website anytime. From your next call on, I'll know you by your own account. Now — where were we?`, session.voice);
   } else if (res && res.exists) {
     await speak(session, `Looks like ${spellOutEmail(reg.email)} already has an account. If that's yours, you're already good on the website — let's just keep talking.`, session.voice);
   } else if (res && res.passcode) {
