@@ -1515,8 +1515,31 @@ async function streamReply(session, userText) {
   const flushChunk = () => {
     if (_chunkBuf) { const c = _chunkBuf; _chunkBuf = ''; _chunksAfterFirst++; processUnit(c); }
   };
+  // LIVE ANTI-TELL SCRUB (July 21 2026): run each finished sentence through
+  // the deterministic stripAiTells engine BEFORE it reaches TTS, so universal
+  // BANs (sycophancy openers, empty signposts, canned closers...) are never
+  // SPOKEN, not just cleaned from the saved transcript afterward. Per-sentence
+  // scope means zero added latency (the streamer already works per sentence).
+  // A leading %%%direction%%% tag is held aside so the TTS steering stays in
+  // lead position; a sentence that scrubs down to NOTHING was pure tell and is
+  // dropped whole. Fail-soft: any error passes the original sentence through.
+  const scrubSentence = (raw) => {
+    try {
+      const m = raw.match(/^(\s*%%%[^%]+%%%\s*)([\s\S]*)$/);
+      const head = m ? m[1] : '';
+      const body = m ? m[2] : raw;
+      const cleaned = stripAiTells(body);
+      if (!cleaned) return '';
+      return head + cleaned;
+    } catch (e) { return raw; }
+  };
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
+    // Sound cues / tables / END CALL units are control payloads -- never scrub.
+    if (sentence.indexOf('[sound:') === -1 && sentence.indexOf('[table:') === -1 && !/\[END CALL\]/i.test(sentence)) {
+      sentence = scrubSentence(sentence);
+      if (!sentence) return; // whole sentence was tell -- skip it, keep _firstShipped state
+    }
     if (!_firstShipped) { _firstShipped = true; processUnit(sentence); return; }
     if (sentence.indexOf('[sound:') !== -1 || sentence.indexOf('[table:') !== -1 || /\[END CALL\]/i.test(sentence)) {
       flushChunk();
