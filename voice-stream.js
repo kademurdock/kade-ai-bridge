@@ -2003,10 +2003,12 @@ const FILLER_PHRASES = [
 // once per call (see RAMBLE_HINT section).
 // KADE July 12 2026: interrupt-invites retired ("you don't have to put that
 // feel free to interrupt thing in there anymore") — typing-sound heads-up stays.
+// KADE July 22 2026 ("the thinking sound warning could be shortened too"):
+// one short clause each, same promise.
 const ORIENTATION_LINES = [
-  "Real quick -- when I'm thinking, you'll hear a little typing sound. I'm still right here.",
-  "Quick note -- a typing sound just means I'm thinking. Still with you.",
-  "One thing -- you'll hear a little typing while I think. I'm still on the line.",
+  "Typing sound just means I'm thinking.",
+  "If you hear typing, I'm just thinking.",
+  "A little typing means I'm thinking.",
 ];
 
 // Lazy per-voice cache so a given filler phrase is only synthesized once per
@@ -2547,21 +2549,18 @@ function attachMediaStreams(server, users, cfg) {
           // invitation so the caller is never invited to talk and then
           // talked over. Single synth also removes the second TTS round-trip
           // (the old post-greeting orientation gap WAS that synth latency).
+          // KADE July 22 2026 ("they should all say something with their
+          // name in it. Like, Hey it's Kiana"): pruned to ONLY openers that
+          // carry the agent's name — a caller must never have to guess who
+          // picked up. The LLM character opener (fetchLlmOpener) already
+          // enforces the same rule in its instruction.
           const knownOpeners = [
             `Hey ${name}! It's ${agentName}.`,
-            `${name}! Good to hear from you.`,
             `Hey, ${name}! ${agentName} here.`,
-            `Oh it's ${name}! ${agentName} is in.`,
-            `Hey ${name}, ${agentName} picked up.`,
             `It's ${agentName} — hey ${name}!`,
-            `${name}! Caught me at a good time.`,
-            `There you are, ${name}!`,
             `Hey ${name} — ${agentName} speaking.`,
-            `${name}! Glad you called.`,
-            `Oh hey, ${name}! Perfect timing.`,
-            `Hey there, ${name}!`,
-            `Hi ${name} — ${agentName} picking up.`,
-            `Hey ${name}! Good timing.`,
+            `Hi ${name} — it's ${agentName}.`,
+            `${name}! It's ${agentName}.`,
           ];
           const unknownOpeners = [
             `Hey! I don't think we've met — I'm ${agentName}.`,
@@ -2572,14 +2571,16 @@ function attachMediaStreams(server, users, cfg) {
             `Hello! I'm ${agentName}, and this is a new number to me.`,
             `Hey there! I'm ${agentName} — you can register at kademurdock dot com slash signup so I remember you next time.`,
           ];
+          // KADE July 22 2026 ("the go ahead I'm listening thing is a bit
+          // much"): a couple of words at most. These play on the PHONE only,
+          // where there is no screen saying the line is live — the app
+          // greeting dropped its invite entirely (screen + VoiceOver already
+          // say the call state).
           const INVITES = [
-            `So — what's up?`,
-            `Go ahead, I'm listening.`,
-            `Talk to me — what's going on?`,
-            `So, what's on your mind?`,
-            `Go ahead whenever you're ready.`,
-            `What can I do for you?`,
-            `I'm all ears — go ahead.`,
+            `What's up?`,
+            `Go ahead.`,
+            `What's going on?`,
+            `Talk to me.`,
           ];
           const pick     = (arr) => arr[Math.floor(Math.random() * arr.length)];
           if (outboundCtx && !outboundCtx.greeting) {
@@ -2823,6 +2824,9 @@ async function logCallTranscript(session) {
     await axios.post(`${base}/api/kade/calls/ingest`, {
       secret,
       userEmail: session.lcEmail || null,
+      // KADE July 22 2026 (call continuity): non-null tells the fork's mint
+      // to APPEND into this existing conversation instead of creating one.
+      targetConversationId: session.targetConversationId || null,
       surface: session.surface || 'phone',
       agentId: ingestAgentId,
       agentName: ingestAgentName,
@@ -3115,6 +3119,33 @@ function attachWebVoice(server) {
         // Direct Spotter call (July 18 2026): the client asked for the Spotter
         // from the first tap — the character never speaks on this call.
         session._spotterDirect = msg.spotterDirect === true;
+        // KADE July 22 2026 (call continuity): when the app starts a call
+        // FROM an open conversation it sends that conversation's id; the
+        // post-call ingest then APPENDS the transcript into it instead of
+        // minting a fresh conversation per call ("they should have to go to
+        // a new conversation to get a fresh call"), and the history seeding
+        // below hands the agent what was already said there.
+        session.targetConversationId =
+          (typeof msg.conversationId === 'string' && /^[0-9a-f-]{8,64}$/i.test(msg.conversationId))
+            ? msg.conversationId
+            : null;
+        if (session.targetConversationId && cfg.fetchConversationContext) {
+          cfg.fetchConversationContext({ email: t.email, conversationId: session.targetConversationId })
+            .then((turns) => {
+              if (session && Array.isArray(turns) && turns.length) {
+                // Seed BEFORE the greeting's own history entry if possible;
+                // order within history is what matters, and unshift keeps
+                // prior conversation turns ahead of anything this call adds.
+                const seeded = turns.map((tn) => ({
+                  role: tn.role === 'user' ? 'user' : 'assistant',
+                  content: String(tn.text || '').slice(0, 2000),
+                }));
+                session.history.unshift(...seeded);
+                console.log(`[web-voice] seeded ${seeded.length} prior turns from convo ${session.targetConversationId}`);
+              }
+            })
+            .catch(() => {});
+        }
         console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice} spotter=${session.spotter ? session.spotter.name + '/' + session.spotter.voice : 'none'}${session._spotterDirect ? ' DIRECT' : ''}`);
         // July 13 2026 drift audit: web streaming calls never got the July 12
         // caller-memories fix — the phone had it, the sibling engine surface
@@ -3163,10 +3194,17 @@ function attachWebVoice(server) {
           // notices still speak in the character's voice, so no dead air.
         } else {
           const first = (t.name || '').trim().split(/\s+/)[0] || null;
-          // KADE July 12 2026: interrupt-invite retired — short and natural.
+          // KADE July 22 2026 ("too long and wordy... the go ahead I'm
+          // listening thing is a bit much since the screen and vo says the
+          // same thing"): app greeting is now JUST the name line. The app's
+          // own screen + VoiceOver announce the listening state, and the
+          // NEW client-side thinking sound (this same session) covers the
+          // typing orientation the phone greeting still carries. Shorter
+          // greeting also shrinks the echo window that sometimes let the
+          // agent hear its own greeting tail.
           const line = first
-            ? `Hey ${first}! ${session.agentName} here — go ahead.`
-            : `Hey! ${session.agentName} here — go ahead.`;
+            ? `Hey ${first}! It's ${session.agentName}.`
+            : `Hey! It's ${session.agentName}.`;
           speak(session, line, session.voice).catch(() => {});
         }
         return;

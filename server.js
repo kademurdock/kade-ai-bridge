@@ -1266,6 +1266,24 @@ async function lookupVoicePref(identity, agentId) {
     return (r.data && r.data.voice) || null;
   } catch { return null; }
 }
+// KADE July 22 2026 (call continuity): the last stretch of an existing
+// conversation, for seeding a call that CONTINUES it. Mirrors
+// fetchCallMemories -- same secret header, same fail-soft (a miss just
+// means the call starts without prior context, never a broken call).
+// Returns an array of {role, text} turns, oldest first, or [].
+async function fetchConversationContext({ email, conversationId }) {
+  if (!USAGE_EVENT_SECRET || !email || !conversationId) return [];
+  try {
+    const r = await axios.post(`${FORK_USAGE_URL}/api/kade/calls/context`, {
+      email, conversationId,
+    }, {
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET },
+      timeout: 3500,
+    });
+    return (r.data && Array.isArray(r.data.turns)) ? r.data.turns : [];
+  } catch { return []; }
+}
+
 async function fetchCallMemories(identity, agentId, opts = {}) {
   if (!USAGE_EVENT_SECRET || !identity) return null;
   try {
@@ -2626,6 +2644,7 @@ attachMediaStreams(server, users, {
   lookupVoicePref,   // July 12 2026: per-caller per-agent voice picks (fork)
   ingestVoicePref,
   fetchCallMemories, // July 12 2026: caller's own memory cards on calls
+  fetchConversationContext, // July 22 2026: call continuity -- prior turns of the open conversation
   fetchPronunciationDictionary, // July 20 2026: per-user name/word respellings
   // ── July 21 2026 (phone registration rebuild — PHONE_REGISTRATION_REBUILD doc) ──
   // Spoken account signup on calls. createAccount posts the register with the
