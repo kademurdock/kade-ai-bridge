@@ -742,7 +742,7 @@ function openDeepgramFlux(session, key) {
       // EndOfTurn deadline comment.
       const maxHold = parseInt(process.env.FLUX_CARRY_MAX_MS || '2500', 10);
       if (session._fluxCarry && session._fluxCarryAt && Date.now() - session._fluxCarryAt >= maxHold && session._fluxDispatch) {
-        console.log(`[timing] flux carry aged out at StartOfTurn -- dispatching held thought`);
+        console.log(`[timing ${session.streamSid}] flux carry aged out at StartOfTurn -- dispatching held thought`);
         session._fluxDispatch();
         return;
       }
@@ -788,7 +788,14 @@ function openDeepgramFlux(session, key) {
         // KADE July 22 2026 (the speed bug, from her own test call's logs):
         // receipts show how long the finished thought sat held.
         const heldMs = session._fluxCarryAt ? Date.now() - session._fluxCarryAt : 0;
-        if (heldMs > 0) console.log(`[timing] flux dispatch after ${heldMs}ms total hold`);
+        if (heldMs > 0) console.log(`[timing ${session.streamSid}] flux dispatch after ${heldMs}ms total hold`);
+        // Session 22: stamp the moment the thought left STT-land, so the
+        // turn-start receipt downstream can print a REAL number (the old
+        // one read _bufStartedAt, a CLASSIC-path stamp flux never sets --
+        // which is why production logs said "+?ms". Receipts that print
+        // question marks answer no questions.)
+        session._dispatchAt = Date.now();
+        if (session._fluxCapTimer) { clearTimeout(session._fluxCapTimer); session._fluxCapTimer = null; }
         session._fluxCarryAt = null;
         session._fluxDispatch = null;
         session._fluxCarry = null;
@@ -815,8 +822,28 @@ function openDeepgramFlux(session, key) {
         if (!session._fluxCarryAt) session._fluxCarryAt = Date.now();
         session._fluxDispatch = dispatch;
         const maxHold = parseInt(process.env.FLUX_CARRY_MAX_MS || '2500', 10);
+        // Session 22, the RESIDUAL from a235e60, caught by a real receipt
+        // (an 11421ms hold on Amber's noisy Spotter call, cap message
+        // attached): the commit message promised "dispatch at cap from
+        // timer OR StartOfTurn" -- but no cap timer ever existed. The only
+        // timer was the 900ms grace, which any Update-with-text CANCELS
+        // without re-arming, so on a noisy line a finished thought waited
+        // for the NEXT EndOfTurn/StartOfTurn EVENT to notice the cap had
+        // long passed. This deadline timer is that missing half: armed
+        // once at first completion, canceled only by dispatch itself,
+        // never by noise. Everything it fires through already existed.
+        if (!session._fluxCapTimer) {
+          const remain = Math.max(0, maxHold - (Date.now() - session._fluxCarryAt));
+          session._fluxCapTimer = setTimeout(() => {
+            session._fluxCapTimer = null;
+            if (session._fluxCarry && session._fluxDispatch) {
+              console.log(`[timing ${session.streamSid}] flux carry hit the ${maxHold}ms cap (deadline timer) -- dispatching now`);
+              session._fluxDispatch();
+            }
+          }, remain);
+        }
         if (Date.now() - session._fluxCarryAt >= maxHold) {
-          console.log(`[timing] flux carry hit the ${maxHold}ms cap -- dispatching now`);
+          console.log(`[timing ${session.streamSid}] flux carry hit the ${maxHold}ms cap -- dispatching now`);
           dispatch();
         } else {
           if (session._fluxGraceTimer) clearTimeout(session._fluxGraceTimer);
@@ -832,6 +859,7 @@ function openDeepgramFlux(session, key) {
   dg.on('error', (e) => console.error('[voice-stream] Deepgram FLUX error:', e.message));
   dg.on('close', (code) => {
     if (session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
+    if (session._fluxCapTimer) { clearTimeout(session._fluxCapTimer); session._fluxCapTimer = null; }
     console.log(`[voice-stream] Deepgram FLUX closed ${session.streamSid} (${code})`);
   });
   return dg;
@@ -1203,8 +1231,14 @@ async function handleUtterance(session, text) {
   if (session.sendCaption) session.sendCaption('user', text);
   if (session.sendState) session.sendState('thinking');
   session._turnT0 = Date.now();
-  console.log(`[timing] turn-start +${session._bufStartedAt ? session._turnT0 - session._bufStartedAt : '?'}ms after first is_final (state 'thinking' sent = her thinking sound starts NOW)`);
+  // Session 22: measure from the flux dispatch stamp (the classic-path
+  // _bufStartedAt never exists on flux -- production printed "+?ms").
+  {
+    const t0 = session._dispatchAt || session._bufStartedAt;
+    console.log(`[timing ${session.streamSid}] turn-start +${t0 ? session._turnT0 - t0 : 0}ms after dispatch (state 'thinking' sent = her thinking sound starts NOW)`);
+  }
   session._bufStartedAt = null;
+  session._dispatchAt = null;
   session.busy = true;
   try {
     // ── Spoken registration (July 21 2026) — deterministic, never the LLM. ──
@@ -1644,7 +1678,7 @@ async function streamReply(session, userText) {
           if (webClip) {
             if (!fillerCtx.firstAudioReady) {
               fillerCtx.firstAudioReady = true;
-              if (session._turnT0) console.log(`[timing] first-audio +${Date.now() - session._turnT0}ms after turn-start (web clip)`);
+              if (session._turnT0) console.log(`[timing ${session.streamSid}] first-audio +${Date.now() - session._turnT0}ms after turn-start (web clip)`);
             }
             await playBufferWav(session, webClip, { noCaption: true });
           }
@@ -1654,6 +1688,7 @@ async function streamReply(session, userText) {
         if (!clip) continue;
         if (!fillerCtx.firstAudioReady) {
           fillerCtx.firstAudioReady = true; // a table sound counts as first audio — stop the typing filler
+          if (session._turnT0) console.log(`[timing ${session.streamSid}] first-audio +${Date.now() - session._turnT0}ms after turn-start (phone clip)`);
           if (fillerCtx.fillerStarted) {
             session.sendClear();
             await new Promise((r) => setTimeout(r, 100));
@@ -1665,6 +1700,10 @@ async function streamReply(session, userText) {
       if (mulawBuf && !session.llmAbort) {
         if (!fillerCtx.firstAudioReady) {
           fillerCtx.firstAudioReady = true;
+          // Session 22: THE first-audio receipt that actually fires on a
+          // normal spoken reply (the web-clip one above only fires on game
+          // sounds -- which is why production showed no first-audio lines).
+          if (session._turnT0) console.log(`[timing ${session.streamSid}] first-audio +${Date.now() - session._turnT0}ms after turn-start (speech)`);
           // Only worth a clear+pause if the filler actually played something —
           // keeps the common fast-reply path exactly as quick as before.
           if (fillerCtx.fillerStarted) {
@@ -1752,6 +1791,14 @@ async function streamReply(session, userText) {
   const TURN_STALL_MS = parseInt(process.env.PHONE_TURN_STALL_MS || '45000', 10);
   const STALL_RETRIES = parseInt(process.env.PHONE_STALL_RETRIES || '1', 10);
   let turnTimedOut = false;
+  // Session 22 receipts: the leg between turn-start and the first LLM
+  // token was INVISIBLE (Kade: "answers were taking like ten seconds...
+  // the other things not so much"). Two stamps bracket the whole
+  // ask-stream leg: request-sent (everything before it = prep: memories,
+  // context, outgoing build) and first-token (everything between =
+  // proxy login + LibreChat agents pipeline + model first token).
+  let _llmFirstTokenLogged = false;
+  if (session._turnT0) console.log(`[timing ${session.streamSid}] llm-request sent +${Date.now() - session._turnT0}ms after turn-start`);
   for (let attempt = 0; attempt <= STALL_RETRIES; attempt++) {
     turnTimedOut = false;
     const res = await streamPost(
@@ -1787,7 +1834,13 @@ async function streamReply(session, userText) {
           try {
             const d = JSON.parse(raw);
             if (d.error) { clearInterval(stallCheck); reject(new Error(d.error)); return; }
-            if (d.token) { lastProgress = Date.now(); fullReply += d.token; if (!session.llmAbort) streamer.push(d.token); }
+            if (d.token) {
+              if (!_llmFirstTokenLogged) {
+                _llmFirstTokenLogged = true;
+                if (session._turnT0) console.log(`[timing ${session.streamSid}] llm-first-token +${Date.now() - session._turnT0}ms after turn-start`);
+              }
+              lastProgress = Date.now(); fullReply += d.token; if (!session.llmAbort) streamer.push(d.token);
+            }
           } catch {}
         }
       });
