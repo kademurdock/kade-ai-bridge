@@ -627,7 +627,7 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert }) {
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   const message = String(body || '').trim().slice(0, 300);
@@ -635,13 +635,23 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   title = String(title || agentName).slice(0, 40);
   const { day, hhmm } = centralClock();
   if (notifyCounts.day !== day) notifyCounts = { day, global: 0, perAgent: {}, lastSentMs: notifyCounts.lastSentMs };
-  // guardrails (server-side, unbypassable)
+  // guardrails (server-side, unbypassable by AGENTS).
+  // Session 23 `adminAlert` (BRIDGE_SECRET callers only — gated at the
+  // route, same pattern as broadcast): owner alerts (the fork's new
+  // bug-report pings, kadeOwnerAlerts) skip the cooldown and daily caps so
+  // they are never silently swallowed by — and never EAT — the agents'
+  // outreach budget. What still applies to them, deliberately: the global
+  // enabled switch, per-agent mute (muting 'kade-feedback-alert' in
+  // notify-prefs turns bug pushes off with no code change), and quiet
+  // hours unless urgent (a 2 a.m. report waits for morning; its in-chat
+  // nudge carries it meanwhile).
+  const skipBudget = adminAlert === true;
   if (!notifyPrefs.enabled) return { ok: false, blocked: 'notifications are globally muted' };
   if (notifyPrefs.mutedAgents.includes(agentId)) return { ok: false, blocked: 'this agent is muted' };
   if (!urgent && notifyInQuietHours(hhmm)) return { ok: false, blocked: 'quiet hours (Central)' };
-  if (Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return { ok: false, blocked: 'cooldown active' };
-  if (notifyCounts.global >= notifyPrefs.globalDailyCap) return { ok: false, blocked: 'daily total cap reached' };
-  if ((notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return { ok: false, blocked: 'per-agent daily cap reached' };
+  if (!skipBudget && Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return { ok: false, blocked: 'cooldown active' };
+  if (!skipBudget && notifyCounts.global >= notifyPrefs.globalDailyCap) return { ok: false, blocked: 'daily total cap reached' };
+  if (!skipBudget && (notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return { ok: false, blocked: 'per-agent daily cap reached' };
   // Per-user targeting: a userId restricts delivery to THAT person's linked
   // device(s) only — it never falls back to the full pool, so an unlinked or
   // not-yet-registered user gets zero targets, never someone else's phone.
@@ -657,7 +667,9 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
-  if (sent > 0) { notifyCounts.global++; notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1; notifyCounts.lastSentMs = Date.now(); }
+  // adminAlert sends don't advance the counters — the outreach budget
+  // belongs to the agents, and owner alerts must not spend it.
+  if (sent > 0 && !skipBudget) { notifyCounts.global++; notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1; notifyCounts.lastSentMs = Date.now(); }
   console.log(`[notify] ${agentName} (${agentId}) sent=${sent} global=${notifyCounts.global}/${notifyPrefs.globalDailyCap}`);
   return { ok: true, sent, from: agentName, remainingToday: Math.max(0, notifyPrefs.globalDailyCap - notifyCounts.global) };
 }
@@ -671,7 +683,7 @@ app.post('/notify', async (req, res) => {
   console.log(
     `[notify] caller=${bridgeSecretOk(req, b.secret) ? 'ADMIN' : 'agent-scoped'} agent=${String(b.agentId || '?').slice(0, 40)} userId=${b.userId ? String(b.userId).slice(0, 8) + '...' : 'NONE'} broadcast=${b.broadcast === true}`,
   );
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: bridgeSecretOk(req, b.secret) && b.broadcast === true });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: bridgeSecretOk(req, b.secret) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
