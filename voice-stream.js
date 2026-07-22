@@ -737,6 +737,15 @@ function openDeepgramFlux(session, key) {
       // voice opens turns too. Same posture as the old SpeechStarted skip —
       // words first, then the content-based echo gate decides.
       session._fluxTurnText = '';
+      // KADE July 22 2026 (speed bug): an aged-out carry dispatches NOW
+      // instead of waiting on whatever just opened this turn -- see the
+      // EndOfTurn deadline comment.
+      const maxHold = parseInt(process.env.FLUX_CARRY_MAX_MS || '2500', 10);
+      if (session._fluxCarry && session._fluxCarryAt && Date.now() - session._fluxCarryAt >= maxHold && session._fluxDispatch) {
+        console.log(`[timing] flux carry aged out at StartOfTurn -- dispatching held thought`);
+        session._fluxDispatch();
+        return;
+      }
       // Grace window: they started talking again — hold the carried text and
       // wait for this new turn to finish (the two get stitched together).
       if (session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
@@ -776,6 +785,12 @@ function openDeepgramFlux(session, key) {
       const full = (carry + turnText).trim();
       if (!full) return;
       const dispatch = () => {
+        // KADE July 22 2026 (the speed bug, from her own test call's logs):
+        // receipts show how long the finished thought sat held.
+        const heldMs = session._fluxCarryAt ? Date.now() - session._fluxCarryAt : 0;
+        if (heldMs > 0) console.log(`[timing] flux dispatch after ${heldMs}ms total hold`);
+        session._fluxCarryAt = null;
+        session._fluxDispatch = null;
         session._fluxCarry = null;
         session._fluxGraceTimer = null;
         const sinceSpoke = Date.now() - session.lastSpokAt;
@@ -787,9 +802,26 @@ function openDeepgramFlux(session, key) {
       };
       const grace = parseInt(process.env.FLUX_POST_TURN_GRACE_MS || '900', 10);
       if (grace > 0) {
+        // KADE July 22 2026 — THE SPEED BUG. The 900ms stitch-grace was
+        // UNBOUNDED: any noise that opened a turn (speakerphone, the
+        // agent's own echo, a breath) canceled this timer, and the held
+        // thought waited for the NEXT EndOfTurn -- which re-armed another
+        // 900ms, and so on. Quiet room = 0.9s fixed cost; noisy room =
+        // "upwards of ten seconds sometimes," her exact report. The stitch
+        // stays (real mid-thought resumes still merge), but a finished
+        // thought now has a HARD deadline: FLUX_CARRY_MAX_MS (default
+        // 2500) after it FIRST completed, it dispatches no matter what.
         session._fluxCarry = full;
-        if (session._fluxGraceTimer) clearTimeout(session._fluxGraceTimer);
-        session._fluxGraceTimer = setTimeout(dispatch, grace);
+        if (!session._fluxCarryAt) session._fluxCarryAt = Date.now();
+        session._fluxDispatch = dispatch;
+        const maxHold = parseInt(process.env.FLUX_CARRY_MAX_MS || '2500', 10);
+        if (Date.now() - session._fluxCarryAt >= maxHold) {
+          console.log(`[timing] flux carry hit the ${maxHold}ms cap -- dispatching now`);
+          dispatch();
+        } else {
+          if (session._fluxGraceTimer) clearTimeout(session._fluxGraceTimer);
+          session._fluxGraceTimer = setTimeout(dispatch, grace);
+        }
       } else {
         dispatch();
       }
