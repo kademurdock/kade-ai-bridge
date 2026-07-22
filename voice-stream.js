@@ -1809,7 +1809,11 @@ async function streamReply(session, userText) {
         'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
-      { agentId: session.agentId, messages: outgoing }
+      // Session 23 identity threading: session.lcEmail names who's really on
+      // the line (registration + web-voice ticket both set it). Proxy forwards
+      // it as kadeOnBehalfOf; fork honors it admin-only for per-user Kade
+      // tools — Amber's bug reports file as Amber now, not the service account.
+      { agentId: session.agentId, messages: outgoing, userEmail: session.lcEmail || undefined }
     );
     await new Promise((resolve, reject) => {
       let buf = '';
@@ -2147,7 +2151,7 @@ async function fetchLlmOpener(session, user) {
         'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
-      { agentId: session.agentId, messages: [{ role: 'user', content: instruction }] }
+      { agentId: session.agentId, messages: [{ role: 'user', content: instruction }], userEmail: session.lcEmail || undefined }
     );
     let text = '';
     await new Promise((resolve, reject) => {
