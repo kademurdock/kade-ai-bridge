@@ -875,7 +875,13 @@ function openDeepgram(session) {
           bargeIn(session);
         }
       }
-      if (msg.is_final) session.finalBuf += (session.finalBuf ? ' ' : '') + text;
+      if (msg.is_final) {
+        // KADE July 22 2026 (speed-bug instrumentation): stamp the FIRST
+        // is_final of this buffer -- [timing] lines below decompose her
+        // reported speaking->beep gap into STT-finalize vs turn-fire.
+        if (!session.finalBuf) session._bufStartedAt = Date.now();
+        session.finalBuf += (session.finalBuf ? ' ' : '') + text;
+      }
       if (msg.speech_final && session.finalBuf) {
         const utterance = session.finalBuf.trim();
         session.finalBuf = '';
@@ -902,8 +908,9 @@ function openDeepgram(session) {
         const echoPossible = session.isSpeaking || sinceSpoke < 3000;
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
         const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        console.log(`[timing] speech_final +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms speaking=${!!session.isSpeaking})`);
         if (!isEcho) handleUtterance(session, utterance);
-        else console.log(`[voice-stream] echo-dropped: "${utterance.slice(0, 60)}"`);
+        else console.log(`[voice-stream] echo-dropped (overlap, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
       }
       return;
     }
@@ -915,8 +922,9 @@ function openDeepgram(session) {
       const echoPossible = session.isSpeaking || sinceSpoke < 3000; // see speech_final note
       const echoWindow = session.isSpeaking || sinceSpoke < 1200;
       const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+      console.log(`[timing] UtteranceEnd +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms) -- speech_final never came`);
       if (!isEcho) handleUtterance(session, utterance);
-      else console.log(`[voice-stream] echo-dropped (UtteranceEnd): "${utterance.slice(0, 60)}"`);
+      else console.log(`[voice-stream] echo-dropped (UtteranceEnd, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
     }
   });
 
@@ -1162,6 +1170,9 @@ async function handleUtterance(session, text) {
   // client UI mirrors the turn. Both are undefined on phone sessions.
   if (session.sendCaption) session.sendCaption('user', text);
   if (session.sendState) session.sendState('thinking');
+  session._turnT0 = Date.now();
+  console.log(`[timing] turn-start +${session._bufStartedAt ? session._turnT0 - session._bufStartedAt : '?'}ms after first is_final (state 'thinking' sent = her thinking sound starts NOW)`);
+  session._bufStartedAt = null;
   session.busy = true;
   try {
     // ── Spoken registration (July 21 2026) — deterministic, never the LLM. ──
@@ -1599,7 +1610,10 @@ async function streamReply(session, userText) {
           // effect never re-sends the previous sentence's caption.
           const webClip = pickGameClipWeb(cue);
           if (webClip) {
-            if (!fillerCtx.firstAudioReady) fillerCtx.firstAudioReady = true;
+            if (!fillerCtx.firstAudioReady) {
+              fillerCtx.firstAudioReady = true;
+              if (session._turnT0) console.log(`[timing] first-audio +${Date.now() - session._turnT0}ms after turn-start (web clip)`);
+            }
             await playBufferWav(session, webClip, { noCaption: true });
           }
           continue;
