@@ -518,7 +518,11 @@ function sendApnsPush(deviceToken, title, body) {
     try { client = http2.connect(APNS_HOST); }
     catch (e) { return resolve({ token: deviceToken, status: 0, error: e.message }); }
     client.on('error', (e) => resolve({ token: deviceToken, status: 0, error: e.message }));
-    const payload = JSON.stringify({ aps: { alert: { title, body }, sound: 'default' } });
+    // July 22 2026: Kade's own Notify.wav (bundled in the iOS app since the staged
+    // app commit) is the push sound. Builds that predate the bundle fall back to the
+    // system default automatically (Apple's rule for a missing sound file), so this
+    // is safe to ship ahead of her next app build. Revert hatch: PUSH_SOUND=default.
+    const payload = JSON.stringify({ aps: { alert: { title, body }, sound: process.env.PUSH_SOUND || 'Notify.wav' } });
     const r = client.request({
       ':method': 'POST',
       ':path': `/3/device/${deviceToken}`,
