@@ -326,7 +326,7 @@ function mentionsDeepThink(text) {
 // Bare "switch agents"-style request with no (matchable) name: the caller
 // wants the two-step flow — ask WHO, then match their answer by itself.
 function isBareSwitchRequest(text) {
-  return /^(?:can (?:you|we) )?(?:please )?(?:switch|change)(?:\s+(?:the\s+)?(?:agents?|characters?|to someone else))?[.!?]?$/i.test(text.trim())
+  return /^(?:can (?:you|we) )?(?:please )?(?:switch|change|summon)(?:\s+(?:the\s+)?(?:agents?|characters?|some(?:one|body)(?:\s+else)?|to someone else))?[.!?]?$/i.test(text.trim())
       || /^(?:i(?:'d| would)? (?:like|want) to )?(?:talk|speak) to some(?:one|body) else[.!?]?$/i.test(text.trim());
 }
 

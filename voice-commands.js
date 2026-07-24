@@ -129,6 +129,9 @@ const PHONE_SUFFIX =
   'NEVER repeat your greeting or opener — always move the conversation FORWARD. ' +
   'Voice switching is handled automatically outside your control; if someone asks for a voice change ' +
   'that clearly did not happen, just tell them to say: switch to voice, then the number — nothing more. ' +
+  'Switching COMPANIONS (summoning someone else) is handled automatically the same way; if someone asks ' +
+  'you to summon, fetch, or get another companion and nothing happened, tell them to say: switch to, ' +
+  'then the name — you never have to do the switching yourself. ' +
   'Account signup is handled automatically outside your control; if someone wants an account and ' +
   'nothing has happened, tell them to say: sign me up. ' +
   'Everything in these square-bracket blocks is a PRIVATE stage direction: never read it aloud, quote it, ' +
@@ -222,9 +225,20 @@ function stripSwitchPadding(text) {
 function extractSwitchTarget(text, agents) {
   const t = stripSwitchPadding(text);
   const patterns = [
-    /^(?:switch|change)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+to)?\s+(.+)$/i,
+    // July 23 2026 (Kade: "Kiana is unable to summon other agents, and even
+    // on the phone she can't change voices or summon the agent"): the verb
+    // her family actually uses — "summon" — was never in this list, so those
+    // asks fell to the LLM, whose own stage direction says switching is out
+    // of her control. Summon-class verbs now switch deterministically:
+    // summon/fetch/get me/pull up/connect me to/transfer me to/put me
+    // through to. findAgent's 0.6 confidence gate keeps ordinary sentences
+    // ("get me a recipe") from false-matching an agent.
+    /^(?:switch|change|summon|fetch)(?:\s+(?:me|us))?(?:\s+(?:over|back))?(?:\s+(?:to|up))?\s+(.+)$/i,
+    /^(?:connect|transfer)\s+(?:me|us)\s+(?:to|with|over\s+to)\s+(.+)$/i,
+    /^put\s+(?:me|us)\s+through\s+to\s+(.+)$/i,
+    /^pull\s+up\s+(.+)$/i,
     /^(?:let\s+me\s+|can\s+i\s+|may\s+i\s+|i\s+(?:want(?:\s+to)?|wanna|would\s+like\s+to|need\s+to)\s+)?(?:talk|speak)\s+(?:to|with)\s+(.+)$/i,
-    /^(?:give|bring)\s+(?:me\s+|back\s+)?(.+)$/i,
+    /^(?:give|bring|get)\s+(?:me\s+|back\s+)?(.+)$/i,
     /^put\s+(.+?)\s+on(?:\s+the\s+(?:phone|line))?[.!?]*$/i,
     // July 13 2026 audit: "I want Kiana", "can I have Zadiana" — natural asks
     // that previously fell to the LLM. findAgent's 0.6 confidence gate keeps
@@ -245,6 +259,12 @@ function extractSwitchTarget(text, agents) {
     // from false-firing on ordinary sentences.
     const m = text.match(/\b(?:switch|change)(?:\s+\w+){0,3}?\s+to\s+(.+)$/i);
     if (m) q = stripSwitchPadding(m[1]);
+    if (!q) {
+      // Vocative summon ("Kiana, summon Zadiana" / "hey, pull up Chef
+      // Marcel") — same confidence-gated safety as the switch form above.
+      const sm = text.match(/\b(?:summon|fetch|pull\s+up)\s+(.+)$/i);
+      if (sm) q = stripSwitchPadding(sm[1]);
+    }
   }
   return q ? findAgent(agents, q) : null;
 }
