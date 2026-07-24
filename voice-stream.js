@@ -552,6 +552,19 @@ class CallSession {
     // (whole WAV clips over the socket, client schedules playback).
     this.media   = 'mulaw';
     this.surface = 'phone';
+    // KADE July 24 2026 ("the agent says a couple words then quits... I'm
+    // wondering if the auto barge in is making them forfeit their turn on
+    // accident. Maybe people have an interrupt bot button instead."):
+    // 'auto'  = interim speech can cut the agent off (classic phone flow;
+    //           PSTN keeps this — no buttons on a landline, but any keypad
+    //           press now barges too).
+    // 'push'  = ONLY the Stop button (the {type:'barge'} control the app
+    //           and web client already send) interrupts. Web/app sessions
+    //           default here: music, VoiceOver, the Clubhouse PA — modern
+    //           rooms are full of speech that is not the caller, and one
+    //           stray interim was killing whole turns.
+    // Completed utterances still take their normal turn either way.
+    this.bargeMode = 'auto';
   }
 
   twSend(obj) {
@@ -608,13 +621,19 @@ function armBargeRecovery(session) {
     // suspenders) or a new turn is running/speaking: nothing to recover.
     if (session.busy || session.isSpeaking) return;
     if ((session._lastUtteranceAt || 0) >= armedAt) return;
-    if (session.finalBuf || session._fluxTurnText || session._fluxCarry) {
+    // KADE July 24 2026 ("says a couple words then quits and doesn't come
+    // back"): with music / the Clubhouse PA / VoiceOver in the room, STT
+    // turn-text NEVER goes quiet — this recheck looped every 3 seconds
+    // forever and the recovery line never fired. Twenty seconds of "she's
+    // still mid-sentence" is not a sentence; recover anyway.
+    const hardOver = Date.now() - armedAt > 20000;
+    if (!hardOver && (session.finalBuf || session._fluxTurnText || session._fluxCarry)) {
       // She IS talking, the final/turn just hasn't closed yet -- check again.
       // (_fluxTurnText is the Flux engine's mid-turn signal; finalBuf is nova's.)
       session._bargeRecoveryTimer = setTimeout(check, 3000);
       return;
     }
-    console.log('[voice-stream] barge-in got no follow-up utterance -- recovering');
+    console.log('[voice-stream] barge-in got no follow-up utterance -- recovering' + (hardOver ? ' (hard deadline)' : ''));
     const line = BARGE_RECOVERY_LINES[Math.floor(Math.random() * BARGE_RECOVERY_LINES.length)];
     speak(session, line, session.voice).catch(() => {});
   };
@@ -761,7 +780,7 @@ function openDeepgramFlux(session, key) {
       // Barge-in: identical guards to the nova path (grace window + echo gate
       // + once-per-reply flag). All the July 1-4 lessons live in these checks.
       const graceOk = Date.now() - session.speakStartedAt > 1000;
-      if (session.isSpeaking && !session.bargedIn && graceOk) {
+      if (session.bargeMode !== 'push' && session.isSpeaking && !session.bargedIn && graceOk) {
         if (!looksLikeEcho(text, session._currentSpokenText) && isPlausibleBargeIn(text)) {
           session.bargedIn = true;
           console.log(`[voice-stream] barge-in trigger (flux): "${text.slice(0, 50)}"`);
@@ -921,7 +940,7 @@ function openDeepgram(session) {
       const text = (alt?.transcript || '').trim();
       if (!text) return;
       const graceOk = Date.now() - session.speakStartedAt > 1000;
-      if (session.isSpeaking && !session.bargedIn && graceOk) {
+      if (session.bargeMode !== 'push' && session.isSpeaking && !session.bargedIn && graceOk) {
         if (looksLikeEcho(text, session._currentSpokenText)) {
           // Almost certainly her own voice coming back through the mic --
           // ignore this check, keep listening for a real interruption.
@@ -2845,6 +2864,20 @@ function attachMediaStreams(server, users, cfg) {
           break;
         }
 
+        case 'dtmf': {
+          // KADE July 24 2026: the phone caller's interrupt button — any
+          // keypad press while the agent is talking cuts them off, same as
+          // the app's Stop button. A press while quiet is ignored (butt-
+          // dials should not be conversation events).
+          if (session && (session.isSpeaking || session.busy)) {
+            console.log(`[voice-stream] DTMF barge (${msg.dtmf?.digit || '?'}) ${session.streamSid}`);
+            session.bargedIn = true;
+            bargeIn(session);
+            if (session.busy && !session.isSpeaking) { session.sendClear(); session.llmAbort = true; }
+          }
+          break;
+        }
+
         case 'stop': {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           if (session) {
@@ -2964,6 +2997,7 @@ class WebCallSession extends CallSession {
     this.surface  = 'web';
     this.userId   = user?.userId || null; // LibreChat user id, for usage events
     this._webPlayheadEnd = 0;
+    this.bargeMode = 'push'; // the app/web Stop button is the interrupter
   }
   jsonSend(obj) {
     if (this.ws.readyState === WebSocket.OPEN) { try { this.ws.send(JSON.stringify(obj)); } catch {} }
@@ -3222,6 +3256,10 @@ function attachWebVoice(server) {
         // Direct Spotter call (July 18 2026): the client asked for the Spotter
         // from the first tap — the character never speaks on this call.
         session._spotterDirect = msg.spotterDirect === true;
+        // Barge mode override (July 24 2026): web/app sessions default to
+        // 'push' (Stop-button-only interrupts); a client that WANTS the old
+        // voice-activated cutting can say so in its hello.
+        if (msg.bargeMode === 'auto' || msg.bargeMode === 'push') session.bargeMode = msg.bargeMode;
         // KADE July 22 2026 (call continuity): when the app starts a call
         // FROM an open conversation it sends that conversation's id; the
         // post-call ingest then APPENDS the transcript into it instead of
