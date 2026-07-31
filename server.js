@@ -449,6 +449,10 @@ app.post('/register', (req, res) => {
   if (lcEmail) record.lcEmail = lcEmail;
   if (lcPass)  record.lcPass  = lcPass;
   if (accountType === 'child') record.accountType = 'child'; // KADE July 3 2026
+  // July 31 2026: admin hatch to CLEAR a stale spoken-switch voice off a
+  // row (the merge deliberately preserves unknown fields, so there was no
+  // way to unset one). The builder cast takes over on the next call.
+  if (req.body.clearVoice) delete record.voice;
   users.set(e164, record);
   saveUsers();
   refreshAgentTts(record.agentId); // pick up the agent's builder voice for inbound calls
@@ -828,15 +832,32 @@ app.post('/voice', async (req, res) => {
     twiml.say({ voice: 'alice' }, "I didn't catch that. Call back anytime!");
     twiml.hangup();
   } else {
-    // Returning caller — short greeting, straight to record
+    // Returning caller — short greeting, straight to record.
+    // July 31 2026 (session 35 part 12, her report: "the voice on kiana
+    // doesn't match my app selection"): her row carried a June-era spoken
+    // switch ("Voice 23") that shadowed the builder cast FOREVER — the
+    // row's voice field predates BOTH the personal-pref store (spoken
+    // switches ingest there since July 12) and the builder cache. The
+    // call's voice now follows the platform's one truth: PERSONAL pick →
+    // BUILDER cast → legacy row voice (only worth anything when the fork
+    // is unreachable) → phone default. Fail-soft at every rung.
+    const inboundAgent = user.agentId || DEFAULT_AGENT;
+    let callVoice = null;
+    try {
+      callVoice = await lookupVoicePref({ email: user.lcEmail, phone: from }, inboundAgent);
+    } catch { /* personal lookup is optional */ }
+    if (!callVoice) {
+      const builderTts = agentTtsCache.get(inboundAgent);
+      callVoice = (builderTts && builderTts.voiceId) || user.voice || null;
+    }
     voiceStates.set(callSid, {
       from, agentId: user.agentId, agentName: user.agentName || DEFAULT_AGENT_NAME,
-      history: [], lcEmail: user.lcEmail, lcPass: user.lcPass, voice: user.voice || null,
+      history: [], lcEmail: user.lcEmail, lcPass: user.lcPass, voice: callVoice,
     });
     await playOrSay(twiml,
       `Hey ${user.name}! You're with ${user.agentName || DEFAULT_AGENT_NAME}. ` +
       `Go ahead — say "switch to" and a name anytime to change agents, or "switch voice to" a voice name to change how I sound.`,
-      user.voice || null
+      callVoice
     );
     twiml.gather({ input: 'speech', speechTimeout: 'auto', timeout: 10,
       action: `/voice/heard/${callSid}`, method: 'POST' });
