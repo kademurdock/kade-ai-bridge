@@ -410,6 +410,56 @@ async function buildListenTwiml(message, voice, callSid) {
 }
 
 // ── Health ─────────────────────────────────────────────────────────────────────
+
+// ── CRASH DIAGNOSTICS SINK (Aug 5 2026, "the native app just crashed on me") ──
+// The app's KadeCrashWatch saves Apple's MetricKit crash JSON on-device; the
+// share lane is manual. This sink makes the NEXT crash report itself: the app
+// POSTs each unsent crash file + breadcrumb tail here on the launch after a
+// crash. Storage is an in-memory ring (last 20 — lost on redeploy, accepted:
+// the LOUD console line below is the durable copy, readable in Railway
+// deployment logs any time). No auth on POST by design (family-scale; worst
+// abuse = junk in a capped ring): 64KB cap, 20/day rate. GET requires the
+// admin BRIDGE_SECRET.
+const diagRing = [];
+let diagDayStamp = ''; let diagDayCount = 0;
+app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    if (diagDayStamp !== today) { diagDayStamp = today; diagDayCount = 0; }
+    if (++diagDayCount > 20) return res.status(429).json({ ok: false });
+    const b = req.body || {};
+    const entry = {
+      at: new Date().toISOString(),
+      build: String(b.build || '?').slice(0, 24),
+      device: String(b.device || '?').slice(0, 64),
+      kind: String(b.kind || 'crash').slice(0, 24),
+      payload: b.payload,
+      breadcrumbs: String(b.breadcrumbs || '').slice(0, 4000),
+    };
+    diagRing.push(entry);
+    while (diagRing.length > 20) diagRing.shift();
+    // The durable copy: a summary line in the deploy logs. Pull the crash
+    // signature out of MetricKit's shape when parseable.
+    let sig = '';
+    try {
+      const p = typeof entry.payload === 'string' ? JSON.parse(entry.payload) : entry.payload;
+      const d = p && p.crashDiagnostics && p.crashDiagnostics[0];
+      const meta = d && d.diagnosticMetaData;
+      if (meta) sig = `type=${meta.exceptionType ?? '?'} code=${meta.exceptionCode ?? '?'} signal=${meta.signal ?? '?'} reason=${String(meta.terminationReason ?? '').slice(0, 120)}`;
+    } catch (_) { /* summary only */ }
+    console.log(`DIAGNOSTICS RECEIVED — build ${entry.build} device ${entry.device} kind ${entry.kind} ${sig}`);
+    const tail = entry.breadcrumbs.split('\n').slice(-8).join(' | ');
+    if (tail) console.log(`DIAGNOSTICS BREADCRUMB TAIL — ${tail}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false });
+  }
+});
+app.get('/diagnostics', (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: 'admin only' });
+  res.json({ count: diagRing.length, entries: diagRing });
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, users: users.size, rev: (process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown').slice(0, 7) }));
 
 // Static opt-in / SMS consent disclosure image — used for Twilio toll-free verification.
