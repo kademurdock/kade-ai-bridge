@@ -2979,6 +2979,186 @@ app.get('/clock/status', (req, res) => {
   });
 });
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * PLATFORM HEARTBEAT (Aug 6 2026 — ideas 62 + 42 from
+ * PLATFORM_IMPROVEMENT_IDEAS_2026-08-06, her "ops heartbeat pack" pick).
+ *
+ * GET /platform-status — one endpoint that answers "is the platform up?"
+ * honestly, plus yesterday's spend against the 30-day average. Secret-gated
+ * (scoped notify secret or admin BRIDGE_SECRET); the fork's kade_notify tool
+ * gained a platform_status action that reads this, so ANY character can
+ * answer by voice. spokenSummary is composed for the ear first.
+ *
+ * Spend math needs history, so a daily BALANCE SNAPSHOT (first tick after
+ * midnight Central; checked hourly) appends one line per day to the volume:
+ * balance-history.jsonl. Sources ride the TTS proxy's /balances aggregate
+ * (Twilio + Flux today; Moonshot/OpenRouter/fish arrive whenever those keys
+ * land on the proxy — this side parses whatever shows up, fail-soft per
+ * provider, and the spend line simply skips providers with no history yet).
+ * ────────────────────────────────────────────────────────────────────────── */
+const BALANCE_HISTORY_FILE = path.join(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
+  'balance-history.jsonl'
+);
+
+function bridgeCentralDateKey(d = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+function readBalanceHistory() {
+  try {
+    if (!fs.existsSync(BALANCE_HISTORY_FILE)) return [];
+    return fs.readFileSync(BALANCE_HISTORY_FILE, 'utf8')
+      .split('\n').filter(Boolean).slice(-40)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch { return []; }
+}
+
+// Pull every parsable dollar-ish number out of the proxy's /balances shape.
+function parseBalanceNumbers(b) {
+  const out = {};
+  try {
+    if (b && b.twilio && b.twilio.balance != null && !b.twilio.error) out.twilio = parseFloat(b.twilio.balance);
+    if (b && b.flux && b.flux.credits != null && !b.flux.error) out.flux = parseFloat(b.flux.credits);
+    if (b && b.moonshot && b.moonshot.balance != null && !b.moonshot.error) out.moonshot = parseFloat(b.moonshot.balance);
+    if (b && b.openrouter && !b.openrouter.error) {
+      if (b.openrouter.usage != null) out.openrouter_usage = parseFloat(b.openrouter.usage); // grows
+      if (b.openrouter.balance != null) out.openrouter = parseFloat(b.openrouter.balance);
+    }
+    if (b && b.fish && b.fish.credit != null && !b.fish.error) out.fish = parseFloat(b.fish.credit);
+  } catch { /* partial is fine */ }
+  for (const k of Object.keys(out)) if (!isFinite(out[k])) delete out[k];
+  return out;
+}
+
+let lastSnapshotDay = null;
+async function snapshotBalancesDaily() {
+  const today = bridgeCentralDateKey();
+  if (lastSnapshotDay === today) return;
+  const hist = readBalanceHistory();
+  if (hist.length && hist[hist.length - 1].dateKey === today) { lastSnapshotDay = today; return; }
+  if (!PROXY_SECRET) return;
+  try {
+    const r = await axios.get(`${PROXY_URL}/balances`, {
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
+      timeout: 30000,
+    });
+    const nums = parseBalanceNumbers(r.data);
+    const line = { at: new Date().toISOString(), dateKey: today, ...nums };
+    fs.appendFileSync(BALANCE_HISTORY_FILE, JSON.stringify(line) + '\n');
+    lastSnapshotDay = today;
+    console.log(`[heartbeat] balance snapshot for ${today}: ${JSON.stringify(nums)}`);
+  } catch (e) {
+    console.warn(`[heartbeat] balance snapshot failed (${e.message}) — will retry on the next tick`);
+  }
+}
+setTimeout(snapshotBalancesDaily, 90 * 1000); // boot warm-up
+setInterval(snapshotBalancesDaily, 60 * 60 * 1000); // hourly guard, writes once/day
+
+// Spend deltas from daily snapshots. BALANCES fall as money is spent, so
+// yesterday's spend = balance(day-before) - balance(yesterday); usage-style
+// counters grow, so the delta flips. Providers missing days are skipped.
+function computeSpend() {
+  const hist = readBalanceHistory();
+  if (hist.length < 2) return { lines: [], note: hist.length ? 'Spend history starts tomorrow — first snapshot is on the books today.' : 'No balance history yet.' };
+  const byDay = new Map(hist.map((h) => [h.dateKey, h]));
+  const days = [...byDay.keys()].sort();
+  const providers = [
+    { key: 'moonshot', name: 'Moonshot', kind: 'balance' },
+    { key: 'openrouter_usage', name: 'OpenRouter', kind: 'usage' },
+    { key: 'openrouter', name: 'OpenRouter', kind: 'balance' },
+    { key: 'fish', name: 'fish audio', kind: 'balance' },
+    { key: 'twilio', name: 'Twilio', kind: 'balance' },
+    { key: 'flux', name: 'Flux images', kind: 'balance' },
+  ];
+  const lines = [];
+  const seenNames = new Set();
+  for (const p of providers) {
+    if (seenNames.has(p.name)) continue;
+    const deltas = [];
+    for (let i = 1; i < days.length; i++) {
+      const a = byDay.get(days[i - 1]);
+      const b = byDay.get(days[i]);
+      if (!a || !b || a[p.key] == null || b[p.key] == null) continue;
+      const spend = p.kind === 'usage' ? b[p.key] - a[p.key] : a[p.key] - b[p.key];
+      deltas.push({ day: days[i], spend });
+    }
+    if (!deltas.length) continue;
+    seenNames.add(p.name);
+    const yesterday = deltas[deltas.length - 1];
+    const window = deltas.slice(-30);
+    const avg = window.reduce((s, d) => s + Math.max(0, d.spend), 0) / window.length;
+    const y = Math.max(0, yesterday.spend);
+    const hot = avg > 0.01 && y > avg * 1.5;
+    lines.push({
+      provider: p.name,
+      yesterday: Math.round(y * 100) / 100,
+      avg30: Math.round(avg * 100) / 100,
+      hot,
+      spoken: `${p.name}: ${y < 0.005 ? 'quiet' : '$' + y.toFixed(2)} yesterday` +
+        (window.length > 2 ? ` against a ${'$' + avg.toFixed(2)} average` : '') +
+        (hot ? ' — running hot' : ''),
+    });
+  }
+  return { lines, note: null };
+}
+
+// Honest service checks: a real HTTP round-trip to each public face.
+async function checkPlatformServices() {
+  const targets = [
+    { name: 'the site', url: 'https://kademurdock.com/health' },
+    { name: 'the voices', url: `${TTS_PROXY_URL}/health` },
+    { name: 'the room server', url: 'https://lounge-livekit-production.up.railway.app', anyResponse: true },
+  ];
+  const checks = await Promise.all(targets.map(async (t) => {
+    const t0 = Date.now();
+    try {
+      const r = await axios.get(t.url, { timeout: 8000, validateStatus: () => true, headers: { 'User-Agent': BROWSER_UA } });
+      const ok = t.anyResponse ? true : r.status >= 200 && r.status < 400;
+      return { name: t.name, ok, ms: Date.now() - t0, detail: `HTTP ${r.status}` };
+    } catch (e) {
+      return { name: t.name, ok: false, ms: Date.now() - t0, detail: e.code || e.message };
+    }
+  }));
+  checks.push({ name: 'the phone bridge', ok: true, ms: 0, detail: 'answering (this reply is the proof)' });
+  return checks;
+}
+
+app.get('/platform-status', async (req, res) => {
+  const provided = req.get('x-notify-secret') || req.get('x-kade-secret') || req.query.secret;
+  const scopedOk = NOTIFY_AGENT_SECRET && provided === NOTIFY_AGENT_SECRET;
+  const adminOk = BRIDGE_SECRET && provided === BRIDGE_SECRET;
+  if (!scopedOk && !adminOk) return res.status(403).json({ error: 'Unauthorized' });
+  try {
+    const services = await checkPlatformServices();
+    const spend = computeSpend();
+    const down = services.filter((s) => !s.ok);
+    const upLine = down.length === 0
+      ? `Everything is up: ${services.map((s) => s.name).join(', ')} all answering.`
+      : `Trouble: ${down.map((s) => `${s.name} is not answering (${s.detail})`).join('; ')}. Up: ${services.filter((s) => s.ok).map((s) => s.name).join(', ') || 'nothing else checked'}.`;
+    const spendSpoken = spend.lines.length
+      ? `Spend: ${spend.lines.map((l) => l.spoken).join('; ')}.`
+      : (spend.note || '');
+    const hotFlags = spend.lines.filter((l) => l.hot);
+    res.json({
+      ok: down.length === 0,
+      spokenSummary: [upLine, spendSpoken].filter(Boolean).join(' '),
+      services,
+      spend: spend.lines,
+      spendNote: spend.note,
+      hotFlags: hotFlags.map((l) => l.provider),
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
