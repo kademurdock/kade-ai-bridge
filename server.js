@@ -59,6 +59,19 @@ function notifySecretOk(req, provided) {
   const h = req.get && req.get('x-notify-secret');
   return h === NOTIFY_AGENT_SECRET || provided === NOTIFY_AGENT_SECRET;
 }
+
+// Aug 7 2026: SCOPED broadcast secret for owner-triggered platform-wide
+// announcements (the "what's new" push). Held by the LibreChat fork's
+// kade_notify tool, which only exposes its broadcast action to the ADMIN
+// account — so the chain is: owner asks in chat -> owner-gated tool ->
+// this secret -> broadcast:true. A leak of this secret can at most fire
+// rate-capped, quiet-hours-guarded broadcasts; it reaches no admin route.
+const NOTIFY_BROADCAST_SECRET = process.env.NOTIFY_BROADCAST_SECRET || '';
+function broadcastSecretOk(req, provided) {
+  if (!NOTIFY_BROADCAST_SECRET) return false;
+  const h = req.get && req.get('x-notify-broadcast-secret');
+  return h === NOTIFY_BROADCAST_SECRET || provided === NOTIFY_BROADCAST_SECRET;
+}
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
@@ -747,13 +760,13 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
 // Any agent -> user push. Body: { secret, agentId, agentName, title?, body, urgent? }
 app.post('/notify', async (req, res) => {
   const b = req.body || {};
-  if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  if (!notifySecretOk(req, b.secret) && !broadcastSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
   // Caller forensics (July 21 2026): one line per request so "who sent this"
   // never needs to be reconstructed from circumstantial evidence again.
   console.log(
-    `[notify] caller=${bridgeSecretOk(req, b.secret) ? 'ADMIN' : 'agent-scoped'} agent=${String(b.agentId || '?').slice(0, 40)} userId=${b.userId ? String(b.userId).slice(0, 8) + '...' : 'NONE'} broadcast=${b.broadcast === true}`,
+    `[notify] caller=${bridgeSecretOk(req, b.secret) ? 'ADMIN' : broadcastSecretOk(req, b.secret) ? 'broadcast-scoped' : 'agent-scoped'} agent=${String(b.agentId || '?').slice(0, 40)} userId=${b.userId ? String(b.userId).slice(0, 8) + '...' : 'NONE'} broadcast=${b.broadcast === true}`,
   );
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: bridgeSecretOk(req, b.secret) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
