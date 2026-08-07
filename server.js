@@ -420,7 +420,13 @@ async function buildListenTwiml(message, voice, callSid) {
 // deployment logs any time). No auth on POST by design (family-scale; worst
 // abuse = junk in a capped ring): 64KB cap, 20/day rate. GET requires the
 // admin BRIDGE_SECRET.
-const diagRing = [];
+// Aug 6 2026: the ring is now DURABLE (kade: "look at the latest native crash
+// logs" found it empty — in-memory meant every bridge redeploy wiped the
+// evidence, and today shipped two redeploys). Persisted to the volume like
+// every other bridge store; loaded at boot; capped the same 20.
+const DIAG_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'diagnostics-ring.json');
+const diagRing = (() => { try { if (fs.existsSync(DIAG_FILE)) return JSON.parse(fs.readFileSync(DIAG_FILE, 'utf8')).slice(-20); } catch {} return []; })();
+function saveDiagRing() { try { fs.writeFileSync(DIAG_FILE, JSON.stringify(diagRing)); } catch (e) { console.warn('[diag] ring save failed:', e.message); } }
 let diagDayStamp = ''; let diagDayCount = 0;
 app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
   try {
@@ -438,6 +444,7 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
     };
     diagRing.push(entry);
     while (diagRing.length > 20) diagRing.shift();
+    saveDiagRing();
     // The durable copy: a summary line in the deploy logs. Pull the crash
     // signature out of MetricKit's shape when parseable.
     let sig = '';
@@ -456,7 +463,12 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
   }
 });
 app.get('/diagnostics', (req, res) => {
-  if (!isAdmin(req)) return res.status(403).json({ error: 'admin only' });
+  // Aug 6 2026 BUG FIX: this called isAdmin(req) — a helper that never
+  // existed in this file — so the admin dump had 500'd since the sink
+  // shipped (the POST lane + log lines worked; the GET was never exercised
+  // until Kade asked to read the ring). Same auth shape as /clock/status.
+  const h = req.get('x-kade-secret') || req.query.secret;
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
   res.json({ count: diagRing.length, entries: diagRing });
 });
 
