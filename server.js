@@ -2992,6 +2992,137 @@ app.get('/clock/status', (req, res) => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────────
+ * SYNTHETIC CANARY (Aug 6 2026 late — idea 63, her word: "Let's do the bird").
+ *
+ * Every CANARY_INTERVAL_MIN minutes, one scripted turn runs against a
+ * dedicated private Canary agent (kimi-k3, the fleet's own lane, via the
+ * proxy's /librechat/ask — isTemporary convos, so nothing piles up). Code
+ * judges the reply like a referee, never a vibe:
+ *   FAIL  = HTTP error / timeout / empty / under 10 chars / byte-identical
+ *           to the previous canary reply (the array-repetition signature
+ *           that took live family traffic to catch last time).
+ *   SLOW  = passed but took longer than CANARY_SLOW_MS (noted, not alarmed).
+ *   PASS  = everything else.
+ * Two consecutive FAILs -> ONE push to Kade through the guardrailed
+ * notify lane (adminAlert budget-skip, quiet hours respected unless
+ * CANARY_URGENT=1, mutable by muting 'kade-canary-alert' in notify-prefs);
+ * recovery sends one "back to green." State lives on the volume; the last
+ * 60 results ride /platform-status so any companion can speak the bird's
+ * health. Kill switch: CANARY_ENABLED=0. Cost: ~24 short cached-prefix k3
+ * turns/day ≈ well under a dollar a month — the real number is in
+ * PROJECT_STATUS Part 35 with the receipts.
+ * ────────────────────────────────────────────────────────────────────────── */
+const CANARY_ENABLED = process.env.CANARY_ENABLED !== '0';
+const CANARY_AGENT_ID = process.env.CANARY_AGENT_ID || 'agent_BsyesQ07Iku6NozcthFvV';
+const CANARY_INTERVAL_MIN = Math.max(10, parseInt(process.env.CANARY_INTERVAL_MIN || '60', 10));
+const CANARY_SLOW_MS = parseInt(process.env.CANARY_SLOW_MS || '45000', 10);
+const CANARY_TIMEOUT_MS = parseInt(process.env.CANARY_TIMEOUT_MS || '120000', 10);
+const CANARY_FAILS_TO_ALERT = Math.max(1, parseInt(process.env.CANARY_FAILS_TO_ALERT || '2', 10));
+const CANARY_URGENT = process.env.CANARY_URGENT === '1';
+const CANARY_ADMIN_USER = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
+const CANARY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'canary-state.json');
+
+const CANARY_PROBES = [
+  'name three things you might find on a porch, in one short sentence.',
+  'what season comes after summer? One short sentence.',
+  'add nine and six, answer in one short sentence.',
+  'name two animals bigger than a cat, one short sentence.',
+  'which is colder, ice or steam? One short sentence.',
+  'name three colors you might see in a sunset, one short sentence.',
+  'how many days are in a week? One short sentence.',
+  'name two things that need batteries, one short sentence.',
+];
+
+const canaryState = (() => {
+  try { if (fs.existsSync(CANARY_FILE)) return JSON.parse(fs.readFileSync(CANARY_FILE, 'utf8')); } catch {}
+  return { results: [], consecutiveFails: 0, alerted: false, lastReplyHash: null };
+})();
+function saveCanaryState() {
+  try { fs.writeFileSync(CANARY_FILE, JSON.stringify(canaryState)); } catch (e) { console.warn('[canary] state save failed:', e.message); }
+}
+
+async function runCanaryProbe(trigger = 'tick') {
+  const nonce = Math.floor(100000 + Math.random() * 900000);
+  const probe = CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
+  const question = `Canary check ${nonce}: ${probe}`;
+  const t0 = Date.now();
+  const result = { at: new Date().toISOString(), trigger, ok: false, ms: 0, len: 0, note: '' };
+  try {
+    const r = await axios.post(
+      `${PROXY_URL}/librechat/ask`,
+      { agentId: CANARY_AGENT_ID, messages: [{ role: 'user', content: question }] },
+      { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: CANARY_TIMEOUT_MS }
+    );
+    result.ms = Date.now() - t0;
+    const text = String(r.data && r.data.text || '').trim();
+    result.len = text.length;
+    const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
+    if (!text || text.length < 10) {
+      result.note = `reply too short (${text.length} chars) — the wordless-turn class`;
+    } else if (canaryState.lastReplyHash && hash === canaryState.lastReplyHash) {
+      result.note = 'reply BYTE-IDENTICAL to the previous check — the repetition-bug signature';
+    } else {
+      result.ok = true;
+      canaryState.lastReplyHash = hash;
+      if (result.ms >= CANARY_SLOW_MS) result.note = `slow (${(result.ms / 1000).toFixed(1)}s)`;
+    }
+  } catch (e) {
+    result.ms = Date.now() - t0;
+    result.note = e.code === 'ECONNABORTED' ? `timed out after ${Math.round(CANARY_TIMEOUT_MS / 1000)}s` : `turn failed: ${String(e.message).slice(0, 120)}`;
+  }
+
+  canaryState.results.push(result);
+  while (canaryState.results.length > 60) canaryState.results.shift();
+
+  if (result.ok) {
+    const wasAlerted = canaryState.alerted;
+    canaryState.consecutiveFails = 0;
+    canaryState.alerted = false;
+    saveCanaryState();
+    console.log(`[canary] PASS in ${result.ms}ms${result.note ? ` (${result.note})` : ''}`);
+    if (wasAlerted) {
+      runNotify({
+        agentId: 'kade-canary-alert', agentName: 'Canary', title: 'Canary',
+        body: `Back to green — the canary check just passed in ${(result.ms / 1000).toFixed(1)} seconds.`,
+        urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+      }).catch(() => {});
+    }
+  } else {
+    canaryState.consecutiveFails += 1;
+    console.warn(`[canary] FAIL #${canaryState.consecutiveFails}: ${result.note}`);
+    if (canaryState.consecutiveFails >= CANARY_FAILS_TO_ALERT && !canaryState.alerted) {
+      canaryState.alerted = true;
+      runNotify({
+        agentId: 'kade-canary-alert', agentName: 'Canary', title: 'Canary',
+        body: `The canary check has failed ${canaryState.consecutiveFails} times running: ${result.note}. Ask any companion "is the platform up?" for details.`,
+        urgent: CANARY_URGENT, userId: CANARY_ADMIN_USER, adminAlert: true,
+      }).catch(() => {});
+    }
+    saveCanaryState();
+  }
+  return result;
+}
+
+if (CANARY_ENABLED) {
+  setTimeout(() => { runCanaryProbe('boot').catch(() => {}); }, 3 * 60 * 1000);
+  setInterval(() => { runCanaryProbe('tick').catch(() => {}); }, CANARY_INTERVAL_MIN * 60 * 1000);
+  console.log(`[canary] armed: every ${CANARY_INTERVAL_MIN} min against ${CANARY_AGENT_ID}`);
+} else {
+  console.log('[canary] disabled by CANARY_ENABLED=0');
+}
+
+// Manual probe for smoke tests and "check the canary right now" (admin).
+app.post('/canary/run', async (req, res) => {
+  const h = req.get('x-kade-secret') || req.query.secret;
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  try {
+    res.json(await runCanaryProbe('manual'));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
  * PLATFORM HEARTBEAT (Aug 6 2026 — ideas 62 + 42 from
  * PLATFORM_IMPROVEMENT_IDEAS_2026-08-06, her "ops heartbeat pack" pick).
  *
@@ -3150,6 +3281,28 @@ app.get('/platform-status', async (req, res) => {
     const services = await checkPlatformServices();
     const spend = computeSpend();
     const down = services.filter((s) => !s.ok);
+    // Canary section (idea 63): the bird's recent record, spoken-ready.
+    const canaryLast = canaryState.results[canaryState.results.length - 1] || null;
+    let greenStreak = 0;
+    for (let i = canaryState.results.length - 1; i >= 0 && canaryState.results[i].ok; i--) greenStreak++;
+    const lastFail = [...canaryState.results].reverse().find((r) => !r.ok) || null;
+    const canary = {
+      enabled: CANARY_ENABLED,
+      lastAt: canaryLast ? canaryLast.at : null,
+      ok: canaryLast ? canaryLast.ok : null,
+      ms: canaryLast ? canaryLast.ms : null,
+      greenStreak,
+      consecutiveFails: canaryState.consecutiveFails,
+      lastFailAt: lastFail ? lastFail.at : null,
+      lastFailNote: lastFail ? lastFail.note : null,
+    };
+    const canarySpoken = !CANARY_ENABLED
+      ? 'The canary is off.'
+      : !canaryLast
+        ? 'The canary has not flown yet this boot.'
+        : canaryLast.ok
+          ? `Canary: green, ${greenStreak} straight pass${greenStreak === 1 ? '' : 'es'}, last check ${(canaryLast.ms / 1000).toFixed(1)} seconds.`
+          : `Canary: RED — ${canaryLast.note}.`;
     const upLine = down.length === 0
       ? `Everything is up: ${services.map((s) => s.name).join(', ')} all answering.`
       : `Trouble: ${down.map((s) => `${s.name} is not answering (${s.detail})`).join('; ')}. Up: ${services.filter((s) => s.ok).map((s) => s.name).join(', ') || 'nothing else checked'}.`;
@@ -3158,9 +3311,10 @@ app.get('/platform-status', async (req, res) => {
       : (spend.note || '');
     const hotFlags = spend.lines.filter((l) => l.hot);
     res.json({
-      ok: down.length === 0,
-      spokenSummary: [upLine, spendSpoken].filter(Boolean).join(' '),
+      ok: down.length === 0 && !(canaryLast && !canaryLast.ok),
+      spokenSummary: [upLine, canarySpoken, spendSpoken].filter(Boolean).join(' '),
       services,
+      canary,
       spend: spend.lines,
       spendNote: spend.note,
       hotFlags: hotFlags.map((l) => l.provider),
