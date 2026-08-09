@@ -591,7 +591,7 @@ function apnsAuthToken() {
   return _apnsJwt.token;
 }
 
-function sendApnsPush(deviceToken, title, body) {
+function sendApnsPush(deviceToken, title, body, opts = {}) {
   return new Promise((resolve) => {
     let client;
     try { client = http2.connect(APNS_HOST); }
@@ -601,7 +601,12 @@ function sendApnsPush(deviceToken, title, body) {
     // app commit) is the push sound. Builds that predate the bundle fall back to the
     // system default automatically (Apple's rule for a missing sound file), so this
     // is safe to ship ahead of her next app build. Revert hatch: PUSH_SOUND=default.
-    const payload = JSON.stringify({ aps: { alert: { title, body }, sound: process.env.PUSH_SOUND || 'Notify.wav' } });
+    // Build 193 (Aug 9 2026): an optional APNs CATEGORY rides along — the
+    // native app registers KADE_BRIEF with LISTEN/READ action buttons, and a
+    // category the app doesn't know is ignored by iOS (safe on old builds).
+    const aps = { alert: { title, body }, sound: process.env.PUSH_SOUND || 'Notify.wav' };
+    if (opts.category) aps.category = String(opts.category);
+    const payload = JSON.stringify({ aps });
     const r = client.request({
       ':method': 'POST',
       ':path': `/3/device/${deviceToken}`,
@@ -710,7 +715,7 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category }) {
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   const message = String(body || '').trim().slice(0, 300);
@@ -747,7 +752,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
     if (!userId && broadcast !== true) return { ok: false, blocked: 'no target user (per-user sends need a userId; broadcast needs admin broadcast:true)' };
     return { ok: true, sent: 0, note: userId ? 'no device linked to this user yet' : 'no device tokens registered yet' };
   }
-  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
+  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message, { category })));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
   // adminAlert sends don't advance the counters — the outreach budget
@@ -980,6 +985,7 @@ async function fireBrief(userId, urgent = false) {
     body,
     urgent: urgent === true,
     userId,
+    category: 'KADE_BRIEF', // build 193's LISTEN/READ notification actions
   });
   const { day } = centralClock();
   briefStore.users[userId] = { ...p, lastBrief: { date: day, text: body, at: new Date().toISOString() } };
