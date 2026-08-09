@@ -807,15 +807,14 @@ function loadReachout() {
 let reachout = loadReachout();
 function saveReachout() { try { fs.writeFileSync(REACHOUT_FILE, JSON.stringify(reachout)); } catch (e) { console.error('[reachout] save:', e.message); } }
 
-async function fireReachout(urgent) {
-  const text = await askAgentRich(REACHOUT_AGENT_ID, reachout.prompt);
-  if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
-  /* Aug 9 2026 (morning-brief hardening, first live fire's receipts): a push
-   * body is LOCK-SCREEN TEXT, not a performance — strip %%%steering%%% spans
-   * and [sound:x]-style tokens outright; drop a leading "I'll go do the task"
-   * meta-line when a real paragraph follows it (headless asks narrate
-   * sometimes — the plan is not the brief); then cap at a SENTENCE boundary
-   * instead of mid-word. */
+/* Aug 9 2026 (morning-brief hardening, first live fire's receipts): a push
+ * body is LOCK-SCREEN TEXT, not a performance — strip %%%steering%%% spans
+ * and [sound:x]-style tokens outright; drop a leading "I'll go do the task"
+ * meta-line when a real paragraph follows it (headless asks narrate
+ * sometimes — the plan is not the brief); then cap at a SENTENCE boundary
+ * instead of mid-word. Shared by the legacy reachout and the per-account
+ * morning brief. */
+function sanitizePushBody(text, cap = 280) {
   let clean = String(text)
     .replace(/%%%[^%]{0,200}?%%%/g, ' ')
     .replace(/\[(?:sound|table):[^\]]{1,60}\]/g, ' ')
@@ -830,11 +829,18 @@ async function fireReachout(urgent) {
       clean = rest;
     }
   }
-  let body = clean.slice(0, 280);
-  if (clean.length > 280) {
+  let body = clean.slice(0, cap);
+  if (clean.length > cap) {
     const cut = Math.max(body.lastIndexOf('. '), body.lastIndexOf('! '), body.lastIndexOf('? '));
-    if (cut > 120) body = body.slice(0, cut + 1);
+    if (cut > cap * 0.45) body = body.slice(0, cut + 1);
   }
+  return body;
+}
+
+async function fireReachout(urgent) {
+  const text = await askAgentRich(REACHOUT_AGENT_ID, reachout.prompt);
+  if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
+  const body = sanitizePushBody(text);
   // "Ki reaches out" is Kade's own personal check-in — deliver ONLY to her
   // linked devices (ADMIN_USER_ID env can override the baked-in default).
   const delivery = await runNotify({ agentId: REACHOUT_AGENT_ID, agentName: REACHOUT_AGENT_NAME, title: reachout.title || 'Ki', body, urgent: urgent === true, userId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7' });
@@ -878,6 +884,197 @@ setInterval(async () => {
     console.error('[reachout] tick error:', e.message);
   }
 }, 60 * 1000);
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * MORNING BRIEF, PER ACCOUNT (Aug 9 2026 — her spec, verbatim spirit: settings
+ * per account, delivered by your own companion, checkboxes for what's in it,
+ * your own town's weather). The bridge holds prefs + schedules + composition;
+ * the fork's /api/brief lane (JWT) is the only writer, so a user can only
+ * ever touch their OWN prefs. Delivery = runNotify(userId) → only that
+ * user's linked devices; an unlinked account simply can't receive one (the
+ * settings page says so instead of failing silent).
+ *
+ * PRIVACY, the part that matters: the day-ahead checkbox pulls the user's
+ * OWN saved notes via fetchCallMemories({userId}) — the exact scoped lane
+ * phone calls use — and the prompt forbids referencing anything beyond
+ * what's provided. Briefs never compose from anyone else's memory. The
+ * legacy global reachout stays for its own purposes but auto-disables once
+ * Kade's account migrates to a per-user pref (no double 10 AMs).
+ * Kill switch: BRIEF_ENABLED=0. Store: brief-prefs.json on the volume.
+ * ────────────────────────────────────────────────────────────────────────── */
+const BRIEF_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'brief-prefs.json');
+const briefStore = (() => {
+  try { if (fs.existsSync(BRIEF_FILE)) return JSON.parse(fs.readFileSync(BRIEF_FILE, 'utf8')); } catch {}
+  return { users: {} };
+})();
+function saveBriefStore() {
+  try { fs.writeFileSync(BRIEF_FILE, JSON.stringify(briefStore)); } catch (e) { console.error('[brief] save:', e.message); }
+}
+const BRIEF_DEFAULTS = {
+  enabled: false,
+  time: '09:00',
+  items: { weather: true, news: true, dayAhead: true },
+  location: '',
+  agentId: '',
+  email: '',
+  lastRun: '',
+  lastBrief: null,
+};
+function briefPrefsFor(userId) {
+  const raw = briefStore.users[userId] || {};
+  return {
+    ...BRIEF_DEFAULTS,
+    ...raw,
+    items: { ...BRIEF_DEFAULTS.items, ...(raw.items || {}) },
+  };
+}
+function briefAuthOk(req, provided) {
+  return bridgeSecretOk(req, provided) || notifySecretOk(req, provided);
+}
+
+function composeBriefPrompt(p, memCtx) {
+  const parts = [];
+  parts.push(
+    "Compose this person's MORNING BRIEF. OUTPUT RULES FIRST: this lands as a plain lock-screen " +
+    'notification — output ONLY the brief itself, no preamble about what you are going to do, no ' +
+    'steering tags of any kind, no percent signs, plain prose under 270 characters total.',
+  );
+  const wants = [];
+  if (p.items.weather) {
+    wants.push(
+      `the feel of today's weather in one clause (use your weather tool for ${p.location || 'Highlandville, Missouri'} — feels-like temp, anything worth planning around)`,
+    );
+  }
+  if (p.items.news) {
+    wants.push('ONE genuinely interesting national or local headline via your news tool, one clause, skip doom unless it truly matters to them');
+  }
+  if (wants.length) parts.push('CONTENT, in order: ' + wants.join('; ') + '.');
+  if (p.items.dayAhead && memCtx) {
+    parts.push(
+      'CLOSE: their own saved notes are below. If one plainly points at TODAY or TOMORROW (an appointment, a plan, a promise), nod to it naturally in the close — otherwise a short warm send-off in your own voice. Never mention that notes exist, never reference anything not provided below.\n\n[THEIR OWN SAVED NOTES — context only]\n' +
+      String(memCtx).slice(0, 1500),
+    );
+  } else {
+    parts.push('CLOSE: one short warm send-off line in your own voice. Zero greeting-card energy.');
+  }
+  return parts.join('\n\n');
+}
+
+async function fireBrief(userId, urgent = false) {
+  if (process.env.BRIEF_ENABLED === '0') return { ok: false, error: 'briefs disabled' };
+  const p = briefPrefsFor(userId);
+  const agentId = p.agentId || DEFAULT_AGENT;
+  let memCtx = null;
+  if (p.items.dayAhead) {
+    try {
+      memCtx = await fetchCallMemories({ userId, email: p.email || undefined }, agentId);
+    } catch { /* a brief without notes is still a brief */ }
+  }
+  const text = await askAgentRich(agentId, composeBriefPrompt(p, memCtx));
+  if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
+  const body = sanitizePushBody(text);
+  const delivery = await runNotify({
+    agentId,
+    agentName: 'Morning brief',
+    title: 'Morning brief',
+    body,
+    urgent: urgent === true,
+    userId,
+  });
+  const { day } = centralClock();
+  briefStore.users[userId] = { ...p, lastBrief: { date: day, text: body, at: new Date().toISOString() } };
+  saveBriefStore();
+  return { ok: true, generated: body, delivery };
+}
+
+// GET /brief-prefs?userId= — prefs + whether this account can actually receive one.
+app.get('/brief-prefs', (req, res) => {
+  if (!briefAuthOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(req.query.userId || '').trim();
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const p = briefPrefsFor(userId);
+  res.json({ prefs: { enabled: p.enabled, time: p.time, items: p.items, location: p.location, agentId: p.agentId }, linked: tokensForUser(userId).length > 0, lastBrief: p.lastBrief || null });
+});
+
+// POST /brief-prefs {userId, email?, enabled?, time?, items?, location?, agentId?}
+app.post('/brief-prefs', (req, res) => {
+  const b = req.body || {};
+  if (!briefAuthOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(b.userId || '').trim();
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const p = briefPrefsFor(userId);
+  if (b.enabled !== undefined) p.enabled = b.enabled === true || b.enabled === 'true';
+  if (typeof b.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(b.time)) p.time = b.time;
+  if (b.items && typeof b.items === 'object') {
+    ['weather', 'news', 'dayAhead'].forEach((k) => { if (b.items[k] !== undefined) p.items[k] = b.items[k] === true || b.items[k] === 'true'; });
+  }
+  if (typeof b.location === 'string') p.location = b.location.trim().slice(0, 80);
+  if (typeof b.agentId === 'string') p.agentId = b.agentId.trim().slice(0, 64);
+  if (typeof b.email === 'string' && b.email.includes('@')) p.email = b.email.trim().slice(0, 120);
+  briefStore.users[userId] = p;
+  saveBriefStore();
+  res.json({ ok: true, prefs: { enabled: p.enabled, time: p.time, items: p.items, location: p.location, agentId: p.agentId }, linked: tokensForUser(userId).length > 0 });
+});
+
+// POST /brief/fire {userId, urgent?} — one now (the settings page's test button).
+app.post('/brief/fire', async (req, res) => {
+  const b = req.body || {};
+  if (!briefAuthOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(b.userId || '').trim();
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try { res.json(await fireBrief(userId, b.urgent === true)); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// GET /brief/today?userId= — today's brief text for read/listen surfaces.
+app.get('/brief/today', (req, res) => {
+  if (!briefAuthOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(req.query.userId || '').trim();
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const p = briefPrefsFor(userId);
+  res.json({ lastBrief: p.lastBrief || null });
+});
+
+// Minute tick — per-user times, once per day each, sequential (family scale).
+setInterval(async () => {
+  try {
+    if (process.env.BRIEF_ENABLED === '0') return;
+    const { day, hhmm } = centralClock();
+    for (const [userId, raw] of Object.entries(briefStore.users)) {
+      const p = briefPrefsFor(userId);
+      if (!p.enabled || p.time !== hhmm || p.lastRun === day) continue;
+      briefStore.users[userId] = { ...p, lastRun: day };
+      saveBriefStore(); // set first so a slow compose can't double-fire
+      try {
+        const r = await fireBrief(userId, false);
+        console.log(`[brief] fired for ${userId.slice(-6)}: ${r.ok ? 'sent=' + (r.delivery && r.delivery.sent) : 'error=' + r.error}`);
+      } catch (e) {
+        console.error(`[brief] fire error for ${userId.slice(-6)}:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[brief] tick error:', e.message);
+  }
+}, 60 * 1000);
+
+// One-time migration: Kade's global 10 AM reachout becomes her per-user brief.
+(function migrateReachoutToBrief() {
+  const adminId = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
+  if (briefStore.users[adminId]) return;
+  if (reachout.enabled && reachout.title === 'Morning brief') {
+    briefStore.users[adminId] = {
+      ...BRIEF_DEFAULTS,
+      enabled: true,
+      time: reachout.time || '10:00',
+      location: 'Highlandville, Missouri',
+      email: 'kademurdock@gmail.com',
+    };
+    saveBriefStore();
+    reachout.enabled = false;
+    saveReachout();
+    console.log('[brief] migrated the global reachout into a per-user brief for the admin account');
+  }
+})();
 
 
 
