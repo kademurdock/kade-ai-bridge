@@ -810,7 +810,31 @@ function saveReachout() { try { fs.writeFileSync(REACHOUT_FILE, JSON.stringify(r
 async function fireReachout(urgent) {
   const text = await askAgentRich(REACHOUT_AGENT_ID, reachout.prompt);
   if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
-  const body = String(text).trim().replace(/^["']+|["']+$/g, '').slice(0, 280);
+  /* Aug 9 2026 (morning-brief hardening, first live fire's receipts): a push
+   * body is LOCK-SCREEN TEXT, not a performance — strip %%%steering%%% spans
+   * and [sound:x]-style tokens outright; drop a leading "I'll go do the task"
+   * meta-line when a real paragraph follows it (headless asks narrate
+   * sometimes — the plan is not the brief); then cap at a SENTENCE boundary
+   * instead of mid-word. */
+  let clean = String(text)
+    .replace(/%%%[^%]{0,200}?%%%/g, ' ')
+    .replace(/\[(?:sound|table):[^\]]{1,60}\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^["']+|["']+$/g, '');
+  const firstBreak = clean.search(/[.!?]\s/);
+  if (firstBreak > -1 && firstBreak < 140) {
+    const lead = clean.slice(0, firstBreak + 1);
+    const rest = clean.slice(firstBreak + 1).trim();
+    if (rest.length > 60 && /\b(?:i'?ll|i will|let me|gonna go|about to)\b/i.test(lead) && /\b(?:grab|check|pull|fetch|look up|write|compose|get)\b/i.test(lead)) {
+      clean = rest;
+    }
+  }
+  let body = clean.slice(0, 280);
+  if (clean.length > 280) {
+    const cut = Math.max(body.lastIndexOf('. '), body.lastIndexOf('! '), body.lastIndexOf('? '));
+    if (cut > 120) body = body.slice(0, cut + 1);
+  }
   // "Ki reaches out" is Kade's own personal check-in — deliver ONLY to her
   // linked devices (ADMIN_USER_ID env can override the baked-in default).
   const delivery = await runNotify({ agentId: REACHOUT_AGENT_ID, agentName: REACHOUT_AGENT_NAME, title: reachout.title || 'Ki', body, urgent: urgent === true, userId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7' });
