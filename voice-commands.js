@@ -523,3 +523,23 @@ module.exports.REG_CANCEL_RE = REG_CANCEL_RE;
 module.exports.REG_YES_RE    = REG_YES_RE;
 module.exports.REG_NO_RE     = REG_NO_RE;
 module.exports.REG_PICK_RE   = REG_PICK_RE;
+
+// ── FRONT-DESK GATE (Aug 9 2026 — Kade: "no random people hanging on the
+// line talking, free riding on admin funds without a reason") ───────────────
+// Deterministic intent nets for unregistered callers on the toll-free line.
+// The gate never runs an LLM turn — these regexes ARE the classifier, and a
+// caller who fits none of them (twice) gets a polite goodbye. Kept loose on
+// purpose where Flux STT wobbles ("calling back" arrives dozens of ways),
+// tight where a false positive would hijack ("message" alone is not enough
+// to start capture — it needs a leave/take/pass/for shape around it).
+const GATE_CALLBACK_RE = /\b(?:call(?:ing|ed)?\s+(?:you\s+|ya\s+|y'all\s+)?back|return(?:ing)?\s+(?:your|a|the)\s+call|(?:you|someone|somebody|she|he|they|an?\s+(?:ai|assistant|robot|girl|lady|woman|man|guy))\s+(?:called|reached\s+out|left\s+(?:me\s+)?a\s+(?:message|voicemail)|tried\s+to\s+reach)|missed\s+(?:a\s+)?call\s+from|about\s+(?:the|an?|your|that)\s+(?:appointment|apt|booking|reservation|order|quote|estimate|inquiry|callback|call))\b/i;
+const GATE_MESSAGE_RE  = /\b(?:leave|take|pass(?:\s+(?:on|along))?|give|relay|send)\s+(?:\w+\s+){0,2}?message\b|\bmessage\s+for\b|\b(?:tell|let)\s+(?:kade|keighty|her|him|them|\w+)\s+(?:that|know|i)\b/i;
+const GATE_ACCOUNT_RE  = /\b(?:sign(?:ing)?\s*(?:me\s*)?up|(?:make|create|open|get|want|need|requesting?)\s+(?:me\s+)?an?\s+account|(?:get|request|want|need)\s+access|join(?:ing)?|register(?:ing)?|invite|invitation|membership|how\s+do\s+i\s+(?:get|use|join)\b)/i;
+const GATE_DONE_RE     = /^\s*(?:no+|nope|nah)\b[\s,.!]*(?:that'?s\s+(?:it|all|everything)|thanks?(?:\s+you)?|i'?m\s+good)?[\s.!,]*$|\b(?:that'?s\s+(?:it|all|everything)|nothing\s+else|i'?m\s+(?:good|done|all\s+set)|all\s+good|we'?re\s+good|that'?ll\s+do(?:\s+it)?)\b|^\s*(?:bye|goodbye|no\s+thanks?)[\s.!,]*$/i;
+const GATE_MORE_RE     = /^\s*(?:yes|yeah|yep|yup|one\s+more|also|and|actually|wait|hold\s+on)\b/i;
+
+module.exports.GATE_CALLBACK_RE = GATE_CALLBACK_RE;
+module.exports.GATE_MESSAGE_RE  = GATE_MESSAGE_RE;
+module.exports.GATE_ACCOUNT_RE  = GATE_ACCOUNT_RE;
+module.exports.GATE_DONE_RE     = GATE_DONE_RE;
+module.exports.GATE_MORE_RE     = GATE_MORE_RE;

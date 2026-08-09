@@ -57,7 +57,8 @@ const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE
         fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText, stripAiTells,
         parseSpokenEmailV2, spellOutEmail, parseSpokenPassword, friendlyPassword,
         REG_INTENT_RE, REG_CANCEL_RE, REG_YES_RE, REG_NO_RE, REG_PICK_RE,
-        REG_OK_RE, REG_ANOTHER_RE, friendlyPasswordParts } = require('./voice-commands');
+        REG_OK_RE, REG_ANOTHER_RE, friendlyPasswordParts,
+        GATE_CALLBACK_RE, GATE_MESSAGE_RE, GATE_ACCOUNT_RE, GATE_DONE_RE, GATE_MORE_RE } = require('./voice-commands');
 const videoSight = require('./video-sight'); // caller camera -> agent vision (July 16 2026)
 // Watch-and-alert delivery (July 16 2026, Kade's yes -- character-voice
 // alerts): when an armed watch fires (or expires), video-sight hands the
@@ -1242,6 +1243,194 @@ async function finishRegistration(session) {
   }
 }
 
+// ── FRONT-DESK GATE (Aug 9 2026) ─────────────────────────────────────────────
+// Kade's commission, her words kept: "no random people hanging on the line
+// talking, free riding on admin funds without a reason." An UNREGISTERED
+// number calling the toll-free line no longer gets an open AI conversation
+// on the platform's dime. It gets a front desk: deterministic, zero LLM
+// turns, zero per-turn model cost — state a purpose or the call wraps.
+//
+// Legit purposes, each a real lane:
+//   1. CALLING BACK about an outbound call one of the agents placed (her
+//      hair-appointment example): the bridge KNOWS its own outbound calls —
+//      findCallbackContext(from) matches the caller's number against the
+//      outbound log, so the desk can say "right, the appointment for Kade"
+//      and route the message to the exact user who commissioned the call
+//      (push + in-chat nudge), with the admin always copied.
+//   2. LEAVING A MESSAGE for someone here: captured verbatim, sender named,
+//      delivered to the admin's phone + the front-desk log. No guessing at
+//      registry rows by spoken name — the admin relays; that's what a front
+//      desk does.
+//   3. ASKING ABOUT AN ACCOUNT: routed to the Aug-9 front-door system — the
+//      same /api/access-request doorbell the login page links, filed by
+//      voice (name + who-you-are; contact = the number they're calling
+//      from). Kade approves people, not the phone line — spoken instant
+//      registration is deliberately NOT offered to unknown numbers (that
+//      lane stays for registry-known family like Amber, who never hit this
+//      gate at all).
+//
+// The leash (her pick, Aug 9 session): ~2 minutes hard for gated callers —
+// warn at GATE_WARN_SEC, wrap and hang up at GATE_MAX_SEC, deliver whatever
+// message got captured before the line drops. Anyone in the registry, every
+// outbound call, and every signed-in web/app caller is untouched by all of
+// this. Kill switch: GATE_ENABLED=0.
+const GATE_ENABLED  = process.env.GATE_ENABLED !== '0';
+const GATE_MAX_SEC  = parseInt(process.env.GATE_MAX_SEC || '120', 10);
+const GATE_WARN_SEC = parseInt(process.env.GATE_WARN_SEC || '90', 10);
+
+function clearGateTimers(session) {
+  if (session._gateWarnTimer) { clearTimeout(session._gateWarnTimer); session._gateWarnTimer = null; }
+  if (session._gateEndTimer)  { clearTimeout(session._gateEndTimer);  session._gateEndTimer  = null; }
+}
+
+/// Wrap-up + real hangup. speak() resolves after playback, so the REST
+/// hangup fires once the goodbye has actually reached their ear (+ a small
+/// grace so the last frames drain the jitter buffer).
+async function gateHangup(session, line) {
+  clearGateTimers(session);
+  try { if (line) await speak(session, line, session.voice); } catch {}
+  setTimeout(() => {
+    try { if (session.cfg.endCall && session.callSid) session.cfg.endCall(session.callSid); } catch {}
+  }, 1200);
+}
+
+/// Deliver whatever the gate captured (used by the normal flow AND the hard
+/// timer — a message someone finished dictating must never die with the cap).
+async function gateDeliver(session) {
+  const g = session.gate;
+  if (!g || !g.message || g.delivered) return false;
+  g.delivered = true;
+  try {
+    await session.cfg.deliverFrontDeskMessage({
+      from: session.from,
+      fromName: g.fromName || null,
+      message: g.message,
+      targetUserId: g.cb ? g.cb.userId : null,
+      targetUserName: g.cb ? g.cb.userName : (g.targetName || null),
+      context: g.cb ? (g.cb.purpose || 'an earlier call from this line') : null,
+    });
+    return true;
+  } catch (e) { console.error('[gate] deliver failed:', e.message); return false; }
+}
+
+function gateGreeting(session, agentName) {
+  const g = session.gate;
+  if (g.cb) {
+    const who = g.cb.userName ? ` for ${g.cb.userName}` : '';
+    const about = g.cb.purpose ? ` about ${String(g.cb.purpose).slice(0, 80)}` : '';
+    return `Hey — this is ${agentName} with Kade-AI. If you're calling back${about}, I can take a message${who} right now. Or tell me quick what you need.`;
+  }
+  return `Hey — this is ${agentName} with Kade-AI. I don't recognize this number, and this line is for members — so tell me quick: are you calling somebody back, leaving a message, or asking about an account?`;
+}
+
+async function handleGateTurn(session, text) {
+  const g = session.gate;
+  const t = String(text || '').trim();
+  console.log(`[gate] ${session.from} step=${g.step} "${t.slice(0, 60)}"`);
+  switch (g.step) {
+    case 'purpose': {
+      // Callback-first: if we prematched their number to an outbound call,
+      // a bare "yeah" on the greeting is them confirming exactly that.
+      if (g.cb && (GATE_CALLBACK_RE.test(t) || REG_YES_RE.test(t))) {
+        g.step = 'msg_body';
+        const who = g.cb.userName ? ` straight to ${g.cb.userName}` : ' along';
+        await speak(session, `Perfect. Go ahead with the message whenever you're ready — I'll pass it${who}.`, session.voice);
+        return;
+      }
+      if (GATE_CALLBACK_RE.test(t)) {
+        // Claims a callback but the log has nothing for this number.
+        g.step = 'msg_body';
+        await speak(session, `Hm — I don't show an outgoing call to this number lately, but no matter. Go ahead with the message and who it's for, and I'll get it where it goes.`, session.voice);
+        return;
+      }
+      if (GATE_ACCOUNT_RE.test(t) || REG_INTENT_RE.test(t)) {
+        g.step = 'door_name';
+        await speak(session, `Accounts here are personal invites — but I can ring the front door for you right now. What's your name?`, session.voice);
+        return;
+      }
+      if (GATE_MESSAGE_RE.test(t)) {
+        g.step = 'msg_body';
+        await speak(session, `Sure — go ahead with the message.`, session.voice);
+        return;
+      }
+      g.strikes = (g.strikes || 0) + 1;
+      if (g.strikes >= 2) {
+        await gateHangup(session, `This line runs on the family's dime, so I can't keep it open without a reason. Call back when you've got one — take care now.`);
+        return;
+      }
+      await speak(session, `I hear you — but this line's for business. I can take a message, pass along a callback, or send an account request up to Kade. Which is it?`, session.voice);
+      return;
+    }
+    case 'msg_body': {
+      if (t.length < 3) { await speak(session, `Go ahead — I'm listening.`, session.voice); return; }
+      g.message = (g.message ? g.message + ' ' : '') + t.slice(0, 700 - (g.message ? g.message.length : 0));
+      g.step = 'msg_from';
+      await speak(session, `Got it. And who should I say it's from?`, session.voice);
+      return;
+    }
+    case 'msg_from': {
+      const name = t.replace(/^(?:it'?s|this is|i'?m|i am|my name is|from)\s+/i, '').replace(/[.,!?]+$/g, '').trim();
+      if (name && name.split(/\s+/).length <= 5) g.fromName = name.slice(0, 60);
+      g.step = 'msg_done';
+      await speak(session, `Alright${g.fromName ? ', ' + g.fromName : ''} — I've got it down. Anything to add, or are we good?`, session.voice);
+      return;
+    }
+    case 'msg_done': {
+      if (GATE_DONE_RE.test(t) || (!GATE_MORE_RE.test(t) && t.length < 12)) {
+        const ok = await gateDeliver(session);
+        await gateHangup(session, ok
+          ? `It's delivered — they'll see it on their end. Thanks for calling, take care now!`
+          : `I've got it written down and Kade will see it. Thanks for calling — take care now!`);
+        return;
+      }
+      // They're adding to the message — append and re-confirm.
+      g.message = (g.message ? g.message + ' ' : '') + t.slice(0, 700 - (g.message ? g.message.length : 0));
+      await speak(session, `Added. Anything else, or are we good?`, session.voice);
+      return;
+    }
+    case 'door_name': {
+      const name = t.replace(/^(?:it'?s|this is|i'?m|i am|my name is)\s+/i, '').replace(/[.,!?]+$/g, '').trim();
+      if (!name || name.split(/\s+/).length > 5) {
+        g.strikes = (g.strikes || 0) + 1;
+        if (g.strikes >= 3) { await gateHangup(session, `We can try another time — take care now.`); return; }
+        await speak(session, `Just your name — what should Kade call you?`, session.voice);
+        return;
+      }
+      g.doorName = name.split(/\s+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ').slice(0, 80);
+      g.step = 'door_who';
+      g.strikes = 0;
+      await speak(session, `Alright, ${g.doorName}. And who are you to Kade — or what brings you to the platform?`, session.voice);
+      return;
+    }
+    case 'door_who': {
+      if (t.length < 3) { await speak(session, `Just a sentence — who are you, or what brings you?`, session.voice); return; }
+      g.step = 'door_filed';
+      let filed = false;
+      try {
+        filed = await session.cfg.fileAccessRequest({
+          name: g.doorName || 'Phone caller',
+          contact: `phone ${session.from}`,
+          whoYouAre: t.slice(0, 1200),
+          whyHere: 'Asked by voice on the Kade-AI phone line.',
+        });
+      } catch (e) { console.error('[gate] access request failed:', e.message); }
+      await gateHangup(session, filed
+        ? `That's rung through to Kade herself — if she knows you, expect to hear back at this number. Take care now!`
+        : `The doorbell's jammed on my end right now — but I've noted your name and number, and Kade will see it. Take care now!`);
+      if (!filed) {
+        // Fail-soft: the ask must never vanish — land it as a front-desk note.
+        g.message = `Wants an account. Said: "${t.slice(0, 300)}"`;
+        g.fromName = g.doorName || null;
+        await gateDeliver(session);
+      }
+      return;
+    }
+    default:
+      await gateHangup(session, `Take care now!`);
+      return;
+  }
+}
+
 async function handleUtterance(session, text) {
   text = text.trim();
   if (!text || text.length < 2) return;
@@ -1370,6 +1559,13 @@ async function handleUtterance(session, text) {
     // to voice two" is treated as registration input, and the cancel words
     // are the one documented exit. See PHONE_REGISTRATION_REBUILD doc.
     if (session.reg) { await handleRegistrationTurn(session, text); return; }
+    // ── FRONT-DESK GATE (Aug 9 2026): unregistered numbers never reach the
+    // LLM. Placed AFTER active-registration (that flow is gate-exempt by
+    // construction — only registry-known callers can ever start it) and
+    // BEFORE the registration ENTRY branch below, so an unknown caller
+    // saying "sign me up" gets the front-door request lane inside the gate,
+    // not a self-served account. See handleGateTurn's own doc block.
+    if (session.gate) { await handleGateTurn(session, text); return; }
     if (session.media !== 'wav' && REG_INTENT_RE.test(text)
         && session.cfg && session.cfg.hasAccount && session.cfg.createAccount) {
       if (session.cfg.hasAccount(session.from)) {
@@ -2724,10 +2920,38 @@ function attachMediaStreams(server, users, cfg) {
             ws.on('close', () => sessionsByCallSid.delete(callSid));
           }
 
+          // ── FRONT-DESK GATE (Aug 9 2026): an unregistered number on the
+          // inbound toll-free lane gets the front desk, not the open line.
+          // Armed here so the greeting below composes from gateGreeting()
+          // and the caller's clock starts at pickup. `gsess` captures the
+          // object (the outer `session` variable is nulled at 'stop' — the
+          // same crash the greeting continuations fixed July 1).
+          if (GATE_ENABLED && !user && !outboundCtx) {
+            const gsess = session;
+            gsess.gate = {
+              step: 'purpose', strikes: 0,
+              cb: global._vsConfig.findCallbackContext ? global._vsConfig.findCallbackContext(from) : null,
+            };
+            if (gsess.gate.cb) console.log(`[gate] callback prematch ${from} -> user=${gsess.gate.cb.userName || gsess.gate.cb.userId} purpose="${String(gsess.gate.cb.purpose || '').slice(0, 60)}"`);
+            else console.log(`[gate] armed for ${from} (no callback match) — ${GATE_MAX_SEC}s leash`);
+            gsess._gateWarnTimer = setTimeout(() => {
+              if (gsess.gate && !gsess.gate.delivered && gsess.ws.readyState === WebSocket.OPEN) {
+                speak(gsess, 'Quick heads up — about thirty seconds left on this line. Go ahead and finish your thought.', gsess.voice).catch(() => {});
+              }
+            }, GATE_WARN_SEC * 1000);
+            gsess._gateEndTimer = setTimeout(async () => {
+              if (!gsess.gate) return;
+              const delivered = await gateDeliver(gsess);
+              gateHangup(gsess, delivered
+                ? `That's time on this line — your message is in, they'll see it. Take care now!`
+                : `And that's all the time I've got for this line. Call back when you've got business for me — take care now!`);
+            }, GATE_MAX_SEC * 1000);
+          }
+
           // July 12 2026: fetch the caller/callee's own memory cards (fork)
           // so this agent actually REMEMBERS them on the phone. Async — first
           // turn may go out without them; they attach the moment they land.
-          if (global._vsConfig.fetchCallMemories) {
+          if (!session.gate && global._vsConfig.fetchCallMemories) {
             global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId, { nudges: !session.outbound })
               .then((text) => {
                 if (text && session) {
@@ -2743,7 +2967,7 @@ function attachMediaStreams(server, users, cfg) {
           // second typical) the session upgrades unless they've since spoken
           // an explicit switch. Outbound callee picks are applied in
           // /outbound-call before greeting synth, so skip those here.
-          if (!outboundCtx && global._vsConfig.lookupVoicePref) {
+          if (!outboundCtx && !session.gate && global._vsConfig.lookupVoicePref) {
             const startAgentId = session.agentId;
             global._vsConfig.lookupVoicePref({ email: user?.lcEmail, phone: from }, startAgentId)
               .then((pref) => {
@@ -2762,7 +2986,7 @@ function attachMediaStreams(server, users, cfg) {
           // reasoning (first-ever call = defaults only; warm from then on).
           const pronIdentity = { email: user?.lcEmail, phone: from };
           session.pronunciationDictionary = getCachedDictionary(pronIdentity);
-          refreshPronunciationDictionary(session, pronIdentity, global._vsConfig);
+          if (!session.gate) refreshPronunciationDictionary(session, pronIdentity, global._vsConfig);
 
           session.dgWs = openDeepgram(session);
 
@@ -2816,7 +3040,9 @@ function attachMediaStreams(server, users, cfg) {
           }
           const greeting = outboundCtx
             ? outboundCtx.greeting
-            : `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
+            : session.gate
+              ? gateGreeting(session, agentName) // front desk: purpose up front, no orientation spiel
+              : `${pick(user ? knownOpeners : unknownOpeners)} ${pick(ORIENTATION_LINES)} ${pick(INVITES)}`;
           // Seed history so the agent knows what it already said on pickup,
           // and lock barge-in until the disclosure finishes playing.
           if (outboundCtx) {
@@ -2992,6 +3218,7 @@ function attachMediaStreams(server, users, cfg) {
             session._ringbackActive = false;
             session.llmAbort = true;
             session.isSpeaking = false;
+            clearGateTimers(session);
             if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
           }
@@ -3011,6 +3238,7 @@ function attachMediaStreams(server, users, cfg) {
         session._ringbackActive = false;
         session.llmAbort = true;
         session.isSpeaking = false;
+        clearGateTimers(session);
         if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
         session = null;

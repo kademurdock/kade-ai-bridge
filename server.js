@@ -2953,6 +2953,102 @@ async function endCall(callSid) {
   } catch (e) { console.warn('[outbound] endCall failed:', e.message); }
 }
 
+// ── FRONT DESK (Aug 9 2026 — the toll-free gatekeeper's delivery half) ──────
+// Kade's commission: unknown numbers must state a purpose; messages they
+// leave get DELIVERED, not lost. Three lanes out of the desk:
+//   log file (the permanent record, /front-desk to read it) →
+//   admin push (her phone always hears the desk bell, adminAlert so the
+//   agents' outreach budget never eats a real human's message) →
+//   and when the caller matched an OUTBOUND call (findCallbackContext),
+//   the commissioning user ALSO gets the push + an in-chat nudge — the
+//   hair-appointment example end-to-end: salon calls back, Kiana knows who
+//   the message is for, and it lands with that exact person.
+const FRONTDESK_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'front-desk-messages.json');
+const frontDeskLog = loadJsonFile(FRONTDESK_FILE, []);
+
+function findCallbackContext(from) {
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  // Live (not-yet-finalized) calls first — a salon calling back two minutes
+  // after Kiana hung up is the COMMON case, and its record is still in meta.
+  for (const m of outboundMeta.values()) {
+    if (m.to === from) {
+      return { userId: m.userId, userName: m.userName, purpose: m.purpose, calleeName: m.calleeName, at: new Date(m.startedAt).toISOString() };
+    }
+  }
+  for (let i = outboundLog.length - 1; i >= 0; i--) {
+    const r = outboundLog[i];
+    if (r.to === from && new Date(r.at).getTime() > cutoff) {
+      return { userId: r.userId, userName: r.userName, purpose: r.purpose, calleeName: r.calleeName, at: r.at };
+    }
+  }
+  return null;
+}
+
+async function deliverFrontDeskMessage({ from, fromName, message, targetUserId, targetUserName, context }) {
+  const entry = {
+    at: new Date().toISOString(),
+    from,
+    fromName: fromName || null,
+    message: String(message || '').slice(0, 700),
+    targetUserId: targetUserId || null,
+    targetUserName: targetUserName || null,
+    context: context || null,
+  };
+  frontDeskLog.push(entry);
+  while (frontDeskLog.length > 300) frontDeskLog.shift();
+  saveJsonFile(FRONTDESK_FILE, frontDeskLog);
+  const adminId = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
+  const who = entry.fromName ? `${entry.fromName} (${from})` : from;
+  const forWhom = entry.targetUserName ? ` for ${entry.targetUserName}` : '';
+  const re = entry.context ? ` re: ${String(entry.context).slice(0, 60)}` : '';
+  const short = entry.message.slice(0, 170);
+  try {
+    await runNotify({
+      agentId: 'kade-front-desk', agentName: 'Front desk',
+      title: `Phone message${forWhom}`,
+      body: `${who}${re}: "${short}"`,
+      userId: adminId, adminAlert: true,
+    });
+  } catch (e) { console.warn('[front-desk] admin push failed:', e.message); }
+  if (entry.targetUserId && entry.targetUserId !== adminId) {
+    try {
+      await runNotify({
+        agentId: 'kade-front-desk', agentName: 'Front desk',
+        title: 'Phone message for you',
+        body: `${who}${re}: "${short}"`,
+        userId: entry.targetUserId, adminAlert: true,
+      });
+    } catch (e) { console.warn('[front-desk] target push failed:', e.message); }
+    try {
+      await axios.post(`${FORK_USAGE_URL}/api/kade/nudges/ingest`, {
+        secret: USAGE_EVENT_SECRET,
+        userId: entry.targetUserId,
+        text: `Front desk: ${who} called${re ? re.replace(' re: ', ' back about ') : ''} and left a message: "${entry.message}"`,
+        type: 'reminder',
+      }, { headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' }, timeout: 6000 });
+    } catch (e) { console.warn('[front-desk] nudge ingest failed:', e.message); }
+  }
+  console.log(`[front-desk] message logged from=${from} target=${entry.targetUserName || entry.targetUserId || 'admin'}`);
+  return true;
+}
+
+async function fileAccessRequestByPhone({ name, contact, whoYouAre, whyHere }) {
+  // Rides the SAME public doorbell the login page links (Aug 9 front-door
+  // system) — one review queue, one push, one approve/deny surface. The
+  // fork's 3-per-IP-hour limit sees the bridge's IP; fine for a rare event,
+  // and the gate's fail-soft (front-desk note) catches a 429.
+  const r = await axios.post(`${LIBRECHAT_URL}/api/access-request`, { name, contact, whoYouAre, whyHere }, {
+    headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' }, timeout: 8000,
+  });
+  return !!(r.data && r.data.ok);
+}
+
+// Admin peek at the desk's log (same secret gate as /outbound/calls).
+app.get('/front-desk', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({ count: frontDeskLog.length, messages: [...frontDeskLog].reverse().slice(0, 50) });
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
 
@@ -3012,6 +3108,10 @@ attachMediaStreams(server, users, {
   // first draft) made the flow offer Kade herself a brand-new account,
   // live on her July 21 test call: 4 of 6 registry rows are email-only.
   hasAccount: (phone) => { const u = users.get(phone); return !!(u && u.lcEmail); },
+  // ── Aug 9 2026: FRONT-DESK GATE plumbing (see voice-stream.js handleGateTurn) ──
+  findCallbackContext,
+  deliverFrontDeskMessage,
+  fileAccessRequest: fileAccessRequestByPhone,
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
