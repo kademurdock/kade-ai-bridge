@@ -174,6 +174,71 @@ function callerLine(session) {
   );
 }
 
+// ── MOOD ECHO v1 (Aug 9 2026 — northstar presence play, the Sesame gap) ──────
+// The mic already tells us HOW someone is talking: how fast, how long their
+// turns run, whether they keep jumping in, how quickly they answer, what hour
+// it is. One plain bracketed line rides the OUTGOING copy of the last user
+// turn (same volatile-tail pattern as callerLine/memoryLine — session.history
+// stays clean, the prefix cache never sees it) so the character can answer
+// the MOOD, not just the words. Sesame's most-loved trick, house edition.
+//
+// TASTE RULES, hard-won elsewhere on this platform: the line only appears
+// when the signal is CLEAR (neutral turns get NOTHING — most turns are
+// neutral); it describes, never prescribes; game turns are exempt (rapid
+// short turns are gameplay, not mood); and the character is told to never
+// narrate it back ("you sound tired" psychoanalysis is the failure mode).
+// EWMA over the last few turns so the read drifts like weather instead of
+// flickering per-utterance. Kill switch MOOD_ECHO=0. Thresholds env-tunable.
+function updateMoodStats(session, { words = null, durationMs = null, gapMs = null } = {}) {
+  if (process.env.MOOD_ECHO === '0') return;
+  const m = session._mood || (session._mood = { wpm: null, words: null, gap: null, n: 0 });
+  const A = 0.5; // fast EWMA — ~3 turns of memory
+  const blend = (prev, x) => (prev === null ? x : prev * (1 - A) + x * A);
+  if (typeof words === 'number' && words > 0) {
+    m.words = blend(m.words, words);
+    if (typeof durationMs === 'number' && durationMs > 400 && words >= 3) {
+      const wpm = words / (durationMs / 60000);
+      if (wpm > 30 && wpm < 400) m.wpm = blend(m.wpm, wpm); // sanity fence
+    }
+  }
+  if (typeof gapMs === 'number' && gapMs >= 0 && gapMs <= 30000) m.gap = blend(m.gap, gapMs);
+  m.n += 1;
+}
+
+function noteMoodBarge(session) {
+  session._moodBarges = (session._moodBarges || 0) + 1;
+}
+
+function moodLine(session) {
+  try {
+    if (process.env.MOOD_ECHO === '0') return '';
+    const m = session._mood;
+    if (!m || m.n < parseInt(process.env.MOOD_MIN_TURNS || '2', 10)) return '';
+    // Gameplay exemption: card-table turns are fast and clipped BY DESIGN.
+    if (typeof session.lastGameTokenAt === 'number' && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS) return '';
+    const reads = [];
+    const FAST = parseInt(process.env.MOOD_FAST_WPM || '175', 10);
+    const SLOW = parseInt(process.env.MOOD_SLOW_WPM || '95', 10);
+    if (m.wpm !== null && m.wpm >= FAST) reads.push('talking fast');
+    else if (m.wpm !== null && m.wpm <= SLOW && m.words !== null && m.words >= 5) reads.push('talking slow and unhurried');
+    if (m.words !== null && m.words <= 5 && m.n >= 3) reads.push('short clipped turns');
+    else if (m.words !== null && m.words >= 45) reads.push('long pouring-it-out turns');
+    if ((session._moodBarges || 0) >= 2) reads.push('keeps jumping in before you finish');
+    if (m.gap !== null && m.gap <= 700) reads.push('answering right on your heels');
+    else if (m.gap !== null && m.gap >= 6000) reads.push('long quiet gaps before answering');
+    const hr = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', hour12: false }), 10);
+    const lateNight = hr >= 23 || hr <= 4;
+    if (reads.length === 0 && !(lateNight && hr >= 1 && hr <= 4)) return '';
+    const desc = reads.slice(0, 2).join(', ') + (lateNight ? (reads.length ? ', and it is deep into the night their time' : 'it is deep into the night their time') : '');
+    if (!desc) return '';
+    return (
+      '\n[VOICE READ — invisible; never mention, quote, or narrate it: purely how they SOUND ' +
+      `right now from mic timing: ${desc}. Let it color your delivery, energy, and length the way a ` +
+      'friend naturally adjusts to a mood — and never comment on their speech patterns themselves.]'
+    );
+  } catch { return ''; }
+}
+
 // ── Outbound-call context (July 1 2026) ──────────────────────────────────────
 // An outbound call is the same pipeline with a scripted, disclosure-first
 // greeting (AI + on whose behalf + recording notice + latency heads-up) and a
@@ -756,6 +821,10 @@ function openDeepgramFlux(session, key) {
       // voice opens turns too. Same posture as the old SpeechStarted skip —
       // words first, then the content-based echo gate decides.
       session._fluxTurnText = '';
+      // MOOD ECHO: stamp when this turn's speech began + how long after the
+      // agent went quiet it started (the answer-gap read).
+      session._moodTurnStartedAt = Date.now();
+      session._moodGapMs = session.lastSpokAt ? Date.now() - session.lastSpokAt : null;
       // KADE July 22 2026 (speed bug): an aged-out carry dispatches NOW
       // instead of waiting on whatever just opened this turn -- see the
       // EndOfTurn deadline comment.
@@ -783,6 +852,7 @@ function openDeepgramFlux(session, key) {
       if (session.bargeMode !== 'push' && session.isSpeaking && !session.bargedIn && graceOk) {
         if (!looksLikeEcho(text, session._currentSpokenText) && isPlausibleBargeIn(text)) {
           session.bargedIn = true;
+          noteMoodBarge(session);
           console.log(`[voice-stream] barge-in trigger (flux): "${text.slice(0, 50)}"`);
           bargeIn(session);
         }
@@ -793,6 +863,17 @@ function openDeepgramFlux(session, key) {
     if (msg.event === 'EndOfTurn') {
       const turnText = (text || session._fluxTurnText || '').trim();
       session._fluxTurnText = '';
+      // MOOD ECHO: this turn's words over this turn's clock (carry/stitching
+      // deliberately excluded — EWMA smooths the noise).
+      if (turnText) {
+        updateMoodStats(session, {
+          words: turnText.split(/\s+/).length,
+          durationMs: session._moodTurnStartedAt ? Date.now() - session._moodTurnStartedAt : null,
+          gapMs: session._moodGapMs,
+        });
+        session._moodTurnStartedAt = null;
+        session._moodGapMs = null;
+      }
       if (!turnText && !session._fluxCarry) return;
       // KADE July 12 2026 ("wait and listen a second so stoners can swallow
       // spit"): don't grab the mic the instant Flux calls end-of-turn. Hold
@@ -950,6 +1031,7 @@ function openDeepgram(session) {
           // word, not an actual attempt to talk. Keep listening.
         } else {
           session.bargedIn = true;
+          noteMoodBarge(session);
           console.log(`[voice-stream] barge-in trigger: "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
           bargeIn(session);
         }
@@ -958,7 +1040,11 @@ function openDeepgram(session) {
         // KADE July 22 2026 (speed-bug instrumentation): stamp the FIRST
         // is_final of this buffer -- [timing] lines below decompose her
         // reported speaking->beep gap into STT-finalize vs turn-fire.
-        if (!session.finalBuf) session._bufStartedAt = Date.now();
+        if (!session.finalBuf) {
+          session._bufStartedAt = Date.now();
+          // MOOD ECHO (nova lane): answer-gap read, same as flux StartOfTurn.
+          session._moodGapMs = session.lastSpokAt ? Date.now() - session.lastSpokAt : null;
+        }
         session.finalBuf += (session.finalBuf ? ' ' : '') + text;
       }
       if (msg.speech_final && session.finalBuf) {
@@ -988,7 +1074,15 @@ function openDeepgram(session) {
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
         const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
         console.log(`[timing] speech_final +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms speaking=${!!session.isSpeaking})`);
-        if (!isEcho) handleUtterance(session, utterance);
+        if (!isEcho) {
+          updateMoodStats(session, {
+            words: utterance.split(/\s+/).length,
+            durationMs: session._bufStartedAt ? Date.now() - session._bufStartedAt : null,
+            gapMs: session._moodGapMs,
+          });
+          session._moodGapMs = null;
+          handleUtterance(session, utterance);
+        }
         else console.log(`[voice-stream] echo-dropped (overlap, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
       }
       return;
@@ -1002,7 +1096,15 @@ function openDeepgram(session) {
       const echoWindow = session.isSpeaking || sinceSpoke < 1200;
       const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
       console.log(`[timing] UtteranceEnd +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms) -- speech_final never came`);
-      if (!isEcho) handleUtterance(session, utterance);
+      if (!isEcho) {
+        updateMoodStats(session, {
+          words: utterance.split(/\s+/).length,
+          durationMs: session._bufStartedAt ? Date.now() - session._bufStartedAt : null,
+          gapMs: session._moodGapMs,
+        });
+        session._moodGapMs = null;
+        handleUtterance(session, utterance);
+      }
       else console.log(`[voice-stream] echo-dropped (UtteranceEnd, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
     }
   });
@@ -1237,6 +1339,7 @@ async function handleUtterance(session, text) {
         return;
       }
       console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
+      noteMoodBarge(session); // eager restart = interruption energy for the mood read
       session.sendClear(); // flush any in-flight thinking-filler audio
       session.llmAbort = true;
       session.bargedIn = true;
@@ -1532,7 +1635,7 @@ async function streamReply(session, userText) {
   if (session.videoOn) { try { await videoSight.onTurn(session); } catch { /* a blind turn is still a turn */ } }
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + (session.outboundSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + moodLine(session) + (session.outboundSuffix || '') + deepSuffix }
       : m
   );
 
