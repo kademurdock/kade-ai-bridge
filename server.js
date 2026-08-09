@@ -3136,6 +3136,148 @@ app.post('/canary/run', async (req, res) => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────────
+ * BACKUP WATCH (Aug 9 2026 — the Cowork-independence pass, her pick: the
+ * platform watches its own backups, no external session required).
+ *
+ * The mongo-backup service dumps to Backblaze at 09:00 UTC daily
+ * (backup-mongodb-YYYY-MM-DDT…json.gz). This watcher asks B2 directly —
+ * native B2 API, the bucket-scoped key, zero new deps — whether TODAY'S
+ * object landed. Past the due-time grace (09:20 UTC) with nothing there:
+ * ONE guardrailed admin push per day (same runNotify lane as the canary),
+ * and a back-to-green ping if it shows up late. Result rides
+ * /platform-status as its own section + spoken line, so any companion can
+ * answer "did the backup run?" by voice.
+ *
+ * State on the volume (backup-watch.json) so redeploys don't re-alert.
+ * Kill switch: BACKUP_WATCH=0. Missing keys = watcher silently off (the
+ * status line says so honestly rather than guessing).
+ * ────────────────────────────────────────────────────────────────────────── */
+const BACKUP_WATCH = process.env.BACKUP_WATCH !== '0';
+const B2_WATCH_KEY_ID = process.env.B2_WATCH_KEY_ID || '';
+const B2_WATCH_APP_KEY = process.env.B2_WATCH_APP_KEY || '';
+const B2_WATCH_BUCKET_ID = process.env.B2_WATCH_BUCKET_ID || '732c8de1c831085f99f90319';
+const BACKUP_PREFIX = process.env.BACKUP_PREFIX || 'backup-mongodb-';
+const BACKUP_DUE_UTC_MIN = parseInt(process.env.BACKUP_DUE_UTC_MIN || '560', 10); // 09:20 UTC
+const BACKUP_WATCH_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'backup-watch.json');
+
+const backupWatchState = (() => {
+  try { if (fs.existsSync(BACKUP_WATCH_FILE)) return JSON.parse(fs.readFileSync(BACKUP_WATCH_FILE, 'utf8')); } catch {}
+  return { days: {} };
+})();
+function saveBackupWatchState() {
+  try {
+    const keys = Object.keys(backupWatchState.days).sort();
+    while (keys.length > 45) delete backupWatchState.days[keys.shift()];
+    fs.writeFileSync(BACKUP_WATCH_FILE, JSON.stringify(backupWatchState));
+  } catch (e) { console.warn('[backup-watch] state save failed:', e.message); }
+}
+
+let b2Auth = null; // { apiUrl, token, at }
+async function b2Authorize() {
+  if (b2Auth && Date.now() - b2Auth.at < 20 * 60 * 60 * 1000) return b2Auth;
+  const resp = await axios.get('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
+    auth: { username: B2_WATCH_KEY_ID, password: B2_WATCH_APP_KEY }, timeout: 15000,
+  });
+  b2Auth = { apiUrl: resp.data.apiUrl, token: resp.data.authorizationToken, at: Date.now() };
+  return b2Auth;
+}
+
+function backupUtcDateKey(d = new Date()) { return d.toISOString().slice(0, 10); }
+
+/** Does today's (UTC) backup object exist? -> { ok, size, name } (throws on API trouble). */
+async function checkBackupLanded(dateKey) {
+  const auth = await b2Authorize();
+  const resp = await axios.post(`${auth.apiUrl}/b2api/v2/b2_list_file_names`, {
+    bucketId: B2_WATCH_BUCKET_ID, prefix: `${BACKUP_PREFIX}${dateKey}`, maxFileCount: 5,
+  }, { headers: { Authorization: auth.token }, timeout: 15000 });
+  const files = resp.data.files || [];
+  if (files.length === 0) return { ok: false };
+  const f = files[0];
+  return { ok: true, size: f.contentLength || f.size || 0, name: f.fileName };
+}
+
+async function backupWatchTick() {
+  if (!BACKUP_WATCH || !B2_WATCH_KEY_ID || !B2_WATCH_APP_KEY) return;
+  const now = new Date();
+  const dateKey = backupUtcDateKey(now);
+  const minutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (minutes < BACKUP_DUE_UTC_MIN) return; // not due yet today
+  const day = backupWatchState.days[dateKey] || {};
+  if (day.ok) return; // already confirmed
+  try {
+    const result = await checkBackupLanded(dateKey);
+    if (result.ok) {
+      const wasAlerted = day.alerted;
+      backupWatchState.days[dateKey] = { ok: true, size: result.size, name: result.name, checkedAt: now.toISOString(), alerted: false };
+      saveBackupWatchState();
+      console.log(`[backup-watch] ${dateKey} landed: ${result.name} (${result.size} bytes)`);
+      if (wasAlerted) {
+        runNotify({
+          agentId: 'kade-backup-alert', agentName: 'Backup watch', title: 'Backups',
+          body: 'False alarm resolved — the Mongo backup landed after all. All safe.',
+          urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+        }).catch(() => {});
+      }
+    } else {
+      const alreadyAlerted = day.alerted;
+      backupWatchState.days[dateKey] = { ok: false, checkedAt: now.toISOString(), alerted: true };
+      saveBackupWatchState();
+      console.warn(`[backup-watch] ${dateKey} MISSING past due time`);
+      if (!alreadyAlerted) {
+        runNotify({
+          agentId: 'kade-backup-alert', agentName: 'Backup watch', title: 'Backups',
+          body: `Today's Mongo backup (${dateKey}) has NOT landed in Backblaze and it is past due. The mongo-backup service needs eyes.`,
+          urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+        }).catch(() => {});
+      }
+    }
+  } catch (e) {
+    /* API trouble is not a missing backup — log, never alert on our own failure. */
+    console.warn('[backup-watch] check failed (will retry next tick):', e.message);
+  }
+}
+
+if (BACKUP_WATCH && B2_WATCH_KEY_ID && B2_WATCH_APP_KEY) {
+  setTimeout(() => { backupWatchTick().catch(() => {}); }, 4 * 60 * 1000);
+  setInterval(() => { backupWatchTick().catch(() => {}); }, 30 * 60 * 1000);
+  console.log('[backup-watch] armed: B2 check every 30 min after 09:20 UTC');
+} else {
+  console.log('[backup-watch] off (BACKUP_WATCH=0 or B2 keys not set)');
+}
+
+/** The backups section + spoken line for /platform-status. */
+function backupStatusForSpeech() {
+  if (!BACKUP_WATCH || !B2_WATCH_KEY_ID || !B2_WATCH_APP_KEY) {
+    return { section: { enabled: false }, spoken: '' };
+  }
+  const today = backupUtcDateKey();
+  const yesterday = backupUtcDateKey(new Date(Date.now() - 86400000));
+  const t = backupWatchState.days[today];
+  const y = backupWatchState.days[yesterday];
+  const mb = (n) => `${(n / 1048576).toFixed(1)} megabytes`;
+  if (t && t.ok) {
+    return {
+      section: { enabled: true, date: today, ok: true, size: t.size, checkedAt: t.checkedAt },
+      spoken: `Backups: this morning's Mongo backup landed (${mb(t.size)}).`,
+    };
+  }
+  if (t && !t.ok) {
+    return {
+      section: { enabled: true, date: today, ok: false, checkedAt: t.checkedAt },
+      spoken: "Backups: TODAY'S MONGO BACKUP HAS NOT LANDED — past due and missing from Backblaze.",
+    };
+  }
+  const nowMin = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
+  if (nowMin < BACKUP_DUE_UTC_MIN) {
+    return {
+      section: { enabled: true, date: today, ok: null, note: 'not due yet', yesterday: y || null },
+      spoken: y && y.ok ? "Backups: yesterday's landed; today's isn't due yet." : '',
+    };
+  }
+  return { section: { enabled: true, date: today, ok: null, note: 'not checked yet this boot' }, spoken: '' };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
  * PLATFORM HEARTBEAT (Aug 6 2026 — ideas 62 + 42 from
  * PLATFORM_IMPROVEMENT_IDEAS_2026-08-06, her "ops heartbeat pack" pick).
  *
@@ -3323,11 +3465,13 @@ app.get('/platform-status', async (req, res) => {
       ? `Spend: ${spend.lines.map((l) => l.spoken).join('; ')}.`
       : (spend.note || '');
     const hotFlags = spend.lines.filter((l) => l.hot);
+    const backups = backupStatusForSpeech();
     res.json({
-      ok: down.length === 0 && !(canaryLast && !canaryLast.ok),
-      spokenSummary: [upLine, canarySpoken, spendSpoken].filter(Boolean).join(' '),
+      ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false,
+      spokenSummary: [upLine, canarySpoken, backups.spoken, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
+      backups: backups.section,
       spend: spend.lines,
       spendNote: spend.note,
       hotFlags: hotFlags.map((l) => l.provider),
