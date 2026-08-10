@@ -3845,6 +3845,12 @@ app.get('/platform-status', async (req, res) => {
   }
 });
 
+// Deep research engine (Aug 10 2026): kade_research's back end -- background
+// multi-source research with cited, listenable reports and a done-push.
+// Kill switch RESEARCH_ENABLED=0; needs MOONSHOT_KEY + TAVILY_API_KEY here.
+const { attachResearch } = require('./research');
+attachResearch(app, { bridgeSecretOk, notifySecretOk, runNotify, fetchCallMemories });
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
