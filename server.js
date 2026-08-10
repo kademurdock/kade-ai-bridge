@@ -771,7 +771,13 @@ app.post('/notify', async (req, res) => {
   console.log(
     `[notify] caller=${bridgeSecretOk(req, b.secret) ? 'ADMIN' : broadcastSecretOk(req, b.secret) ? 'broadcast-scoped' : 'agent-scoped'} agent=${String(b.agentId || '?').slice(0, 40)} userId=${b.userId ? String(b.userId).slice(0, 8) + '...' : 'NONE'} broadcast=${b.broadcast === true}`,
   );
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true });
+  /* Build 195 (Aug 10 2026): the front-door doorbell push carries APNs
+   * category KADE_DOORBELL so a tap on the native app opens the Access
+   * Requests screen directly (the Part 42 seed). Derived from the title the
+   * fork already sends — no fork change, no new field, no trust widening;
+   * old builds ignore unknown categories, so this is safe ahead of 195. */
+  const category = /^front door/i.test(String(b.title || '')) ? 'KADE_DOORBELL' : undefined;
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true, category });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
