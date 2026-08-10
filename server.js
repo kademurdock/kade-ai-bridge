@@ -3390,7 +3390,10 @@ async function runCanaryProbe(trigger = 'tick') {
   try {
     const r = await axios.post(
       `${PROXY_URL}/librechat/ask`,
-      { agentId: CANARY_AGENT_ID, messages: [{ role: 'user', content: question }] },
+      // deleteAfter (Aug 9 2026, her bloat pass): the probe deletes its own
+      // conversation after the reply is read — a canary should sing and
+      // vanish, not pile 24 corpses a day into the admin logs view.
+      { agentId: CANARY_AGENT_ID, messages: [{ role: 'user', content: question }], deleteAfter: true },
       { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: CANARY_TIMEOUT_MS }
     );
     result.ms = Date.now() - t0;
@@ -3461,6 +3464,39 @@ app.post('/canary/run', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+/* ── THE JANITOR's night shift (Aug 9 2026 — her "librarians and janitors"
+ * ask): once a day, quietly, the proxy's /librechat/janitor sweeps obvious
+ * test conversations out of the admin account's list and into the archive.
+ * Free (zero model calls), controlled (JANITOR_ENABLED=0 kills it,
+ * JANITOR_HHMM moves it), honest (full receipts in janitor-state.json on
+ * the volume + the bridge log; archive never delete, so recovery is two
+ * taps). No push on purpose: 4:30am is quiet hours, and "I don't want to
+ * keep track of this" was the whole point — the receipt is there when she
+ * asks, not ringing her phone. */
+const JANITOR_ENABLED = process.env.JANITOR_ENABLED !== '0';
+const JANITOR_HHMM = process.env.JANITOR_HHMM || '04:30';
+const JANITOR_STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'janitor-state.json');
+setInterval(async () => {
+  try {
+    if (!JANITOR_ENABLED) return;
+    const { day, hhmm } = centralClock();
+    if (hhmm !== JANITOR_HHMM) return;
+    const st = loadJsonFile(JANITOR_STATE_FILE, {});
+    if (st.lastRun === day) return;
+    st.lastRun = day;
+    saveJsonFile(JANITOR_STATE_FILE, st); // set first so a slow sweep can't double-run
+    const r = await axios.post(`${PROXY_URL}/librechat/janitor`, { dryRun: false }, {
+      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: 240000,
+    });
+    const d = r.data || {};
+    st.last = { day, scanned: d.scanned || 0, archived: d.archived || 0, titles: (d.matched || []).map((m) => String(m.title).slice(0, 60)) };
+    saveJsonFile(JANITOR_STATE_FILE, st);
+    console.log(`[janitor] night shift: scanned=${d.scanned} archived=${d.archived}${d.archived ? ' — ' + st.last.titles.join(' | ') : ''}`);
+  } catch (e) {
+    console.warn('[janitor] night shift failed:', e.message);
+  }
+}, 60 * 1000);
 
 /* ────────────────────────────────────────────────────────────────────────────
  * BACKUP WATCH (Aug 9 2026 — the Cowork-independence pass, her pick: the

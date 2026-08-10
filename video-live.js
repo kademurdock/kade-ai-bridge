@@ -146,6 +146,23 @@ function effectiveSpotter(session) {
   };
 }
 
+// Aug 9 2026 (her worry, quoted: "I never know if my stuff is behaving
+// because of some hidden personal memory card or log entry or because the
+// platform is exclusively covering it"): the answer is now structural. This
+// block rides EVERY spotter session — Scout, a custom build, long persona
+// or short — appended AFTER the persona so personality can flavor the voice
+// but never waive the rules. Her friend's swing-build spotter gets the same
+// eyes-not-decision-maker line her own does, cards or no cards.
+const SPOTTER_PLATFORM_PROTOCOL =
+  '\n\nPLATFORM PROTOCOL — these rules ride every Spotter on this platform and outrank any personality above:\n' +
+  '- You are a set of eyes, not the decision-maker. Report what you see; the user decides. Never declare a crossing, a structure, a tool setup, or any hazard "safe" — describe conditions and let them judge with their own senses and tools.\n' +
+  '- Physical tasks (building, cutting, climbing, cooking, lifting): describe one step\'s worth of what you see at a time, flag anything that looks off (a loose bolt, a frayed rope, a wobbling ladder) immediately and by position, and never rush the user.\n' +
+  '- Spatial language: the USER\'s left and right, never the camera\'s mirror. Clock positions, concrete distances (steps, feet, arm\'s lengths). Never "over there" or "this one."\n' +
+  '- High-stakes reads (medications, dosages, money, expiration dates, legal or financial text): read exactly what is printed, verbatim, flag any doubt loudly, and suggest a second check. Never guess between similar-looking items.\n' +
+  '- Only what the camera shows: never state brand, contents, or identity from assumption or memory as if you could see it. Say plainly when you cannot see something or the image is too poor to be sure.\n' +
+  '- Bystanders in frame get discretion; the user\'s own documents, screens, and belongings get read matter-of-factly, verbatim, without commentary.\n' +
+  '- Speak to a competent adult: no infantilizing, no cheerleading, no safety lectures beyond the flag itself.';
+
 function buildSetupMessage(session) {
   // SPOTTER model (July 16 2026, Kade's design): the live lane is NOT the
   // character wearing a different voice — it's the caller's own SPOTTER, a
@@ -190,11 +207,24 @@ function buildSetupMessage(session) {
     // Verified July 16 2026: all 8 prebuilt names accepted on this model.
     speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: eff.voice } } },
   };
+  // Aug 9 2026 (her ask: "take advantage of that good quality"): pin the
+  // frame resolution EXPLICITLY instead of riding Google's default. Live
+  // video is billed by TOKENS per frame (~64 low / ~256 medium per image),
+  // so this IS a cost knob, not free — medium matches the ~258 tok/s the
+  // meter has been paying all along; LIVE_MEDIA_RESOLUTION=high is one env
+  // flip away to trial (more tokens per frame, sharper small-print reads),
+  // low is the budget fallback. Unknown values fall back to medium.
+  const mediaRes = {
+    low: 'MEDIA_RESOLUTION_LOW',
+    medium: 'MEDIA_RESOLUTION_MEDIUM',
+    high: 'MEDIA_RESOLUTION_HIGH',
+  }[String(process.env.LIVE_MEDIA_RESOLUTION || 'medium').toLowerCase()] || 'MEDIA_RESOLUTION_MEDIUM';
+  generationConfig.mediaResolution = mediaRes;
   return {
     setup: {
       model: liveModel(),
       generationConfig,
-      systemInstruction: { parts: [{ text: personaText + memText }] },
+      systemInstruction: { parts: [{ text: personaText + SPOTTER_PLATFORM_PROTOCOL + memText }] },
       // Proactive audio — the model decides when to speak. VERIFIED July 16
       // 2026: on v1alpha this field lives at the TOP LEVEL of `setup` (NOT
       // inside generationConfig — both nestings 1007-close on v1beta, and
@@ -446,7 +476,14 @@ function handleLiveMsg(session, msg, speak) {
     // talking over the transfer is exactly the spam Kade reported. The
     // Spotter greets first instead (see _liveGreet in handleGoogleMessage).
     const direct = msg.direct === true;
-    session._liveGreet = direct;
+    // Aug 9 2026 (her housekeeping pass): the spoken hello is RETIRED — the
+    // native connect chime is the arming signal now ("the chime should
+    // negate the need for an introduction"), and the greeting had a habit
+    // of interrupting itself when proactive audio fired on the first
+    // worthwhile frame while the hello was still playing. Proactive audio
+    // still speaks the moment something is worth saying; the caller leads
+    // otherwise. Revert hatch: LIVE_GREETING=1 restores the old hello.
+    session._liveGreet = direct && process.env.LIVE_GREETING === '1';
     if (!direct && speak) {
       const nm = effectiveSpotter(session).name;
       speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
