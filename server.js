@@ -3428,11 +3428,24 @@ async function runCanaryProbe(trigger = 'tick') {
     const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
     if (!text || text.length < 10) {
       result.note = `reply too short (${text.length} chars) — the wordless-turn class`;
-    } else if (canaryState.lastReplyHash && hash === canaryState.lastReplyHash) {
-      result.note = 'reply BYTE-IDENTICAL to the previous check — the repetition-bug signature';
+    } else if (
+      canaryState.lastReplyHash && hash === canaryState.lastReplyHash &&
+      canaryState.lastProbe && canaryState.lastProbe !== probe
+    ) {
+      // Aug 11 2026 FALSE-ALARM FIX: this used to fire on ANY repeat hash, but
+      // the probes are deterministic factual questions — "name two animals
+      // bigger than a cat" has one obvious answer, so drawing the same probe
+      // twice in a row produces the same sentence and that is the model being
+      // CORRECT. (Caught by the bug sweep: a red canary at 12:41 whose reply
+      // was independently regenerated, 22 completion tokens, no cache hit.)
+      // A repeat only means something when a DIFFERENT question got the same
+      // answer — that is genuinely the repetition bug. Same question, same
+      // answer is just arithmetic.
+      result.note = 'a DIFFERENT probe returned a byte-identical reply — the repetition-bug signature';
     } else {
       result.ok = true;
       canaryState.lastReplyHash = hash;
+      canaryState.lastProbe = probe;
       if (result.ms >= CANARY_SLOW_MS) result.note = `slow (${(result.ms / 1000).toFixed(1)}s)`;
     }
   } catch (e) {
@@ -3795,6 +3808,187 @@ function computeSpend() {
   return { lines, note: null };
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * LOW-BALANCE WATCH (Aug 11 2026 — her pick from the estate-watchdog question
+ * set: "money about to break things" and "backups stopped working" were the
+ * only two things she wants woken up for).
+ *
+ * The data was already here. The Aug 6 heartbeat has been snapshotting every
+ * provider balance to balance-history.jsonl once a day and computing spend
+ * deltas — but NOBODY WAS EVER TOLD when a number got small. That was the
+ * whole gap: a watcher that reads its own instruments and never speaks.
+ *
+ * Deliberately NOT a new endpoint. The Aug 10 lesson (the redundant
+ * /app-crashes lane, removed same session before it could drift) says one
+ * intake per concern — so this rides /platform-status as a `balances` section
+ * and reuses the backup watch's exact alert shape.
+ *
+ * Two ways to trip, whichever comes first:
+ *   1. FLOOR — an absolute dollar amount per provider.
+ *   2. RUNWAY — projected days left at the recent average burn. Needs at
+ *      least a few days of history; silently skipped until it has them.
+ * Moonshot gets the widest margins on purpose: at $0 the ENTIRE fleet stops
+ * answering, every character at once. Twilio only silences the phone lane.
+ *
+ * ONE push per provider per Central day, back-to-green ping when it recovers,
+ * state on the volume so redeploys don't re-alert. Quiet when healthy is the
+ * entire point — a watchdog that barks daily gets ignored, and then it isn't
+ * a watchdog. Kill switch: BALANCE_WATCH=0.
+ * ────────────────────────────────────────────────────────────────────────── */
+const BALANCE_WATCH = process.env.BALANCE_WATCH !== '0';
+const BALANCE_WATCH_FILE = path.join(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
+  'balance-watch.json'
+);
+// Central-time hour the daily sweep is allowed to speak (her 07:30 ask).
+const BALANCE_WATCH_HHMM = process.env.BALANCE_WATCH_HHMM || '07:30';
+const BALANCE_RUNWAY_DAYS = parseInt(process.env.BALANCE_RUNWAY_DAYS || '14', 10);
+
+// floor = dollars (or Flux credits). plain = how she'd say what breaks.
+const BALANCE_FLOORS = [
+  { key: 'moonshot',   name: 'Moonshot',    floor: parseFloat(process.env.FLOOR_MOONSHOT   || '12'), unit: '$', plain: 'every character on the platform stops answering' },
+  { key: 'openrouter', name: 'OpenRouter',  floor: parseFloat(process.env.FLOOR_OPENROUTER || '10'), unit: '$', plain: 'the models behind the fleet stop answering' },
+  { key: 'fish',       name: 'fish audio',  floor: parseFloat(process.env.FLOOR_FISH       || '10'), unit: '$', plain: 'the cloned voices go quiet' },
+  { key: 'twilio',     name: 'Twilio',      floor: parseFloat(process.env.FLOOR_TWILIO     || '5'),  unit: '$', plain: 'the phone line stops taking calls' },
+  { key: 'flux',       name: 'Flux images', floor: parseFloat(process.env.FLOOR_FLUX       || '40'), unit: '',  plain: 'picture-making stops' },
+];
+
+const balanceWatchState = (() => {
+  try { if (fs.existsSync(BALANCE_WATCH_FILE)) return JSON.parse(fs.readFileSync(BALANCE_WATCH_FILE, 'utf8')); } catch {}
+  return { alerted: {}, lastSweepDay: null, last: null };
+})();
+function saveBalanceWatchState() {
+  try { fs.writeFileSync(BALANCE_WATCH_FILE, JSON.stringify(balanceWatchState)); } catch (e) {
+    console.warn('[balance-watch] state save failed:', e.message);
+  }
+}
+
+/** Average daily burn for one provider from the snapshot history (null if unknowable). */
+function burnRateFor(key) {
+  const hist = readBalanceHistory();
+  if (hist.length < 3) return null;
+  const days = hist.filter((h) => h[key] != null);
+  if (days.length < 3) return null;
+  const deltas = [];
+  for (let i = 1; i < days.length; i++) {
+    const drop = days[i - 1][key] - days[i][key]; // balances fall as money is spent
+    if (isFinite(drop)) deltas.push(Math.max(0, drop));
+  }
+  if (!deltas.length) return null;
+  const window = deltas.slice(-14);
+  const avg = window.reduce((a, b) => a + b, 0) / window.length;
+  return avg > 0.0001 ? avg : null;
+}
+
+/** Read every provider and decide, per provider, whether it is in trouble. */
+async function assessBalances() {
+  const r = await axios.get(`${PROXY_URL}/balances`, {
+    headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
+    timeout: 30000,
+  });
+  const nums = parseBalanceNumbers(r.data);
+  const rows = [];
+  for (const p of BALANCE_FLOORS) {
+    const value = nums[p.key];
+    if (value == null || !isFinite(value)) {
+      rows.push({ ...p, value: null, low: false, reason: null, note: 'no reading' });
+      continue;
+    }
+    const burn = burnRateFor(p.key);
+    const runway = burn ? value / burn : null;
+    let low = false, reason = null;
+    if (value <= p.floor) {
+      low = true;
+      reason = `down to ${p.unit}${value.toFixed(2)}`;
+    } else if (runway != null && runway <= BALANCE_RUNWAY_DAYS) {
+      low = true;
+      reason = `about ${Math.floor(runway)} day${Math.floor(runway) === 1 ? '' : 's'} left at the current rate (${p.unit}${value.toFixed(2)} left, ${p.unit}${burn.toFixed(2)} a day)`;
+    }
+    rows.push({
+      ...p,
+      value: Math.round(value * 100) / 100,
+      burnPerDay: burn ? Math.round(burn * 100) / 100 : null,
+      runwayDays: runway ? Math.floor(runway) : null,
+      low, reason,
+    });
+  }
+  return rows;
+}
+
+async function balanceWatchTick() {
+  if (!BALANCE_WATCH || !PROXY_SECRET) return;
+  const today = bridgeCentralDateKey();
+  const [wantH, wantM] = BALANCE_WATCH_HHMM.split(':').map((n) => parseInt(n, 10));
+  const nowParts = centralNowParts();
+  const nowMin = nowParts.hour * 60 + nowParts.minute;
+  if (nowMin < wantH * 60 + wantM) return;      // not sweep time yet today
+  if (balanceWatchState.lastSweepDay === today) return; // already swept today
+
+  let rows;
+  try {
+    rows = await assessBalances();
+  } catch (e) {
+    // A failed read is NOT an alert. The proxy being briefly unreachable is
+    // not her problem to be woken for; the next tick tries again.
+    console.warn('[balance-watch] read failed:', e.message);
+    return;
+  }
+  balanceWatchState.lastSweepDay = today;
+  balanceWatchState.last = { at: new Date().toISOString(), rows };
+
+  const troubled = rows.filter((r) => r.low);
+  const recovered = rows.filter((r) => !r.low && r.value != null && balanceWatchState.alerted[r.key]);
+
+  for (const r of recovered) delete balanceWatchState.alerted[r.key];
+  const fresh = troubled.filter((r) => balanceWatchState.alerted[r.key] !== today);
+  for (const r of troubled) balanceWatchState.alerted[r.key] = today;
+  saveBalanceWatchState();
+
+  if (fresh.length) {
+    // ONE push, however many providers are low — she gets a sentence, not a list.
+    const body = fresh.length === 1
+      ? `${fresh[0].name} is ${fresh[0].reason}. When it hits zero, ${fresh[0].plain}.`
+      : `${fresh.map((r) => `${r.name} is ${r.reason}`).join('; ')}. Topping these up keeps everything answering.`;
+    console.warn(`[balance-watch] LOW: ${fresh.map((r) => `${r.name}=${r.value}`).join(', ')}`);
+    runNotify({
+      agentId: 'kade-balance-watch', agentName: 'Estate watch', title: 'Money',
+      body, urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+    }).catch(() => {});
+  } else if (recovered.length) {
+    console.log(`[balance-watch] recovered: ${recovered.map((r) => r.name).join(', ')}`);
+    runNotify({
+      agentId: 'kade-balance-watch', agentName: 'Estate watch', title: 'Money',
+      body: `Topped up — ${recovered.map((r) => r.name).join(' and ')} back above the line. Nothing else to do.`,
+      urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+    }).catch(() => {});
+  } else {
+    console.log('[balance-watch] all providers healthy — staying quiet');
+  }
+}
+
+if (BALANCE_WATCH) {
+  setTimeout(() => { balanceWatchTick().catch(() => {}); }, 6 * 60 * 1000);
+  setInterval(() => { balanceWatchTick().catch(() => {}); }, 20 * 60 * 1000);
+  console.log(`[balance-watch] armed: daily sweep after ${BALANCE_WATCH_HHMM} Central, silent unless something is low`);
+} else {
+  console.log('[balance-watch] off (BALANCE_WATCH=0)');
+}
+
+/** The balances section + spoken line for /platform-status. */
+function balanceStatusForSpeech() {
+  if (!BALANCE_WATCH) return { section: { enabled: false }, spoken: '' };
+  const last = balanceWatchState.last;
+  if (!last) return { section: { enabled: true, checkedAt: null, note: 'not swept yet' }, spoken: '' };
+  const low = last.rows.filter((r) => r.low);
+  const known = last.rows.filter((r) => r.value != null);
+  return {
+    section: { enabled: true, checkedAt: last.at, rows: last.rows, low: low.map((r) => r.name) },
+    spoken: low.length
+      ? `Money: ${low.map((r) => `${r.name} is ${r.reason}`).join('; ')}.`
+      : (known.length ? 'Money: every account is comfortably above its floor.' : ''),
+  };
+}
+
 // Honest service checks: a real HTTP round-trip to each public face.
 async function checkPlatformServices() {
   const targets = [
@@ -3855,12 +4049,15 @@ app.get('/platform-status', async (req, res) => {
       : (spend.note || '');
     const hotFlags = spend.lines.filter((l) => l.hot);
     const backups = backupStatusForSpeech();
+    const balances = balanceStatusForSpeech();
     res.json({
-      ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false,
-      spokenSummary: [upLine, canarySpoken, backups.spoken, spendSpoken].filter(Boolean).join(' '),
+      ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
+        && !(balances.section.low && balances.section.low.length),
+      spokenSummary: [upLine, canarySpoken, backups.spoken, balances.spoken, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
       backups: backups.section,
+      balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,
       hotFlags: hotFlags.map((l) => l.provider),
