@@ -26,7 +26,7 @@ const app  = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.json({ limit: '600kb' })); // Aug 10 2026: raised from the 100kb default so MetricKit crash payloads reach /app-crashes (the global parser runs FIRST — a route-level limit can only lower, never raise; learned reading, not crashing)
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const TWILIO_SID      = process.env.TWILIO_ACCOUNT_SID;
@@ -655,7 +655,7 @@ const CRASH_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(
 const CRASH_MAX_LINES = 400;
 let crashPushDay = '';
 const crashIntakeStamps = [];
-app.post('/app-crashes', express.json({ limit: '600kb' }), async (req, res) => {
+app.post('/app-crashes', async (req, res) => {
   const now = Date.now();
   while (crashIntakeStamps.length && now - crashIntakeStamps[0] > 3600e3) crashIntakeStamps.shift();
   if (crashIntakeStamps.length >= 30) return res.status(429).json({ error: 'later' });
