@@ -3918,10 +3918,14 @@ async function assessBalances() {
 async function balanceWatchTick() {
   if (!BALANCE_WATCH || !PROXY_SECRET) return;
   const today = bridgeCentralDateKey();
+  // centralNowParts() hands back { today, hhmm, day } -- NOT hour/minute.
+  // Reading .hour off it yields NaN, and `NaN < anything` is false, so the
+  // time gate silently opens all day. Parse hhmm, which is what it actually
+  // returns. (Caught by the live smoke on the first deploy, Aug 11.)
   const [wantH, wantM] = BALANCE_WATCH_HHMM.split(':').map((n) => parseInt(n, 10));
-  const nowParts = centralNowParts();
-  const nowMin = nowParts.hour * 60 + nowParts.minute;
-  if (nowMin < wantH * 60 + wantM) return;      // not sweep time yet today
+  const [nowH, nowM] = centralNowParts().hhmm.split(':').map((n) => parseInt(n, 10));
+  const nowMin = nowH * 60 + nowM;
+  if (!isFinite(nowMin) || nowMin < wantH * 60 + wantM) return; // not sweep time yet today
   if (balanceWatchState.lastSweepDay === today) return; // already swept today
 
   let rows;
