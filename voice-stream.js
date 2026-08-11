@@ -271,6 +271,7 @@ function buildOutboundSuffix(ctx) {
     `If the answerer already identified themselves or their business ("Pizza Hut, can I help you?"), do NOT ask who they are — get on with it. ` +
     `If they just said "hello" and you were not given a name, you may briefly confirm you reached the right place. ` +
     `Match the register of the call: businesses and strangers get professional, clean language — no profanity, no slang tics — unless the moment genuinely invites humor. ` +
+    `Deliver each mission point ONCE. Before you speak, check the conversation above: anything you already said, do NOT say again — react to their actual last words instead. If they tell you something is handled, or let you off the hook, ACCEPT it and move on; re-delivering a prepared point they just waved off is worse than skipping it. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
     `payments or commitments beyond the mission. If voicemail answered, leave ONE short message covering ` +
     `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
@@ -1633,7 +1634,18 @@ async function handleUtterance(session, text) {
       }
       return;
     }
-    const agents = await session.cfg.getAgents();
+    /* KADE 2026-08-11 — OUTBOUND CALLS HAVE A FIXED IDENTITY. Amber's
+     * apology call proved why: she answered "Yes." and the bare-name matcher
+     * fuzzy-switched the call to JESS; she said "No." and it switched to
+     * NOOR. Kiana greeted her, two strangers finished the call, and every
+     * switch WIPED session.history -- which is also why she heard the whole
+     * mission speech three times. An outbound call is placed AS a specific
+     * agent on a specific mission; the callee's stray words must never
+     * re-cast the speaker. Voice-change commands above stay available --
+     * identity does not. (Inbound switching is untouched, and the bare-name
+     * roulette itself is fixed in voice-commands.js with a stoplist.) */
+    const allowAgentSwitch = !session.outbound;
+    const agents = allowAgentSwitch ? await session.cfg.getAgents() : [];
     const applySwitch = async (agent) => {
       session.agentId   = agent.id;
       session.agentName = agent.name;
@@ -1747,12 +1759,12 @@ async function handleUtterance(session, text) {
       // turns deep, no spoken confirm (the question is the turn).
       session.deepThink = true;
     }
-    if (isBareSwitchRequest(stripSwitchPadding(text))) {
+    if (allowAgentSwitch && isBareSwitchRequest(stripSwitchPadding(text))) {
       session._awaitAgentPick = true;
       await speak(session, 'Sure — who would you like to talk to?', session.voice);
       return;
     }
-    const target = extractSwitchTarget(text, agents);
+    const target = allowAgentSwitch ? extractSwitchTarget(text, agents) : null;
     if (target && target.id !== session.agentId) {
       await applySwitch(target);
       return;

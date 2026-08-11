@@ -222,6 +222,30 @@ function stripSwitchPadding(text) {
   return t.replace(/[\s,]*(?:please|now|for me|real quick)[.!?\s]*$/i, '').trim();
 }
 
+/* KADE 2026-08-11: bare utterances that are conversation, never a name.
+ * Used ONLY by extractSwitchTarget's bare-name branch -- phrased switches
+ * ("talk to jess") and the two-step pick flow are deliberately untouched. */
+const CONVERSATIONAL_STOPWORDS = new Set([
+  'yes', 'no', 'yeah', 'yep', 'yup', 'nope', 'nah', 'okay', 'ok', 'kay',
+  'sure', 'right', 'correct', 'true', 'exactly', 'really', 'seriously',
+  'hello', 'hey', 'hi', 'huh', 'what', 'why', 'when', 'where', 'who', 'how',
+  'wait', 'stop', 'please', 'thanks', 'thank you', 'bye', 'goodbye', 'sorry',
+  'good', 'great', 'fine', 'cool', 'nice', 'awesome', 'perfect', 'alright',
+  'all right', 'uh huh', 'mm hmm', 'mhm', 'um', 'uh', 'hmm', 'oh', 'ah',
+  'wow', 'well', 'so', 'and', 'but', 'now', 'then', 'there', 'here',
+  'no thanks', 'yes please', 'not really', 'i know', 'i see', 'i was',
+  'my bad', 'hold on', 'hang on', 'one sec', 'one second', 'a second',
+  'you know', "you're good", 'youre good', "that's true", 'thats true',
+  "it's central", 'its central', 'go ahead', 'go on', 'come on', 'never',
+  'always', 'maybe', 'probably', 'definitely', 'absolutely', 'of course',
+  'for real', 'me too', 'same', 'anyway', 'anyways', 'whatever', 'nothing',
+  'something', 'someone', 'somebody', 'everyone', 'everybody', 'nobody',
+  'no one', 'this', 'that', 'these', 'those', 'it', 'is it', 'was it',
+  'do it', 'did it', 'got it', 'love it', 'like it', 'i do', 'i did',
+  "i don't", 'i dont', 'i will', "i won't", 'i wont', 'i can', "i can't",
+  'i cant', 'we are', 'we were', 'she is', 'he is', 'they are',
+]);
+
 function extractSwitchTarget(text, agents) {
   const t = stripSwitchPadding(text);
   const patterns = [
@@ -252,7 +276,20 @@ function extractSwitchTarget(text, agents) {
   // only. (Stripping padding here backfired in regression tests: "Now what?"
   // shrank to "what" and fuzzy-matched Wyatt. Raw text is safe because the
   // substring pass already handles "Kiana please".)
-  if (!q && text.trim().split(/\s+/).length <= 2) q = text.trim();
+  //
+  // KADE 2026-08-11 — THE STOPLIST, paid for on a real call: with 223 agents
+  // in the roster, ordinary conversational particles fuzzy-match NAMES.
+  // Amber said "Yes." and this path handed findAgent "Yes" -> JESS (0.6+);
+  // she said "No." -> NOOR. Half of everything a phone callee says is one or
+  // two words, so every short answer was a spin on a 223-agent roulette
+  // wheel. Words a person says AT someone are never the name OF someone --
+  // if the whole bare utterance is one of these, it is not a switch request.
+  // A real bare-name switch ("Kiana.") still works, and every phrased form
+  // above ("switch to noor") is untouched.
+  if (!q && text.trim().split(/\s+/).length <= 2) {
+    const bare = text.trim().toLowerCase().replace(/[^a-z' ]/g, '').replace(/\s+/g, ' ').trim();
+    if (!CONVERSATIONAL_STOPWORDS.has(bare)) q = text.trim();
+  }
   if (!q) {
     // Last-ditch: an explicit switch verb ANYWHERE — covers the vocative case
     // ("Zadiana, switch me to Kiana"). findAgent's confidence gate keeps this
