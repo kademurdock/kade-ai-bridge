@@ -640,6 +640,75 @@ app.options('/push-register', (req, res) => {
   res.set('Access-Control-Allow-Headers', 'Content-Type');
   res.sendStatus(204);
 });
+// ── APP CRASH TELEMETRY (Aug 10 2026, her ruling: every device) ──────────────
+// The automation she asked for by name: "the system lets us know about these
+// crashes so we can fix them proactively." MetricKit hands the native app
+// crash diagnostics (stack trees, never content) in Apple's ~daily batches;
+// the app POSTs them here. PUBLIC like /push-register (the app bakes no
+// secrets) with the same defense shape: strict size caps, a light rate
+// limit, and nothing sensitive to leak — worst case an abuser fills a ring
+// buffer with fiction. Reports land in a JSONL ring on the volume; the admin
+// gets ONE summary push per day at most (dedup by Central date). Read back:
+// GET /app-crashes?secret=BRIDGE_SECRET — the lane future sessions check
+// FIRST before chasing any "native crash issues" report.
+const CRASH_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'app-crash-reports.jsonl');
+const CRASH_MAX_LINES = 400;
+let crashPushDay = '';
+const crashIntakeStamps = [];
+app.post('/app-crashes', express.json({ limit: '600kb' }), async (req, res) => {
+  const now = Date.now();
+  while (crashIntakeStamps.length && now - crashIntakeStamps[0] > 3600e3) crashIntakeStamps.shift();
+  if (crashIntakeStamps.length >= 30) return res.status(429).json({ error: 'later' });
+  crashIntakeStamps.push(now);
+  const b = req.body || {};
+  const report = {
+    at: new Date().toISOString(),
+    appVersion: String(b.appVersion || '').slice(0, 40),
+    build: String(b.build || '').slice(0, 20),
+    osVersion: String(b.osVersion || '').slice(0, 40),
+    model: String(b.model || '').slice(0, 40),
+    userId: b.userId ? String(b.userId).slice(0, 64) : null,
+    crashCount: Math.min(Math.max(parseInt(b.crashCount, 10) || 0, 0), 50),
+    diagnostics: Array.isArray(b.diagnostics) ? b.diagnostics.slice(0, 8).map((d) => String(typeof d === 'string' ? d : JSON.stringify(d)).slice(0, 60000)) : [],
+  };
+  if (!report.crashCount && !report.diagnostics.length) return res.status(400).json({ error: 'empty report' });
+  try {
+    let lines = [];
+    try { lines = fs.readFileSync(CRASH_FILE, 'utf8').split('\n').filter(Boolean); } catch (e) { /* first write */ }
+    lines.push(JSON.stringify(report));
+    if (lines.length > CRASH_MAX_LINES) lines = lines.slice(lines.length - CRASH_MAX_LINES);
+    fs.writeFileSync(CRASH_FILE, lines.join('\n') + '\n');
+  } catch (e) {
+    console.log('[app-crashes] write failed:', e.message);
+  }
+  console.log(`[app-crashes] report: build=${report.build} os=${report.osVersion} model=${report.model} crashes=${report.crashCount}`);
+  // One admin summary push per Central day, urgent never (quiet hours hold).
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago' }).format(new Date());
+  if (crashPushDay !== day) {
+    crashPushDay = day;
+    try {
+      await runNotify({
+        agentId: 'crash_telemetry', agentName: 'The app itself',
+        title: 'The app crashed and told on itself',
+        body: `${report.crashCount || report.diagnostics.length} crash report${(report.crashCount || 1) === 1 ? '' : 's'} came in (build ${report.build || '?'}, iOS ${report.osVersion || '?'}). Stack traces are saved for the next session.`,
+        urgent: false, adminAlert: true,
+      });
+    } catch (e) {
+      console.log('[app-crashes] push failed:', e.message);
+    }
+  }
+  res.json({ ok: true });
+});
+app.get('/app-crashes', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  let lines = [];
+  try { lines = fs.readFileSync(CRASH_FILE, 'utf8').split('\n').filter(Boolean); } catch (e) { /* none yet */ }
+  const limit = Math.min(parseInt(req.query.limit, 10) || 25, CRASH_MAX_LINES);
+  const brief = String(req.query.brief || '') === '1';
+  const rows = lines.slice(-limit).map((l) => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+  res.json({ count: lines.length, reports: brief ? rows.map((r) => ({ at: r.at, build: r.build, osVersion: r.osVersion, model: r.model, crashCount: r.crashCount })) : rows });
+});
+
 app.post('/push-register', (req, res) => {
   res.set('Access-Control-Allow-Origin', 'https://kademurdock.com');
   const token = String((req.body && req.body.token) || '').trim().toLowerCase();
