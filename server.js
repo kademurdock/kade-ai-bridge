@@ -441,6 +441,51 @@ const DIAG_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir()
 const diagRing = (() => { try { if (fs.existsSync(DIAG_FILE)) return JSON.parse(fs.readFileSync(DIAG_FILE, 'utf8')).slice(-20); } catch {} return []; })();
 function saveDiagRing() { try { fs.writeFileSync(DIAG_FILE, JSON.stringify(diagRing)); } catch (e) { console.warn('[diag] ring save failed:', e.message); } }
 let diagDayStamp = ''; let diagDayCount = 0; let crashPushDay = '';
+/* Aug 13 2026 — STORM DETECTION. One push per Central day was the old rule,
+ * and even had it been able to fire, Amber's FIVE crashes in 55 minutes would
+ * have read exactly like one crash. Volume is the signal: a lone crash is
+ * noise, a burst is a bug with a name. Two lanes now — the first crash of the
+ * day (calm), and a storm (loud, and it re-arms). Both stay non-urgent by
+ * Kade's explicit call: quiet hours hold, a 3 a.m. burst waits for morning
+ * with its full count intact. Mute hatch: 'kade-crash-alert' in notify-prefs,
+ * same shape as the canary and balance watchers. */
+const CRASH_STORM_WINDOW_MIN = Number(process.env.CRASH_STORM_WINDOW_MIN || 30);
+const CRASH_STORM_COUNT = Number(process.env.CRASH_STORM_COUNT || 3);
+const CRASH_ALERT_USER = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
+let crashStormAlertedAt = 0;
+
+/* MetricKit's termination reason is a hex code and a C struct dump. Kade
+ * hears these pushes rather than reads them, so the alert speaks the cause
+ * instead of reciting 0x8BADF00D at her. Codes per Apple's own docs; the
+ * fallthrough still carries the raw numbers so nothing is lost. */
+function crashCausePlain(rawPayload) {
+  try {
+    const p = typeof rawPayload === 'string' ? JSON.parse(rawPayload) : rawPayload;
+    const d = p && p.crashDiagnostics && p.crashDiagnostics[0];
+    const meta = d && d.diagnosticMetaData;
+    if (!meta) return 'Cause unknown';
+    const reason = String(meta.terminationReason || '');
+    if (/8BADF00D/i.test(reason)) return 'The watchdog killed it — the app stopped answering';
+    if (/c00010ff/i.test(reason)) return 'Killed for running too hot';
+    if (/dead10cc/i.test(reason)) return 'Killed for holding a file open in the background';
+    if (/baddcafe/i.test(reason)) return 'A background task ran out of time';
+    if (meta.signal === 6) return 'The app tripped its own assertion and aborted';
+    if (meta.signal === 11) return 'A memory fault';
+    if (meta.signal === 9) return 'The system force-quit it';
+    return `Exception type ${meta.exceptionType ?? '?'}, signal ${meta.signal ?? '?'}`;
+  } catch (_) { return 'Cause unknown'; }
+}
+
+/* Names, not addresses — she is hearing this. The email stays in the ring for
+ * the session that has to go look; the push says "Amber A". */
+function crashWhoPhrase(entries) {
+  const names = [...new Set(entries.map((e) => String(e.who || '').trim()).filter(Boolean))]
+    .map((w) => w.replace(/\s*<[^>]*>$/, ''));
+  if (!names.length) return '';
+  if (names.length === 1) return ` — ${names[0]}`;
+  if (names.length === 2) return ` — ${names[0]} and ${names[1]}`;
+  return ` — ${names[0]} and ${names.length - 1} others`;
+}
 app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -452,6 +497,9 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
       build: String(b.build || '?').slice(0, 24),
       device: String(b.device || '?').slice(0, 64),
       kind: String(b.kind || 'crash').slice(0, 24),
+      // Build 199: the app now names the signed-in account on its own crash
+      // reports. Absent on anything older, so every read stays optional.
+      who: String(b.who || '').slice(0, 80),
       payload: b.payload,
       breadcrumbs: String(b.breadcrumbs || '').slice(0, 4000),
     };
@@ -480,14 +528,41 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
      * the next session. The push is the feature; everything else existed. */
     if (entry.kind === 'crash') {
       const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago' }).format(new Date());
-      if (crashPushDay !== day) {
-        crashPushDay = day;
+      /* ⚠️ THE BUG THIS REPLACES, so nobody re-introduces it: the original
+       * call passed NO userId and NO broadcast. runNotify resolves those to
+       * zero targets and returns {ok:false} silently, so from Aug 10 to Aug 13
+       * this alert fired exactly zero times while looking, in code, like it
+       * worked. `userId: CRASH_ALERT_USER` is the whole difference between a
+       * watcher and a decoration. Every other watcher in this file already
+       * had it — this was the only orphan (swept and confirmed Aug 13). */
+      const windowMs = CRASH_STORM_WINDOW_MIN * 60000;
+      const burst = diagRing.filter((e) => e.kind === 'crash' && Date.parse(e.at) >= Date.now() - windowMs);
+      const isStorm = burst.length >= CRASH_STORM_COUNT;
+      // Re-arm once the window has rolled clean past the last storm alert, so
+      // a long bad afternoon reports again instead of going quiet after one.
+      const stormRearmed = Date.now() - crashStormAlertedAt > windowMs;
+      let lane = null;
+      if (isStorm && stormRearmed) {
+        lane = 'storm'; crashStormAlertedAt = Date.now(); crashPushDay = day;
+      } else if (crashPushDay !== day) {
+        lane = 'first'; crashPushDay = day;
+      }
+      if (lane) {
+        const who = crashWhoPhrase(lane === 'storm' ? burst : [entry]);
+        const cause = crashCausePlain(entry.payload);
+        const body = lane === 'storm'
+          ? `${burst.length} crashes in the last ${CRASH_STORM_WINDOW_MIN} minutes${who}, all on build ${entry.build}. ${cause}. That's a pattern, not a blip — the stacks are in the crash ring.`
+          : `Build ${entry.build} on ${entry.device}${who}. ${cause}. Stack and breadcrumbs saved — ask me to read the crash ring.`;
         runNotify({
-          agentId: 'crash_telemetry', agentName: 'The app itself',
-          title: 'The app crashed and told on itself',
-          body: `Crash report received — build ${entry.build}, ${entry.device}${sig ? ' — ' + sig.slice(0, 140) : ''}. Stack and breadcrumbs saved for the next session (GET /diagnostics).`,
-          urgent: false, adminAlert: true,
-        }).catch((e) => console.log('[diagnostics] crash push failed:', e.message));
+          agentId: 'kade-crash-alert', agentName: 'The app itself',
+          title: lane === 'storm' ? 'The app is crashing over and over' : 'The app crashed and told on itself',
+          body,
+          urgent: false, userId: CRASH_ALERT_USER, adminAlert: true,
+        })
+          .then((r) => console.log(`[diagnostics] ${lane} alert → ${JSON.stringify(r)}`))
+          .catch((e) => console.log('[diagnostics] crash push failed:', e.message));
+      } else {
+        console.log(`[diagnostics] crash #${burst.length} in window — no alert (day already alerted, storm not re-armed)`);
       }
     }
     res.json({ ok: true });
@@ -754,12 +829,26 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   // hours unless urgent (a 2 a.m. report waits for morning; its in-chat
   // nudge carries it meanwhile).
   const skipBudget = adminAlert === true;
-  if (!notifyPrefs.enabled) return { ok: false, blocked: 'notifications are globally muted' };
-  if (notifyPrefs.mutedAgents.includes(agentId)) return { ok: false, blocked: 'this agent is muted' };
-  if (!urgent && notifyInQuietHours(hhmm)) return { ok: false, blocked: 'quiet hours (Central)' };
-  if (!skipBudget && Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return { ok: false, blocked: 'cooldown active' };
-  if (!skipBudget && notifyCounts.global >= notifyPrefs.globalDailyCap) return { ok: false, blocked: 'daily total cap reached' };
-  if (!skipBudget && (notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return { ok: false, blocked: 'per-agent daily cap reached' };
+  /* Aug 13 2026 — EVERY REFUSAL SAYS SO OUT LOUD NOW, and this cost a real
+   * one to learn. The crash alert below had been shipping a push with no
+   * userId and no broadcast since Aug 10: runNotify resolved
+   * {ok:false, blocked:'no target user'} BEFORE the success log line and
+   * WITHOUT rejecting, so the caller's .catch never fired either. A watcher
+   * that cannot deliver, saying nothing, for three days — while Amber took
+   * five crashes and had to phone Kade herself. A silent refusal is the worst
+   * failure shape a notifier has: indistinguishable from "nothing happened."
+   * Every early return is now a logged warning. Costs one log line; buys the
+   * ability to ever notice this again. */
+  const refuse = (why) => {
+    console.warn(`[notify] BLOCKED — ${agentName} (${agentId}): ${why}`);
+    return { ok: false, blocked: why };
+  };
+  if (!notifyPrefs.enabled) return refuse('notifications are globally muted');
+  if (notifyPrefs.mutedAgents.includes(agentId)) return refuse('this agent is muted');
+  if (!urgent && notifyInQuietHours(hhmm)) return refuse('quiet hours (Central)');
+  if (!skipBudget && Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return refuse('cooldown active');
+  if (!skipBudget && notifyCounts.global >= notifyPrefs.globalDailyCap) return refuse('daily total cap reached');
+  if (!skipBudget && (notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return refuse('per-agent daily cap reached');
   // Per-user targeting: a userId restricts delivery to THAT person's linked
   // device(s) only — it never falls back to the full pool, so an unlinked or
   // not-yet-registered user gets zero targets, never someone else's phone.
@@ -769,8 +858,13 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   // secret plus an explicit broadcast:true, and is never reachable by agents.
   const targets = userId ? tokensForUser(userId) : (broadcast === true ? [...pushTokens.keys()] : []);
   if (!targets.length) {
-    if (!userId && broadcast !== true) return { ok: false, blocked: 'no target user (per-user sends need a userId; broadcast needs admin broadcast:true)' };
-    return { ok: true, sent: 0, note: userId ? 'no device linked to this user yet' : 'no device tokens registered yet' };
+    if (!userId && broadcast !== true) return refuse('no target user (per-user sends need a userId; broadcast needs admin broadcast:true)');
+    // Not a refusal — a correct send with nobody to send to. Still logged,
+    // because "delivered to zero phones" reads identical to "delivered" from
+    // any caller that only checks ok.
+    const note = userId ? 'no device linked to this user yet' : 'no device tokens registered yet';
+    console.warn(`[notify] ZERO TARGETS — ${agentName} (${agentId}): ${note}`);
+    return { ok: true, sent: 0, note };
   }
   const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message, { category })));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
