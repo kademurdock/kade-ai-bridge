@@ -120,11 +120,18 @@ function attachNvdaAgent(app, deps = {}) {
       host: CONNECT_HOST, port: CONNECT_PORT, key: run.channelKey, role: 'master',
       onSpeak: (t) => { run.observer.push(t); run.recorder.speak(t); },
       onEvent: (m) => {
-        if (m.type === 'client_joined' && !kicked) {
-          kicked = true;
-          run.recorder.note('pc-joined', { mode: run.mode });
-          if (run.mode === 'listen') { run.status = 'listening'; } // co-listener: no keys, no model
-          else startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message }));
+        // Kick off when a PC is present — whether it joins AFTER us
+        // (client_joined) or was ALREADY in the channel when we joined
+        // (channel_joined lists existing members).
+        if (!kicked && (m.type === 'client_joined' || m.type === 'channel_joined')) {
+          const peers = m.type === 'client_joined' ? 1
+            : ((m.clients && m.clients.length) || (m.user_ids && m.user_ids.length) || 0);
+          if (peers > 0) {
+            kicked = true;
+            run.recorder.note('pc-present', { via: m.type, mode: run.mode });
+            if (run.mode === 'listen') { run.status = 'listening'; } // co-listener: no keys, no model
+            else startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message }));
+          }
         }
         else if (m.type === 'client_left') { run.recorder.note('pc-left'); }
       },
