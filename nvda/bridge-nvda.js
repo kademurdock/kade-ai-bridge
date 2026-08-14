@@ -263,6 +263,14 @@ function attachNvdaAgent(app, deps = {}) {
     res.json({ say });
   }));
 
+  // Read back the latest whole-page tree (for supervising a run).
+  app.get('/nvda/tree', wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor(req.query.userId || 'kade');
+    if (!run) return res.json({ tree: '', title: '', chars: 0 });
+    res.json({ title: run.latestTitle, chars: (run.latestTree || '').length, tree: run.latestTree });
+  }));
+
   // Inject a phrase for the add-on to speak (testing + manual narration).
   app.post('/nvda/say', jsonMw, wrap(async (req, res) => {
     if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
