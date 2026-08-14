@@ -36,6 +36,7 @@ const { runAgentLoop } = require('./agent/brain');
 const { ModelRouter } = require('./agent/models');
 const { makeModelBrain } = require('./agent/model_adapter');
 const { Memory } = require('./agent/memory');
+const { chordToKeyEvents } = require('./agent/keymap');
 
 const VOL = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const RELAY_PORT = parseInt(process.env.NVDA_RELAY_PORT, 10) || 6837;
@@ -261,6 +262,31 @@ function attachNvdaAgent(app, deps = {}) {
     if (!run) return res.json({ say: [] });
     const say = run.sayQueue.splice(0, run.sayQueue.length);
     res.json({ say });
+  }));
+
+  // Send keystrokes through the active run's already-connected controller (no
+  // reconnect churn) — for supervised hand-driving. chords: array like
+  // ["control+home","h","tab","enter"]; or text: string (clipboard+paste).
+  app.post('/nvda/key', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor((req.body && req.body.userId) || 'kade');
+    if (!run || !run.master) return res.status(404).json({ error: 'no active run with a connected controller' });
+    const body = req.body || {};
+    const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+    if (body.text) {
+      run.master.send({ type: 'set_clipboard_text', text: String(body.text) });
+      await nap(150);
+      for (const e of (chordToKeyEvents('control+v') || [])) { run.master.send({ type: 'key', ...e }); await nap(45); }
+      return res.json({ ok: true, typed: String(body.text).length });
+    }
+    const chords = body.chords || (body.chord ? [body.chord] : []);
+    for (const chord of chords) {
+      const events = chordToKeyEvents(String(chord), { nvdaKey: 'insert' });
+      if (!events) return res.status(400).json({ error: 'bad chord: ' + chord });
+      for (const e of events) { run.master.send({ type: 'key', ...e }); await nap(50); }
+      await nap(220);
+    }
+    res.json({ ok: true, sent: chords });
   }));
 
   // Read back the latest whole-page tree (for supervising a run).
