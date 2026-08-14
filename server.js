@@ -542,6 +542,20 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
       // a long bad afternoon reports again instead of going quiet after one.
       const stormRearmed = Date.now() - crashStormAlertedAt > windowMs;
       let lane = null;
+      /* Aug 13 2026 NIGHT FIX — found while tracing the doorbell bug, and it
+       * is MY OWN morning bug: the stamps were written at lane selection,
+       * BEFORE knowing the push delivered. A 2 a.m. crash → quiet hours
+       * refuses the push → crashPushDay already stamped → the day's entire
+       * first-crash alert is spent on a refusal, and morning crashes stay
+       * silent unless they storm. Exactly the blocked-means-lost disease
+       * this same day was spent curing, one file down from the cure. Now:
+       * stamp optimistically (keeps the double-fire window closed while the
+       * push is in flight), ROLL BACK on any outcome that didn't reach a
+       * phone, so the next crash retries. If NO further crash comes that
+       * day, the refusal stands unannounced — inherent to push-at-event;
+       * the ring and /platform-status still carry it. */
+      const prevDay = crashPushDay;
+      const prevStormAt = crashStormAlertedAt;
       if (isStorm && stormRearmed) {
         lane = 'storm'; crashStormAlertedAt = Date.now(); crashPushDay = day;
       } else if (crashPushDay !== day) {
@@ -559,8 +573,19 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
           body,
           urgent: false, userId: CRASH_ALERT_USER, adminAlert: true,
         })
-          .then((r) => console.log(`[diagnostics] ${lane} alert → ${JSON.stringify(r)}`))
-          .catch((e) => console.log('[diagnostics] crash push failed:', e.message));
+          .then((r) => {
+            console.log(`[diagnostics] ${lane} alert → ${JSON.stringify(r)}`);
+            if (!r || r.ok !== true || !(r.sent > 0)) {
+              crashPushDay = prevDay;
+              crashStormAlertedAt = prevStormAt;
+              console.log(`[diagnostics] ${lane} alert did not reach a phone — stamps rolled back so the next crash retries`);
+            }
+          })
+          .catch((e) => {
+            crashPushDay = prevDay;
+            crashStormAlertedAt = prevStormAt;
+            console.log('[diagnostics] crash push failed (stamps rolled back):', e.message);
+          });
       } else {
         console.log(`[diagnostics] crash #${burst.length} in window — no alert (day already alerted, storm not re-armed)`);
       }
