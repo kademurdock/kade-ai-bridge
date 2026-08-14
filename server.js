@@ -4264,6 +4264,14 @@ try {
   attachNvdaAgent(app, { bridgeSecretOk, runNotify });
 } catch (e) { console.warn('[nvda] attach failed (bridge unaffected):', e.message); }
 
+// Part 63 (Aug 14 2026) — the platform's own memory: read lane over the
+// kademurdock/kade-ai-project snapshot repo, so the estate keeps its
+// knowledge when her computer is off. Full story atop memory.js.
+try {
+  const { attachMemory } = require('./memory');
+  attachMemory(app, { bridgeSecretOk });
+} catch (e) { console.warn('[memory] attach failed (bridge unaffected):', e.message); }
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
