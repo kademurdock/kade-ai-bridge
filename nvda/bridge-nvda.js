@@ -73,9 +73,11 @@ function attachNvdaAgent(app, deps = {}) {
 
   const runs = new Map();
 
-  function newRun(goal, userId, mode) {
+  function newRun(goal, userId, mode, wantKey) {
     const runId = 'run_' + crypto.randomBytes(5).toString('hex');
-    const channelKey = 'kade-' + crypto.randomBytes(12).toString('hex');
+    // Allow a caller-supplied, easy-to-type key (sanitized); else random.
+    const clean = String(wantKey || '').trim();
+    const channelKey = /^[a-zA-Z0-9_-]{4,60}$/.test(clean) ? clean : 'kade-' + crypto.randomBytes(12).toString('hex');
     const observer = new Observer();
     const recorder = new Recorder({ file: path.join(VOL, `nvda_transcript_${runId}.jsonl`), goal });
     const safety = new Safety();
@@ -167,7 +169,7 @@ function attachNvdaAgent(app, deps = {}) {
     const goal = String((req.body && req.body.goal) || (mode === 'listen' ? 'listen and read the screen' : '')).slice(0, 500);
     const userId = (req.body && req.body.userId) || 'kade';
     if (mode === 'drive' && !goal) return res.status(400).json({ error: 'goal required' });
-    const run = newRun(goal, userId, mode);
+    const run = newRun(goal, userId, mode, req.body && req.body.key);
     await connectMaster(run);
     res.json({ runId: run.runId, status: run.status, mode: run.mode, channelKey: run.channelKey, connect: connectInstructions(run) });
   }));
