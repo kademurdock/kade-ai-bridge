@@ -58,6 +58,19 @@ function tryRequire(m) { try { return require(m); } catch { return null; } }
 function attachNvdaAgent(app, deps = {}) {
   if (!enabled()) { console.log('[nvda] disabled (NVDA_AGENT_ENABLED=0)'); return { enabled: false }; }
   const bridgeSecretOk = deps.bridgeSecretOk || (() => false);
+  /* Aug 14 2026 — SCOPED TOOL SECRET. The fork's kade_drive_pc tool (Kiana +
+   * Forge, hard-gated to Kade's own seat) needs these routes without holding
+   * the admin BRIDGE_SECRET — same pattern as NOTIFY_AGENT_SECRET on /notify.
+   * NVDA_TOOL_SECRET unlocks ONLY the /nvda lane: start/see/confirm/stop and
+   * supervised keys, all of which still ride the driver's own safety rails
+   * (NVDA+Q block, password guard, pacing caps, confirm-before-commit).
+   * Unset = the scoped path is off and BRIDGE_SECRET remains the only door. */
+  const nvdaSecretOk = (req, provided) => {
+    if (bridgeSecretOk(req, provided)) return true;
+    const scoped = process.env.NVDA_TOOL_SECRET;
+    if (!scoped) return false;
+    return provided === scoped || (req.get && req.get('x-nvda-secret') === scoped);
+  };
   const runNotify = deps.runNotify || null;
   const express = tryRequire('express');
   const jsonMw = deps.json || (express ? express.json({ limit: '16kb' }) : (req, _res, next) => next());
@@ -179,7 +192,7 @@ function attachNvdaAgent(app, deps = {}) {
   const wrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(500).json({ error: e.message }); } };
 
   app.post('/nvda/start', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const mode = (req.body && req.body.mode) === 'listen' ? 'listen' : 'drive';
     const goal = String((req.body && req.body.goal) || (mode === 'listen' ? 'listen and read the screen' : '')).slice(0, 500);
     const userId = (req.body && req.body.userId) || 'kade';
@@ -190,7 +203,7 @@ function attachNvdaAgent(app, deps = {}) {
   }));
 
   app.post('/nvda/confirm', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = runs.get(req.body && req.body.runId);
     if (!run) return res.status(404).json({ error: 'no such run' });
     if (!run.pendingConfirm) return res.json({ ok: true, note: 'nothing pending' });
@@ -203,7 +216,7 @@ function attachNvdaAgent(app, deps = {}) {
   }));
 
   app.post('/nvda/stop', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = runs.get(req.body && req.body.runId);
     if (!run) return res.status(404).json({ error: 'no such run' });
     if (run.pendingConfirm) { run.pendingConfirm.resolve(false); run.pendingConfirm = null; }
@@ -214,7 +227,7 @@ function attachNvdaAgent(app, deps = {}) {
   }));
 
   app.get('/nvda/status', wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = runs.get(req.query.runId);
     if (!run) return res.status(404).json({ error: 'no such run' });
     res.json({
@@ -229,7 +242,7 @@ function attachNvdaAgent(app, deps = {}) {
   }));
 
   app.get('/nvda/transcript', wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = runs.get(req.query.runId);
     if (!run) return res.status(404).json({ error: 'no such run' });
     res.json({ runId: run.runId, status: run.status, transcript: run.recorder.transcript() });
@@ -248,7 +261,7 @@ function attachNvdaAgent(app, deps = {}) {
   }
 
   app.post('/nvda/tree', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor((req.body && req.body.userId) || 'kade');
     if (!run) return res.json({ ok: true, note: 'no active run' });
     run.latestTree = String((req.body && req.body.tree) || '').slice(0, 12000);
@@ -257,7 +270,7 @@ function attachNvdaAgent(app, deps = {}) {
   }));
 
   app.get('/nvda/say', wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor(req.query.userId || 'kade');
     if (!run) return res.json({ say: [] });
     const say = run.sayQueue.splice(0, run.sayQueue.length);
@@ -268,7 +281,7 @@ function attachNvdaAgent(app, deps = {}) {
   // reconnect churn) — for supervised hand-driving. chords: array like
   // ["control+home","h","tab","enter"]; or text: string (clipboard+paste).
   app.post('/nvda/key', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor((req.body && req.body.userId) || 'kade');
     if (!run || !run.master) return res.status(404).json({ error: 'no active run with a connected controller' });
     const body = req.body || {};
@@ -291,7 +304,7 @@ function attachNvdaAgent(app, deps = {}) {
 
   // Read back the latest whole-page tree (for supervising a run).
   app.get('/nvda/tree', wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor(req.query.userId || 'kade');
     if (!run) return res.json({ tree: '', title: '', chars: 0 });
     res.json({ title: run.latestTitle, chars: (run.latestTree || '').length, tree: run.latestTree });
@@ -299,7 +312,7 @@ function attachNvdaAgent(app, deps = {}) {
 
   // Inject a phrase for the add-on to speak (testing + manual narration).
   app.post('/nvda/say', jsonMw, wrap(async (req, res) => {
-    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    if (!nvdaSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor((req.body && req.body.userId) || 'kade');
     if (!run) return res.status(404).json({ error: 'no active run' });
     run.sayQueue.push(String((req.body && req.body.text) || '').slice(0, 300));
