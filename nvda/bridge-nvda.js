@@ -43,6 +43,12 @@ const RELAY_HOST = process.env.NVDA_RELAY_HOST || '0.0.0.0';
 // Set after the Railway TCP proxy exists so the connect words are exact:
 const PUBLIC_HOST = process.env.NVDA_RELAY_PUBLIC_HOST || '(your relay host — set NVDA_RELAY_PUBLIC_HOST)';
 const PUBLIC_PORT = process.env.NVDA_RELAY_PUBLIC_PORT || RELAY_PORT;
+// Railway ties a service's web PORT to its TCP-proxy port, so a raw-TCP relay
+// can't live in the bridge service. The relay runs as its OWN service; the
+// bridge does NOT start one in-process, and the driver dials the external relay.
+const IN_PROCESS = process.env.NVDA_RELAY_IN_PROCESS !== '0';
+const CONNECT_HOST = process.env.NVDA_RELAY_CONNECT_HOST || '127.0.0.1';
+const CONNECT_PORT = parseInt(process.env.NVDA_RELAY_CONNECT_PORT, 10) || RELAY_PORT;
 const MAX_STEPS = parseInt(process.env.NVDA_MAX_STEPS, 10) || 60;
 const enabled = () => process.env.NVDA_AGENT_ENABLED !== '0';
 
@@ -56,10 +62,14 @@ function attachNvdaAgent(app, deps = {}) {
   const jsonMw = deps.json || (express ? express.json({ limit: '16kb' }) : (req, _res, next) => next());
 
   let relay = null;
-  try {
-    relay = new NvdaRelay({ port: RELAY_PORT, host: RELAY_HOST, log: (...a) => console.log('[nvda-relay]', ...a) });
-    relay.start().catch((e) => console.warn('[nvda] relay start failed (agent lane down, bridge unaffected):', e.message));
-  } catch (e) { console.warn('[nvda] relay init failed:', e.message); }
+  if (IN_PROCESS) {
+    try {
+      relay = new NvdaRelay({ port: RELAY_PORT, host: RELAY_HOST, log: (...a) => console.log('[nvda-relay]', ...a) });
+      relay.start().catch((e) => console.warn('[nvda] relay start failed (agent lane down, bridge unaffected):', e.message));
+    } catch (e) { console.warn('[nvda] relay init failed:', e.message); }
+  } else {
+    console.log(`[nvda] external relay mode — driver dials ${CONNECT_HOST}:${CONNECT_PORT} (no in-process relay)`);
+  }
 
   const runs = new Map();
 
@@ -103,7 +113,7 @@ function attachNvdaAgent(app, deps = {}) {
   async function connectMaster(run) {
     let kicked = false;
     const master = new NvdaRemoteClient({
-      host: '127.0.0.1', port: RELAY_PORT, key: run.channelKey, role: 'master',
+      host: CONNECT_HOST, port: CONNECT_PORT, key: run.channelKey, role: 'master',
       onSpeak: (t) => { run.observer.push(t); run.recorder.speak(t); },
       onEvent: (m) => {
         if (m.type === 'client_joined' && !kicked) { kicked = true; run.recorder.note('pc-joined'); startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message })); }
