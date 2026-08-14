@@ -221,6 +221,9 @@ function attachNvdaAgent(app, deps = {}) {
       lastLines: run.observer.recent(8),
       pendingConfirm: run.pendingConfirm ? describePlan(run.pendingConfirm.plan) : null,
       stats: run.router ? run.router.stats() : null,
+      treeTitle: run.latestTitle || null,
+      treeChars: (run.latestTree || '').length,
+      sayPending: run.sayQueue.length,
     });
   }));
 
@@ -258,6 +261,15 @@ function attachNvdaAgent(app, deps = {}) {
     if (!run) return res.json({ say: [] });
     const say = run.sayQueue.splice(0, run.sayQueue.length);
     res.json({ say });
+  }));
+
+  // Inject a phrase for the add-on to speak (testing + manual narration).
+  app.post('/nvda/say', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor((req.body && req.body.userId) || 'kade');
+    if (!run) return res.status(404).json({ error: 'no active run' });
+    run.sayQueue.push(String((req.body && req.body.text) || '').slice(0, 300));
+    res.json({ ok: true });
   }));
 
   console.log(`[nvda] agent lane attached — relay :${RELAY_PORT}, endpoints /nvda/{start,confirm,stop,status,transcript,tree,say}`);
