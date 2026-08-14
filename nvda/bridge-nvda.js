@@ -84,7 +84,7 @@ function attachNvdaAgent(app, deps = {}) {
     const memory = new Memory({ userId: userId || 'kade', dir: VOL, onRemember: deps.remember || null });
     // mode 'listen' = co-listener (v0.1): connect, hear the screen, send NO keys,
     // no model. The safe first rung. mode 'drive' = the full agent loop.
-    const run = { runId, channelKey, goal, userId: userId || 'kade', mode: mode === 'listen' ? 'listen' : 'drive', observer, recorder, safety, memory, status: 'connecting', pendingConfirm: null, master: null, startedAt: Date.now() };
+    const run = { runId, channelKey, goal, userId: userId || 'kade', mode: mode === 'listen' ? 'listen' : 'drive', observer, recorder, safety, memory, status: 'connecting', pendingConfirm: null, master: null, startedAt: Date.now(), latestTree: '', latestTitle: '', sayQueue: [] };
     runs.set(runId, run);
     return run;
   }
@@ -108,6 +108,7 @@ function attachNvdaAgent(app, deps = {}) {
       run.pendingConfirm = { plan, resolve, at: Date.now() };
       run.status = 'awaiting_confirm';
       run.recorder.note('confirm-requested', { intent: plan.intent, plan: describePlan(plan) });
+      run.sayQueue.push('I need your okay to ' + describePlan(plan) + '. Tell Kade AI yes or no.');
       if (runNotify) {
         runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Approve action?', body: `About to ${describePlan(plan)}. Reply in chat or approve on your screen.`, urgent: false }).catch(() => {});
       }
@@ -146,7 +147,12 @@ function attachNvdaAgent(app, deps = {}) {
     const actions = new Actions({ client: run.master, observer: run.observer, safety: run.safety, recorder: run.recorder });
     const router = new ModelRouter({ budget: { maxCalls: MAX_STEPS + 20 }, onUsage: (u) => run.recorder.log('usage', u) });
     run.router = router;
-    const decide = makeModelBrain({ router });
+    // Inject the whole-screen accessibility tree (from the NVDA add-on, if
+    // it's running) into every decision, so the model sees the entire window,
+    // not just the one item NVDA spoke.
+    const baseDecide = makeModelBrain({ router });
+    const decide = (ctx) => baseDecide({ ...ctx, screen: run.latestTree || null });
+    run.sayQueue.push('Okay, I am on it. Working now.');
     const hint = run.memory.hint(run.goal);
     const goal = hint ? `${run.goal}\n${hint}` : run.goal;
     try {
@@ -164,6 +170,7 @@ function attachNvdaAgent(app, deps = {}) {
     const chords = run.recorder.find('action').filter((a) => a.action === 'send_keys').map((a) => a.chord).filter(Boolean);
     if (chords.length) { try { run.memory.learn(run.goal, { steps: chords }); } catch { /* */ } }
     const stats = run.router ? run.router.stats() : null;
+    run.sayQueue.push('Finished. ' + run.goal.slice(0, 60) + '. Status: ' + run.status + '.');
     if (runNotify) runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Errand finished', body: `${run.goal.slice(0, 80)} — ${run.status}.`, urgent: false }).catch(() => {});
     run.recorder.note('finalized', { status: run.status, stats });
   }
@@ -224,7 +231,36 @@ function attachNvdaAgent(app, deps = {}) {
     res.json({ runId: run.runId, status: run.status, transcript: run.recorder.transcript() });
   }));
 
-  console.log(`[nvda] agent lane attached — relay :${RELAY_PORT}, endpoints /nvda/{start,confirm,stop,status,transcript}`);
+  // The NVDA add-on posts the whole foreground tree here and polls /nvda/say
+  // for the agent's voice. Both are keyed by the user's active run.
+  function activeRunFor(userId) {
+    let best = null;
+    for (const r of runs.values()) {
+      if (r.userId === userId && ['awaiting_pc', 'listening', 'driving', 'awaiting_confirm'].includes(r.status)) {
+        if (!best || r.startedAt > best.startedAt) best = r;
+      }
+    }
+    return best;
+  }
+
+  app.post('/nvda/tree', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor((req.body && req.body.userId) || 'kade');
+    if (!run) return res.json({ ok: true, note: 'no active run' });
+    run.latestTree = String((req.body && req.body.tree) || '').slice(0, 12000);
+    run.latestTitle = String((req.body && req.body.title) || '');
+    res.json({ ok: true, runId: run.runId, chars: run.latestTree.length });
+  }));
+
+  app.get('/nvda/say', wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor(req.query.userId || 'kade');
+    if (!run) return res.json({ say: [] });
+    const say = run.sayQueue.splice(0, run.sayQueue.length);
+    res.json({ say });
+  }));
+
+  console.log(`[nvda] agent lane attached — relay :${RELAY_PORT}, endpoints /nvda/{start,confirm,stop,status,transcript,tree,say}`);
   return { enabled: true, relay, runs };
 }
 

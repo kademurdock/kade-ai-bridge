@@ -86,6 +86,7 @@ function makeModelBrain(opts = {}) {
       ...ctx.transcript.map((l) => '  ' + l),
       '',
       ctx.lastOutcome && ctx.lastOutcome.length ? `SINCE YOUR LAST ACTION: ${ctx.lastOutcome.join(' | ')}` : 'SINCE YOUR LAST ACTION: (nothing new)',
+      ...(ctx.screen ? ['', 'WHOLE-SCREEN ACCESSIBILITY TREE (the entire foreground window at once, not just the focused item — use it to locate controls precisely and confirm labels/states before acting):', ctx.screen] : []),
       '',
       'Your one JSON action:',
     ].join('\n');
