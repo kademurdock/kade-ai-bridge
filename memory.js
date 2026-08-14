@@ -71,7 +71,25 @@ const FORBIDDEN = [
  * a legit doc caught by \bkey\b can be renamed; a leaked key cannot. */
 const ALLOWED_EXT = /\.(md|txt|py)$/i;
 
+/* Part 64 (Aug 14 2026) — HER DOCTRINE, verbatim spirit: "For me, I want her
+ * to have access to anything and everything... but for everyone else, if she
+ * gives them access, it has to be them specific... she could use living
+ * knowledge to answer [platform questions] to inform herself, but she can't
+ * leak secrets about basically insider trading type things... like prompting
+ * specifically." So the lane grew a second, SMALLER shelf: scope=family
+ * serves ONLY the allowlisted user-facing docs (help manual, install
+ * walkthrough — the things any family member could read on the site anyway).
+ * Persona bibles, prompts, roadmaps, bakeoffs, session history: owner-only.
+ * The fork tool decides WHICH scope to request off the authed seat (the
+ * kade_drive_pc gate pattern); this list is the server-side floor under it.
+ * Widen via env MEMORY_FAMILY_ALLOW (comma-separated path prefixes). */
+const FAMILY_ALLOW = (process.env.MEMORY_FAMILY_ALLOW || 'Kade-AI Help Manual.txt,iOS_PWA_Walkthrough.md')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+function familyVisible(p) { return FAMILY_ALLOW.some((a) => p === a || p.startsWith(a)); }
 function forbidden(p) { return FORBIDDEN.some((re) => re.test(p)); }
+function scopeOf(req) { return String(req.query.scope || '').toLowerCase() === 'family' ? 'family' : 'full'; }
+function inScope(p, scope) { return scope === 'family' ? familyVisible(p) : true; }
 
 function attachMemory(app, deps = {}) {
   if (process.env.MEMORY_ENABLED === '0') { console.log('[memory] disabled (MEMORY_ENABLED=0)'); return { enabled: false }; }
@@ -155,10 +173,13 @@ function attachMemory(app, deps = {}) {
     if (!guard(req, res)) return;
     try {
       const t = await getTree(req.query.refresh === '1');
-      const files = t.files.map((f) => ({ path: f.path, kb: Math.max(1, Math.round(f.size / 1024)) }));
+      const scope = scopeOf(req);
+      const files = t.files.filter((f) => inScope(f.path, scope)).map((f) => ({ path: f.path, kb: Math.max(1, Math.round(f.size / 1024)) }));
       res.json({
-        ok: true, repo: MEMORY_REPO, head: t.head.slice(0, 8), count: files.length, files,
-        note: 'Newest project state: PROJECT_STATUS.md (newest-first — read its head). Standing rules: NEXT_SESSION_PROMPT.md.',
+        ok: true, repo: MEMORY_REPO, head: t.head.slice(0, 8), scope, count: files.length, files,
+        note: scope === 'family'
+          ? 'The family shelf: user-facing docs only.'
+          : 'Newest project state: PROJECT_STATUS.md (newest-first — read its head). Standing rules: NEXT_SESSION_PROMPT.md.',
       });
     } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
   });
@@ -170,8 +191,11 @@ function attachMemory(app, deps = {}) {
     if (forbidden(p) || !ALLOWED_EXT.test(p)) return deny(res);
     try {
       const t = await getTree(false);
+      const scope = scopeOf(req);
       const f = t.files.find((x) => x.path === p) || t.files.find((x) => x.path.toLowerCase() === p.toLowerCase());
-      if (!f) return res.status(404).json({ ok: false, error: 'No doc at that path. /memory/list shows the shelf.' });
+      // Family scope: out-of-shelf paths read as not-found, not forbidden —
+      // a curious kid should get "no such doc," never a locked-door tell.
+      if (!f || !inScope(f.path, scope)) return res.status(404).json({ ok: false, error: 'No doc at that path. /memory/list shows the shelf.' });
       const text = await getBlobText(f.sha);
       const head = req.query.head ? parseInt(req.query.head, 10) : 0;
       const tail = req.query.tail ? parseInt(req.query.tail, 10) : 0;
@@ -192,6 +216,7 @@ function attachMemory(app, deps = {}) {
     if (q.length < 3) return res.status(400).json({ ok: false, error: 'Query needs at least 3 characters.' });
     try {
       const t = await getTree(false);
+      const scope = scopeOf(req);
       const needle = q.toLowerCase();
       const hits = []; const partial = [];
       let searched = 0;
@@ -202,10 +227,11 @@ function attachMemory(app, deps = {}) {
       // batches instead, under a hard time budget — a partial answer with a
       // note beats a hung tool call every time.
       const BATCH = 8, TIME_BUDGET_MS = 20_000;
-      for (let b = 0; b < t.files.length; b += BATCH) {
+      const shelf = t.files.filter((f) => inScope(f.path, scope));
+      for (let b = 0; b < shelf.length; b += BATCH) {
         if (hits.length >= MAX_SEARCH_FILES * MAX_HITS_PER_FILE) break;
         if (Date.now() - t0 > TIME_BUDGET_MS) { budgetHit = true; break; }
-        const batch = t.files.slice(b, b + BATCH);
+        const batch = shelf.slice(b, b + BATCH);
         const texts = await Promise.all(batch.map((f) => getBlobText(f.sha).catch(() => null)));
         for (let j = 0; j < batch.length; j++) {
           if (hits.length >= MAX_SEARCH_FILES * MAX_HITS_PER_FILE) break;
@@ -227,9 +253,9 @@ function attachMemory(app, deps = {}) {
       }
       const notes = [];
       if (partial.length) notes.push('Some large docs were searched in their first 200KB only (newest-first files keep their news there).');
-      if (budgetHit) notes.push('Time budget hit — ' + searched + ' of ' + t.files.length + ' docs searched this call; the cache is warmer now, ask again for the rest.');
+      if (budgetHit) notes.push('Time budget hit — ' + searched + ' of ' + shelf.length + ' docs searched this call; the cache is warmer now, ask again for the rest.');
       res.json({
-        ok: true, query: q, filesSearched: searched, totalDocs: t.files.length, hitCount: hits.length, hits,
+        ok: true, query: q, scope, filesSearched: searched, totalDocs: shelf.length, hitCount: hits.length, hits,
         partiallyIndexed: partial.length ? partial : undefined,
         note: notes.length ? notes.join(' ') : undefined,
       });
