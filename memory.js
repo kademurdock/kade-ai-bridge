@@ -57,13 +57,18 @@ const MAX_HITS_PER_FILE = 3;
 const FORBIDDEN = [
   /private/i,            // PRIVATE_kade-ai_credentials.md and kin
   /credential/i,
-  /authkey/i,            // AuthKey_*.p8 stems (any extension)
+  /\bkey\b|key[s_.-]|[_-]key|authkey|keystore/i, // AuthKey, api key, CERT_KEY, KEYSTORE, KEY_SEALED
   /\.p8$/i,
-  /api[ _-]?key/i,       // "Kiana openrouter api key.txt"
   /secret/i,
   /password/i,
-  /\.jsonl$/i,           // sweep backups can embed raw agent configs
+  /\bcert\b|certificate|signing/i, // kade-ai-signing/*, cert dumps (July-era sync, before the dir skip)
+  /token/i,
+  /\.jsonl$/i,          // sweep backups can embed raw agent configs
 ];
+/* First smoke's receipts (Aug 14): the July-era snapshot already held
+ * kade-ai-signing/ANDROID_KEYSTORE…, …CERT_KEY…, and reverie/BAKEOFF_KEY_SEALED
+ * — three paths the first wall missed. The wall now over-blocks on purpose:
+ * a legit doc caught by \bkey\b can be renamed; a leaked key cannot. */
 const ALLOWED_EXT = /\.(md|txt|py)$/i;
 
 function forbidden(p) { return FORBIDDEN.some((re) => re.test(p)); }
@@ -190,32 +195,64 @@ function attachMemory(app, deps = {}) {
       const needle = q.toLowerCase();
       const hits = []; const partial = [];
       let searched = 0;
-      for (const f of t.files) {
+      const t0 = Date.now();
+      let budgetHit = false;
+      // First-search reality (smoke receipt): 280+ sequential blob fetches
+      // blew the caller's timeout and returned nothing. Fetch in parallel
+      // batches instead, under a hard time budget — a partial answer with a
+      // note beats a hung tool call every time.
+      const BATCH = 8, TIME_BUDGET_MS = 20_000;
+      for (let b = 0; b < t.files.length; b += BATCH) {
         if (hits.length >= MAX_SEARCH_FILES * MAX_HITS_PER_FILE) break;
-        let text;
-        try { text = await getBlobText(f.sha); } catch { continue; }
-        searched++;
-        let scope = text;
-        if (text.length > SEARCH_INDEX_CAP) { scope = text.slice(0, SEARCH_INDEX_CAP); partial.push(f.path); }
-        if (!scope.toLowerCase().includes(needle)) continue;
-        const lines = scope.split('\n');
-        let per = 0;
-        for (let i = 0; i < lines.length && per < MAX_HITS_PER_FILE; i++) {
-          if (lines[i].toLowerCase().includes(needle)) {
-            hits.push({ path: f.path, line: i + 1, text: lines[i].trim().slice(0, 240) });
-            per++;
+        if (Date.now() - t0 > TIME_BUDGET_MS) { budgetHit = true; break; }
+        const batch = t.files.slice(b, b + BATCH);
+        const texts = await Promise.all(batch.map((f) => getBlobText(f.sha).catch(() => null)));
+        for (let j = 0; j < batch.length; j++) {
+          if (hits.length >= MAX_SEARCH_FILES * MAX_HITS_PER_FILE) break;
+          const f = batch[j]; const text = texts[j];
+          if (text === null) continue;
+          searched++;
+          let scope = text;
+          if (text.length > SEARCH_INDEX_CAP) { scope = text.slice(0, SEARCH_INDEX_CAP); partial.push(f.path); }
+          if (!scope.toLowerCase().includes(needle)) continue;
+          const lines = scope.split('\n');
+          let per = 0;
+          for (let i = 0; i < lines.length && per < MAX_HITS_PER_FILE; i++) {
+            if (lines[i].toLowerCase().includes(needle)) {
+              hits.push({ path: f.path, line: i + 1, text: lines[i].trim().slice(0, 240) });
+              per++;
+            }
           }
         }
       }
+      const notes = [];
+      if (partial.length) notes.push('Some large docs were searched in their first 200KB only (newest-first files keep their news there).');
+      if (budgetHit) notes.push('Time budget hit — ' + searched + ' of ' + t.files.length + ' docs searched this call; the cache is warmer now, ask again for the rest.');
       res.json({
-        ok: true, query: q, filesSearched: searched, hitCount: hits.length, hits,
+        ok: true, query: q, filesSearched: searched, totalDocs: t.files.length, hitCount: hits.length, hits,
         partiallyIndexed: partial.length ? partial : undefined,
-        note: partial.length ? 'Some large docs were searched in their first 200KB only (newest-first files keep their news there).' : undefined,
+        note: notes.length ? notes.join(' ') : undefined,
       });
     } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
   });
 
   console.log('[memory] lane attached — repo ' + MEMORY_REPO + ', scoped secret ' + (process.env.MEMORY_TOOL_SECRET ? 'SET' : 'unset'));
+
+  // Cache warm, 45s after boot (out of the boot path, survives failure):
+  // pull the tree + every blob in gentle batches so the FIRST real search
+  // answers in milliseconds instead of paying 280 fetches on the clock.
+  if (PAT) {
+    setTimeout(async () => {
+      try {
+        const t = await getTree(false);
+        for (let b = 0; b < t.files.length; b += 6) {
+          await Promise.all(t.files.slice(b, b + 6).map((f) => getBlobText(f.sha).catch(() => null)));
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        console.log('[memory] cache warm: ' + t.files.length + ' docs resident');
+      } catch (e) { console.warn('[memory] warm skipped:', e.message); }
+    }, 45_000).unref?.();
+  }
   return { enabled: true };
 }
 
