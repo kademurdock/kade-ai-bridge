@@ -73,14 +73,16 @@ function attachNvdaAgent(app, deps = {}) {
 
   const runs = new Map();
 
-  function newRun(goal, userId) {
+  function newRun(goal, userId, mode) {
     const runId = 'run_' + crypto.randomBytes(5).toString('hex');
     const channelKey = 'kade-' + crypto.randomBytes(12).toString('hex');
     const observer = new Observer();
     const recorder = new Recorder({ file: path.join(VOL, `nvda_transcript_${runId}.jsonl`), goal });
     const safety = new Safety();
     const memory = new Memory({ userId: userId || 'kade', dir: VOL, onRemember: deps.remember || null });
-    const run = { runId, channelKey, goal, userId: userId || 'kade', observer, recorder, safety, memory, status: 'connecting', pendingConfirm: null, master: null, startedAt: Date.now() };
+    // mode 'listen' = co-listener (v0.1): connect, hear the screen, send NO keys,
+    // no model. The safe first rung. mode 'drive' = the full agent loop.
+    const run = { runId, channelKey, goal, userId: userId || 'kade', mode: mode === 'listen' ? 'listen' : 'drive', observer, recorder, safety, memory, status: 'connecting', pendingConfirm: null, master: null, startedAt: Date.now() };
     runs.set(runId, run);
     return run;
   }
@@ -116,7 +118,12 @@ function attachNvdaAgent(app, deps = {}) {
       host: CONNECT_HOST, port: CONNECT_PORT, key: run.channelKey, role: 'master',
       onSpeak: (t) => { run.observer.push(t); run.recorder.speak(t); },
       onEvent: (m) => {
-        if (m.type === 'client_joined' && !kicked) { kicked = true; run.recorder.note('pc-joined'); startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message })); }
+        if (m.type === 'client_joined' && !kicked) {
+          kicked = true;
+          run.recorder.note('pc-joined', { mode: run.mode });
+          if (run.mode === 'listen') { run.status = 'listening'; } // co-listener: no keys, no model
+          else startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message }));
+        }
         else if (m.type === 'client_left') { run.recorder.note('pc-left'); }
       },
     });
@@ -156,12 +163,13 @@ function attachNvdaAgent(app, deps = {}) {
 
   app.post('/nvda/start', jsonMw, wrap(async (req, res) => {
     if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
-    const goal = String((req.body && req.body.goal) || '').slice(0, 500);
+    const mode = (req.body && req.body.mode) === 'listen' ? 'listen' : 'drive';
+    const goal = String((req.body && req.body.goal) || (mode === 'listen' ? 'listen and read the screen' : '')).slice(0, 500);
     const userId = (req.body && req.body.userId) || 'kade';
-    if (!goal) return res.status(400).json({ error: 'goal required' });
-    const run = newRun(goal, userId);
+    if (mode === 'drive' && !goal) return res.status(400).json({ error: 'goal required' });
+    const run = newRun(goal, userId, mode);
     await connectMaster(run);
-    res.json({ runId: run.runId, status: run.status, channelKey: run.channelKey, connect: connectInstructions(run) });
+    res.json({ runId: run.runId, status: run.status, mode: run.mode, channelKey: run.channelKey, connect: connectInstructions(run) });
   }));
 
   app.post('/nvda/confirm', jsonMw, wrap(async (req, res) => {
