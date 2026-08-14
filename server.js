@@ -4197,6 +4197,14 @@ app.get('/platform-status', async (req, res) => {
 const { attachResearch } = require('./research');
 attachResearch(app, { bridgeSecretOk, notifySecretOk, runNotify, fetchCallMemories });
 
+// NVDA Agent lane (Aug 14 2026): her own relay + the screen-reader-driving
+// agent, folded in per her choice. Additive + fail-soft; kill switch
+// NVDA_AGENT_ENABLED=0. Endpoints /nvda/{start,confirm,stop,status,transcript}.
+try {
+  const { attachNvdaAgent } = require('./nvda/bridge-nvda');
+  attachNvdaAgent(app, { bridgeSecretOk, runNotify });
+} catch (e) { console.warn('[nvda] attach failed (bridge unaffected):', e.message); }
+
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);

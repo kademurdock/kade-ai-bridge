@@ -1,0 +1,204 @@
+'use strict';
+/**
+ * NVDA Agent, folded into the bridge (Kade's choice, Aug 14 2026).
+ *
+ * Starts her own relay inside the bridge process, manages driver runs, and
+ * exposes secret-gated control endpoints. ADDITIVE and FAIL-SOFT by design: the
+ * relay start and every handler are wrapped so a fault here can never touch the
+ * phone / notify paths that share this process. Kill switch NVDA_AGENT_ENABLED=0.
+ *
+ * Flow: an agent (Forge/Kiana) or a caller POSTs /nvda/start with a goal. We
+ * mint a channel key and connect the driver (master) to the relay. Kade points
+ * her PC's classic NVDA Remote add-on at the relay (Client -> allow this machine
+ * to be controlled) with that key. When her PC joins, the driver loop begins,
+ * narrating through the character, gating destructive steps to /nvda/confirm,
+ * and saving a transcript on the volume.
+ *
+ * Endpoints (all require BRIDGE_SECRET via deps.bridgeSecretOk):
+ *   POST /nvda/start     { goal, userId } -> { runId, channelKey, connect }
+ *   POST /nvda/confirm   { runId, approve }
+ *   POST /nvda/stop      { runId }
+ *   GET  /nvda/status    ?runId=   -> live status + last spoken lines
+ *   GET  /nvda/transcript?runId=   -> the receipt
+ */
+
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+
+const { NvdaRelay } = require('./relay/relay');
+const { NvdaRemoteClient } = require('./client');
+const { Observer } = require('./agent/observer');
+const { Recorder } = require('./agent/recorder');
+const { Safety } = require('./agent/safety');
+const { Actions } = require('./agent/actions');
+const { runAgentLoop } = require('./agent/brain');
+const { ModelRouter } = require('./agent/models');
+const { makeModelBrain } = require('./agent/model_adapter');
+const { Memory } = require('./agent/memory');
+
+const VOL = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
+const RELAY_PORT = parseInt(process.env.NVDA_RELAY_PORT, 10) || 6837;
+const RELAY_HOST = process.env.NVDA_RELAY_HOST || '0.0.0.0';
+// Set after the Railway TCP proxy exists so the connect words are exact:
+const PUBLIC_HOST = process.env.NVDA_RELAY_PUBLIC_HOST || '(your relay host — set NVDA_RELAY_PUBLIC_HOST)';
+const PUBLIC_PORT = process.env.NVDA_RELAY_PUBLIC_PORT || RELAY_PORT;
+const MAX_STEPS = parseInt(process.env.NVDA_MAX_STEPS, 10) || 60;
+const enabled = () => process.env.NVDA_AGENT_ENABLED !== '0';
+
+function tryRequire(m) { try { return require(m); } catch { return null; } }
+
+function attachNvdaAgent(app, deps = {}) {
+  if (!enabled()) { console.log('[nvda] disabled (NVDA_AGENT_ENABLED=0)'); return { enabled: false }; }
+  const bridgeSecretOk = deps.bridgeSecretOk || (() => false);
+  const runNotify = deps.runNotify || null;
+  const express = tryRequire('express');
+  const jsonMw = deps.json || (express ? express.json({ limit: '16kb' }) : (req, _res, next) => next());
+
+  let relay = null;
+  try {
+    relay = new NvdaRelay({ port: RELAY_PORT, host: RELAY_HOST, log: (...a) => console.log('[nvda-relay]', ...a) });
+    relay.start().catch((e) => console.warn('[nvda] relay start failed (agent lane down, bridge unaffected):', e.message));
+  } catch (e) { console.warn('[nvda] relay init failed:', e.message); }
+
+  const runs = new Map();
+
+  function newRun(goal, userId) {
+    const runId = 'run_' + crypto.randomBytes(5).toString('hex');
+    const channelKey = 'kade-' + crypto.randomBytes(12).toString('hex');
+    const observer = new Observer();
+    const recorder = new Recorder({ file: path.join(VOL, `nvda_transcript_${runId}.jsonl`), goal });
+    const safety = new Safety();
+    const memory = new Memory({ userId: userId || 'kade', dir: VOL, onRemember: deps.remember || null });
+    const run = { runId, channelKey, goal, userId: userId || 'kade', observer, recorder, safety, memory, status: 'connecting', pendingConfirm: null, master: null, startedAt: Date.now() };
+    runs.set(runId, run);
+    return run;
+  }
+
+  function connectInstructions(run) {
+    return {
+      words: `In NVDA: Tools > Remote > Connect. Choose Client, then "Allow this machine to be controlled". Host ${PUBLIC_HOST}, port ${PUBLIC_PORT}, key ${run.channelKey}. Connect.`,
+      host: PUBLIC_HOST, port: PUBLIC_PORT, key: run.channelKey, role: 'controlled (slave)',
+    };
+  }
+
+  function describePlan(plan) {
+    if (!plan) return 'an action';
+    if (plan.action === 'type_text') return `type "${String(plan.text).slice(0, 40)}"`;
+    if (plan.action === 'send_keys') return `press ${(plan.keys || []).join(' then ')}${plan.intent ? ' — ' + plan.intent : ''}`;
+    return plan.intent || plan.action;
+  }
+
+  function makeConfirm(run) {
+    return (plan) => new Promise((resolve) => {
+      run.pendingConfirm = { plan, resolve, at: Date.now() };
+      run.status = 'awaiting_confirm';
+      run.recorder.note('confirm-requested', { intent: plan.intent, plan: describePlan(plan) });
+      if (runNotify) {
+        runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Approve action?', body: `About to ${describePlan(plan)}. Reply in chat or approve on your screen.`, urgent: false }).catch(() => {});
+      }
+    });
+  }
+
+  async function connectMaster(run) {
+    let kicked = false;
+    const master = new NvdaRemoteClient({
+      host: '127.0.0.1', port: RELAY_PORT, key: run.channelKey, role: 'master',
+      onSpeak: (t) => { run.observer.push(t); run.recorder.speak(t); },
+      onEvent: (m) => {
+        if (m.type === 'client_joined' && !kicked) { kicked = true; run.recorder.note('pc-joined'); startLoop(run).catch((e) => run.recorder.note('loop-throw', { error: e.message })); }
+        else if (m.type === 'client_left') { run.recorder.note('pc-left'); }
+      },
+    });
+    run.master = master;
+    await master.connect();
+    run.status = 'awaiting_pc';
+  }
+
+  async function startLoop(run) {
+    run.status = 'driving';
+    const actions = new Actions({ client: run.master, observer: run.observer, safety: run.safety, recorder: run.recorder });
+    const router = new ModelRouter({ budget: { maxCalls: MAX_STEPS + 20 }, onUsage: (u) => run.recorder.log('usage', u) });
+    run.router = router;
+    const decide = makeModelBrain({ router });
+    const hint = run.memory.hint(run.goal);
+    const goal = hint ? `${run.goal}\n${hint}` : run.goal;
+    try {
+      await runAgentLoop({ goal, observer: run.observer, actions, safety: run.safety, recorder: run.recorder, decide, confirm: makeConfirm(run), maxSteps: MAX_STEPS });
+      run.status = 'done';
+    } catch (e) {
+      run.status = 'error';
+      run.recorder.note('run-error', { error: e.message });
+    }
+    finalize(run);
+  }
+
+  function finalize(run) {
+    try { if (run.master) run.master.close(); } catch { /* */ }
+    const chords = run.recorder.find('action').filter((a) => a.action === 'send_keys').map((a) => a.chord).filter(Boolean);
+    if (chords.length) { try { run.memory.learn(run.goal, { steps: chords }); } catch { /* */ } }
+    const stats = run.router ? run.router.stats() : null;
+    if (runNotify) runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Errand finished', body: `${run.goal.slice(0, 80)} — ${run.status}.`, urgent: false }).catch(() => {});
+    run.recorder.note('finalized', { status: run.status, stats });
+  }
+
+  const wrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(500).json({ error: e.message }); } };
+
+  app.post('/nvda/start', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const goal = String((req.body && req.body.goal) || '').slice(0, 500);
+    const userId = (req.body && req.body.userId) || 'kade';
+    if (!goal) return res.status(400).json({ error: 'goal required' });
+    const run = newRun(goal, userId);
+    await connectMaster(run);
+    res.json({ runId: run.runId, status: run.status, channelKey: run.channelKey, connect: connectInstructions(run) });
+  }));
+
+  app.post('/nvda/confirm', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = runs.get(req.body && req.body.runId);
+    if (!run) return res.status(404).json({ error: 'no such run' });
+    if (!run.pendingConfirm) return res.json({ ok: true, note: 'nothing pending' });
+    const approve = !!(req.body && req.body.approve);
+    const { resolve } = run.pendingConfirm;
+    run.pendingConfirm = null;
+    run.status = 'driving';
+    resolve(approve);
+    res.json({ ok: true, approved: approve });
+  }));
+
+  app.post('/nvda/stop', jsonMw, wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.body && req.body.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = runs.get(req.body && req.body.runId);
+    if (!run) return res.status(404).json({ error: 'no such run' });
+    if (run.pendingConfirm) { run.pendingConfirm.resolve(false); run.pendingConfirm = null; }
+    try { if (run.master) run.master.close(); } catch { /* */ }
+    run.status = 'stopped';
+    run.recorder.note('stopped-by-user');
+    res.json({ ok: true, status: 'stopped' });
+  }));
+
+  app.get('/nvda/status', wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = runs.get(req.query.runId);
+    if (!run) return res.status(404).json({ error: 'no such run' });
+    res.json({
+      runId: run.runId, status: run.status, goal: run.goal,
+      lastLines: run.observer.recent(8),
+      pendingConfirm: run.pendingConfirm ? describePlan(run.pendingConfirm.plan) : null,
+      stats: run.router ? run.router.stats() : null,
+    });
+  }));
+
+  app.get('/nvda/transcript', wrap(async (req, res) => {
+    if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = runs.get(req.query.runId);
+    if (!run) return res.status(404).json({ error: 'no such run' });
+    res.json({ runId: run.runId, status: run.status, transcript: run.recorder.transcript() });
+  }));
+
+  console.log(`[nvda] agent lane attached — relay :${RELAY_PORT}, endpoints /nvda/{start,confirm,stop,status,transcript}`);
+  return { enabled: true, relay, runs };
+}
+
+module.exports = { attachNvdaAgent };
