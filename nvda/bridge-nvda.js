@@ -302,6 +302,24 @@ function attachNvdaAgent(app, deps = {}) {
     res.json({ ok: true, sent: chords });
   }));
 
+  // The active run at a glance, NO run id needed — so a chat that lost the id
+  // (or a fresh conversation) can still ask "what's my PC doing?" (Aug 14 2026,
+  // shipped with the fork's kade_drive_pc tool.)
+  app.get('/nvda/active', wrap(async (req, res) => {
+    if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
+    const run = activeRunFor(req.query.userId || 'kade');
+    if (!run) return res.json({ active: false });
+    res.json({
+      active: true,
+      runId: run.runId, status: run.status, mode: run.mode, goal: run.goal,
+      lastLines: run.observer.recent(5),
+      pendingConfirm: run.pendingConfirm ? describePlan(run.pendingConfirm.plan) : null,
+      treeTitle: run.latestTitle || null,
+      treeChars: (run.latestTree || '').length,
+      connect: run.status === 'awaiting_pc' ? connectInstructions(run) : undefined,
+    });
+  }));
+
   // Read back the latest whole-page tree (for supervising a run).
   app.get('/nvda/tree', wrap(async (req, res) => {
     if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
