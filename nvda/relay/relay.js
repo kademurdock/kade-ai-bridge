@@ -82,17 +82,40 @@ class NvdaRelay {
       const onConn = (sock) => this._onConnection(sock);
       if (this.useTls) {
         const certs = this.certs || generateSelfSigned();
-        this.server = tls.createServer(
-          { key: certs.key, cert: certs.cert, rejectUnauthorized: false },
-          onConn,
-        );
+        // First-byte demux on ONE port: a TLS handshake starts with 0x16, so
+        // those become NVDA relay connections; anything else (a plain HTTP GET)
+        // is answered as a health check. This lets the relay pass a hosting
+        // platform's HTTP /health probe AND serve the raw-TLS NVDA protocol on
+        // the same port — no second port, no platform config gymnastics.
+        const secureContext = tls.createSecureContext({ key: certs.key, cert: certs.cert });
+        this.server = net.createServer((socket) => {
+          // Paused-mode peek: read one byte, put it back, then route. Using
+          // 'readable'+read(1) (not 'data') keeps the stream paused so the
+          // unshifted byte is cleanly re-consumed by whichever handler takes over.
+          const onReadable = () => {
+            const chunk = socket.read(1);
+            if (chunk === null) return; // not enough yet; wait for next readable
+            socket.removeListener('readable', onReadable);
+            socket.unshift(chunk);
+            if (chunk[0] === 0x16) {
+              const tlsSocket = new tls.TLSSocket(socket, { isServer: true, secureContext });
+              tlsSocket.on('error', () => { try { tlsSocket.destroy(); } catch { /* */ } });
+              onConn(tlsSocket);
+            } else {
+              const body = 'ok';
+              try { socket.end(`HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`); } catch { /* */ }
+            }
+          };
+          socket.on('readable', onReadable);
+          socket.on('error', () => { /* pre-handshake resets are normal */ });
+        });
       } else {
         this.server = net.createServer(onConn);
       }
       this.server.on('error', reject);
       this.server.listen(this.port, this.host, () => {
         const addr = this.server.address();
-        this.log(`listening ${this.useTls ? 'TLS' : 'PLAIN'} on ${this.host}:${addr.port} (protocol ${PROTOCOL_VERSION})`);
+        this.log(`listening ${this.useTls ? 'TLS(+health)' : 'PLAIN'} on ${this.host}:${addr.port} (protocol ${PROTOCOL_VERSION})`);
         resolve(addr.port);
       });
     });
