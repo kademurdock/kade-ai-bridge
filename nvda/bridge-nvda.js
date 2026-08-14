@@ -152,7 +152,43 @@ function attachNvdaAgent(app, deps = {}) {
       },
     });
     run.master = master;
-    await master.connect();
+    /* Aug 14 2026 — the relay SLEEPS between runs now (Railway
+     * sleepApplication, her ask: "put the service to sleep when not being
+     * used... relay of course"). The first connection of a run is what
+     * wakes it, and a waking service can refuse, drop, or simply sit on
+     * that first TCP dance. Four tries with growing waits cover the cold
+     * start; each attempt also carries its own 10s timeout because a
+     * half-woken proxy can accept the socket and then never speak TLS —
+     * an untimed await there would hang the run forever. A warm relay
+     * still connects on try one in milliseconds. */
+    const tryConnect = () => new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { if (master.sock) master.sock.destroy(new Error('connect timeout')); } catch { /* already gone */ }
+        reject(new Error('connect timeout (relay waking?)'));
+      }, 10000);
+      master.connect()
+        .then(() => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } })
+        .catch((e) => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } });
+    });
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await tryConnect();
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        run.recorder.note('relay-connect-retry', { attempt, error: e.message });
+        if (attempt < 4) await new Promise((r) => setTimeout(r, attempt * 4000));
+      }
+    }
+    if (lastErr) {
+      run.status = 'error';
+      throw new Error(`relay unreachable after 4 tries: ${lastErr.message}`);
+    }
     run.status = 'awaiting_pc';
   }
 
