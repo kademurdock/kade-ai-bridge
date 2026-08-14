@@ -605,6 +605,47 @@ app.get('/diagnostics', (req, res) => {
   res.json({ count: diagRing.length, entries: diagRing });
 });
 
+/* ── Crash-ring visibility in /platform-status (Aug 14 2026) ─────────────────
+ * Amber's six watchdog kills sat in the ring on Aug 13 while /platform-status
+ * said "everything is up." The push lane was broken that same window (fixed
+ * that night), and the estate's own front door never mentioned what the house
+ * had already caught. Now it does: crash reports from today and yesterday
+ * (Central, by arrival time — MetricKit uploads on the launch after a crash)
+ * get a section and a spoken line; older ones stay in the ring where they
+ * belong. Quiet when the ring is quiet — no line at all. Crashes TODAY also
+ * flip the endpoint's ok, because "is everything okay?" deserves a "no" on a
+ * day the app is dying on someone's phone. */
+function crashStatusForSpeech() {
+  const crashes = diagRing.filter((e) => e.kind === 'crash');
+  const todayKey = bridgeCentralDateKey();
+  const yesterKey = bridgeCentralDateKey(new Date(Date.now() - 24 * 3600 * 1000));
+  const dayOf = (iso) => { try { return bridgeCentralDateKey(new Date(iso)); } catch { return ''; } };
+  const todayList = crashes.filter((e) => dayOf(e.at) === todayKey);
+  const yesterList = crashes.filter((e) => dayOf(e.at) === yesterKey);
+  const last = crashes.length ? crashes[crashes.length - 1] : null;
+  const section = {
+    ringCount: crashes.length,
+    today: todayList.length,
+    yesterday: yesterList.length,
+    lastAt: last ? last.at : null,
+    lastBuild: last ? last.build : null,
+    lastWho: last && last.who ? String(last.who).replace(/\s*<[^>]*>$/, '') : null,
+  };
+  if (!todayList.length && !yesterList.length) return { section, spoken: '', okToday: true };
+  const times = (n) => (n === 1 ? 'once' : n === 2 ? 'twice' : `${n} times`);
+  const builds = (list) => [...new Set(list.map((e) => e.build))].join(' and ');
+  const parts = [];
+  if (todayList.length) parts.push(`${times(todayList.length)} today on build ${builds(todayList)}`);
+  if (yesterList.length) parts.push(`${times(yesterList.length)} yesterday on build ${builds(yesterList)}`);
+  const who = crashWhoPhrase(todayList.length ? todayList : yesterList);
+  const newest = todayList[todayList.length - 1] || yesterList[yesterList.length - 1];
+  return {
+    section,
+    spoken: `Crashes: the app crashed ${parts.join(', and ')}${who}. ${crashCausePlain(newest.payload)}. Stacks are in the crash ring.`,
+    okToday: todayList.length === 0,
+  };
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true, users: users.size, rev: (process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown').slice(0, 7) }));
 
 // Static opt-in / SMS consent disclosure image — used for Twilio toll-free verification.
@@ -3879,6 +3920,20 @@ async function snapshotBalancesDaily() {
 setTimeout(snapshotBalancesDaily, 90 * 1000); // boot warm-up
 setInterval(snapshotBalancesDaily, 60 * 60 * 1000); // hourly guard, writes once/day
 
+/* Aug 14 2026 — SPEAK CREDITS AS CREDITS. Flux balances arrive as BFL
+ * credits (one credit is one cent), but this file dressed them in dollar
+ * signs: the avatar-backfill night read as "$240.00 yesterday" when the
+ * truth was 240 credits — $2.40. A money line that inflates a hundredfold
+ * isn't a watcher, it's a false alarm with a dollar sign. One formatter,
+ * used by the spend lines and the floor reasons both. */
+function fmtProviderAmount(v, unit) {
+  if (unit !== 'credits') return `$${v.toFixed(2)}`;
+  const cents = Math.round(v);
+  return cents >= 100
+    ? `${cents} credits (about $${(cents / 100).toFixed(2)})`
+    : `${cents} credits (about ${cents} cent${cents === 1 ? '' : 's'})`;
+}
+
 // Spend deltas from daily snapshots. BALANCES fall as money is spent, so
 // yesterday's spend = balance(day-before) - balance(yesterday); usage-style
 // counters grow, so the delta flips. Providers missing days are skipped.
@@ -3893,7 +3948,7 @@ function computeSpend() {
     { key: 'openrouter', name: 'OpenRouter', kind: 'balance' },
     { key: 'fish', name: 'fish audio', kind: 'balance' },
     { key: 'twilio', name: 'Twilio', kind: 'balance' },
-    { key: 'flux', name: 'Flux images', kind: 'balance' },
+    { key: 'flux', name: 'Flux images', kind: 'balance', unit: 'credits' },
   ];
   const lines = [];
   const seenNames = new Set();
@@ -3916,11 +3971,12 @@ function computeSpend() {
     const hot = avg > 0.01 && y > avg * 1.5;
     lines.push({
       provider: p.name,
+      unit: p.unit || '$',
       yesterday: Math.round(y * 100) / 100,
       avg30: Math.round(avg * 100) / 100,
       hot,
-      spoken: `${p.name}: ${y < 0.005 ? 'quiet' : '$' + y.toFixed(2)} yesterday` +
-        (window.length > 2 ? ` against a ${'$' + avg.toFixed(2)} average` : '') +
+      spoken: `${p.name}: ${y < 0.005 ? 'quiet' : fmtProviderAmount(y, p.unit)} yesterday` +
+        (window.length > 2 ? ` against a ${p.unit === 'credits' ? Math.round(avg) + '-credit-a-day' : '$' + avg.toFixed(2)} average` : '') +
         (hot ? ' — running hot' : ''),
     });
   }
@@ -3969,7 +4025,7 @@ const BALANCE_FLOORS = [
   { key: 'openrouter', name: 'OpenRouter',  floor: parseFloat(process.env.FLOOR_OPENROUTER || '10'), unit: '$', plain: 'the models behind the fleet stop answering' },
   { key: 'fish',       name: 'fish audio',  floor: parseFloat(process.env.FLOOR_FISH       || '10'), unit: '$', plain: 'the cloned voices go quiet' },
   { key: 'twilio',     name: 'Twilio',      floor: parseFloat(process.env.FLOOR_TWILIO     || '5'),  unit: '$', plain: 'the phone line stops taking calls' },
-  { key: 'flux',       name: 'Flux images', floor: parseFloat(process.env.FLOOR_FLUX       || '40'), unit: '',  plain: 'picture-making stops' },
+  { key: 'flux',       name: 'Flux images', floor: parseFloat(process.env.FLOOR_FLUX       || '40'), unit: 'credits', plain: 'picture-making stops' },
 ];
 
 const balanceWatchState = (() => {
@@ -4018,14 +4074,15 @@ async function assessBalances() {
     let low = false, reason = null;
     if (value <= p.floor) {
       low = true;
-      reason = `down to ${p.unit}${value.toFixed(2)}`;
+      reason = `down to ${fmtProviderAmount(value, p.unit)}`;
     } else if (runway != null && runway <= BALANCE_RUNWAY_DAYS) {
       low = true;
-      reason = `about ${Math.floor(runway)} day${Math.floor(runway) === 1 ? '' : 's'} left at the current rate (${p.unit}${value.toFixed(2)} left, ${p.unit}${burn.toFixed(2)} a day)`;
+      reason = `about ${Math.floor(runway)} day${Math.floor(runway) === 1 ? '' : 's'} left at the current rate (${fmtProviderAmount(value, p.unit)} left, ${p.unit === 'credits' ? Math.round(burn) + ' credits' : '$' + burn.toFixed(2)} a day)`;
     }
     rows.push({
       ...p,
       value: Math.round(value * 100) / 100,
+      dollars: p.unit === 'credits' ? Math.round(value) / 100 : Math.round(value * 100) / 100,
       burnPerDay: burn ? Math.round(burn * 100) / 100 : null,
       runwayDays: runway ? Math.floor(runway) : null,
       low, reason,
@@ -4173,12 +4230,14 @@ app.get('/platform-status', async (req, res) => {
     const hotFlags = spend.lines.filter((l) => l.hot);
     const backups = backupStatusForSpeech();
     const balances = balanceStatusForSpeech();
+    const crash = crashStatusForSpeech();
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
-        && !(balances.section.low && balances.section.low.length),
-      spokenSummary: [upLine, canarySpoken, backups.spoken, balances.spoken, spendSpoken].filter(Boolean).join(' '),
+        && !(balances.section.low && balances.section.low.length) && crash.okToday,
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, balances.spoken, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
+      crashes: crash.section,
       backups: backups.section,
       balances: balances.section,
       spend: spend.lines,
