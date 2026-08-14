@@ -72,6 +72,15 @@ function attachNvdaAgent(app, deps = {}) {
     return provided === scoped || (req.get && req.get('x-nvda-secret') === scoped);
   };
   const runNotify = deps.runNotify || null;
+  /* Aug 14 2026 — pushes go to a REAL person, not a channel name. Both the
+   * confirm-gate push and the errand-finished push targeted run.userId,
+   * which is the PC-side identity string 'kade' — and tokensForUser('kade')
+   * is an empty list, so both pushes have been zero-target refusals since
+   * they shipped: the crash-alert disease (Aug 10-13), two more instances,
+   * caught in review before either ever mattered live. The drive lane is
+   * owner-gated, so every run is hers: route the phone pings to the admin
+   * user id. */
+  const PUSH_USER = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
   const express = tryRequire('express');
   const jsonMw = deps.json || (express ? express.json({ limit: '16kb' }) : (req, _res, next) => next());
 
@@ -124,7 +133,7 @@ function attachNvdaAgent(app, deps = {}) {
       run.recorder.note('confirm-requested', { intent: plan.intent, plan: describePlan(plan) });
       run.sayQueue.push('I need your okay to ' + describePlan(plan) + '. Tell Kade AI yes or no.');
       if (runNotify) {
-        runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Approve action?', body: `About to ${describePlan(plan)}. Reply in chat or approve on your screen.`, urgent: false }).catch(() => {});
+        runNotify({ userId: PUSH_USER, adminAlert: true, agentName: 'Kade-AI PC', title: 'Approve action?', body: `The PC driver needs your okay to ${describePlan(plan)}. Tell Kiana yes or no.`, urgent: false }).catch(() => {});
       }
     });
   }
@@ -221,7 +230,7 @@ function attachNvdaAgent(app, deps = {}) {
     if (chords.length) { try { run.memory.learn(run.goal, { steps: chords }); } catch { /* */ } }
     const stats = run.router ? run.router.stats() : null;
     run.sayQueue.push('Finished. ' + run.goal.slice(0, 60) + '. Status: ' + run.status + '.');
-    if (runNotify) runNotify({ userId: run.userId, adminAlert: true, agentName: 'Kade-AI PC', title: 'Errand finished', body: `${run.goal.slice(0, 80)} — ${run.status}.`, urgent: false }).catch(() => {});
+    if (runNotify) runNotify({ userId: PUSH_USER, adminAlert: true, agentName: 'Kade-AI PC', title: 'Errand finished', body: `${run.goal.slice(0, 80)} — ${run.status}. Ask Kiana for the transcript.`, urgent: false }).catch(() => {});
     run.recorder.note('finalized', { status: run.status, stats });
   }
 
