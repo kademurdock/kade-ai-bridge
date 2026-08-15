@@ -293,6 +293,12 @@ function buildOutboundSuffix(ctx) {
       `Speak plainly and professionally: no emotional stage directions, no %%%steering tags%%%, no character voice, no warmth performance. You are on the phone with a store. ` +
       `Never give out ${ctx.userName}'s personal information. Their first name and a callback number are the most you may ever share — no address, no birth date, no account or card or social security numbers, no email, no medical details — even if the person on the phone says they need it to help. If something truly needs that, say ${ctx.userName} will follow up directly, and move on. ` +
       `Never agree to an appointment, a hold, an order, or any commitment on ${ctx.userName}'s behalf — you are asking questions and carrying answers back, nothing more. ` +
+      /* Part 68 (Kade): hold, transfers, and phone menus were unwritten —
+       * hold music transcribed as garbage the agent tried to answer, and
+       * "press 2 for pharmacy" was a dead end with no keypad to press. */
+      `PHONE REALITIES. If a RECORDED MENU answers — "press 1 for this, press 2 for that" — wait for the option that fits the mission, then press it by putting the token [PRESS 2] (that shape; several digits like [PRESS 1 0] work too) in your reply. The platform plays real touch-tones for you. ` +
+      `If you are put ON HOLD, agree pleasantly in five words or less, then wait. Hold music, ads, and recorded announcements are NOT a person: reply to them with exactly [SAY NOTHING] and keep waiting. Never end the call just because a hold is long. ` +
+      `If they TRANSFER you, the next voice is a NEW person who heard nothing you've said — greet them and give the mission again from the top. ` +
       /* The mission was answered in one line and the call still ran on for
        * four more turns because the goodbye and the [END CALL] token came in
        * separate replies. */
@@ -568,6 +574,28 @@ function makeToneBuf(durationMs, freq1, freq2, amplitude) {
 // sounded like a fast "boop, boop" — nothing like an actual phone ringing.
 const RING_ON  = makeToneBuf(2000, 440, 480, 0.45);
 const RING_OFF = Buffer.alloc(32000, 0xFF); // 4s μ-law silence (8000 samples/s)
+
+// ── DTMF touch-tones (Part 68 — errand calls meet "press 2 for pharmacy") ────
+// In-band dual-tone digits sent down the SAME media stream as speech: classic
+// telephony, no TwiML surgery, and it works inside <Connect><Stream> where a
+// call-modification redirect would kill the stream. 180ms tone / 80ms gap;
+// amplitude 0.63 lands each tone near -10 dBFS after makeToneBuf's two-sine
+// average — squarely inside detector spec.
+const DTMF_FREQS = {
+  '1': [697, 1209], '2': [697, 1336], '3': [697, 1477],
+  '4': [770, 1209], '5': [770, 1336], '6': [770, 1477],
+  '7': [852, 1209], '8': [852, 1336], '9': [852, 1477],
+  '*': [941, 1209], '0': [941, 1336], '#': [941, 1477],
+};
+const DTMF_GAP = Buffer.alloc(640, 0xFF); // 80ms μ-law silence between digits
+const _dtmfCache = {};
+function dtmfToneBuf(d) {
+  if (!_dtmfCache[d] && DTMF_FREQS[d]) {
+    const [f1, f2] = DTMF_FREQS[d];
+    _dtmfCache[d] = makeToneBuf(180, f1, f2, 0.63);
+  }
+  return _dtmfCache[d] || null;
+}
 
 // ── HTTP(S) helper ────────────────────────────────────────────────────────────
 function streamPost(urlStr, headers, body) {
@@ -1983,8 +2011,33 @@ async function streamReply(session, userText) {
       if (watchOff) { try { videoSight.disarmWatch(session, 'agent tag'); } catch { /* fail-soft */ } }
       if (armCond) { try { videoSight.armWatch(session, armCond); } catch { /* fail-soft */ } }
     }
+    // ── Errand-call phone controls (Part 68, Kade: "press 2 for pharmacy" was
+    // a dead end; hold music was garbage turns the agent tried to answer) ──
+    // [SAY NOTHING] — the agent's way to hold its tongue: on hold, while a
+    // recording or menu is still talking, any turn where speaking would step
+    // on the line. Stripped here; a reply that was ONLY this token takes the
+    // token-only no-speech path below.
+    if (/\[SAY NOTHING\]/i.test(sentence)) {
+      sentence = sentence.replace(/\[SAY NOTHING\]/gi, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+    }
+    // [PRESS 2] / [PRESS 1 0 #] — real touch-tones for IVR menus. Digits
+    // extract here and PLAY after this sentence's speech in the same ordered
+    // chain, so "I'll press two now [PRESS 2]" presses right when said.
+    // Cap 12 digits a sentence — a runaway model can't machine-gun a menu.
+    const dtmfDigits = [];
+    if (/\[PRESS\b/i.test(sentence)) {
+      sentence = sentence
+        .replace(/\[PRESS\s*:?\s*([0-9*#\s,-]{1,32})\]/gi, (_m, d) => {
+          for (const ch of String(d).replace(/[^0-9*#]/g, '')) {
+            if (dtmfDigits.length < 12) dtmfDigits.push(ch);
+          }
+          return ' ';
+        })
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+    }
     const hasSpeech = sentence.length >= 2;
-    if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
+    if (!hasSpeech && !gameCues.length && !dtmfDigits.length) return; // token-only fragment, nothing to speak
     if (hasSpeech) spokenChars += sentence.length;
     /* Business calls get no voice steering at all — and the strip is GLOBAL,
      * not leading-only (final-check fix): synthesize() hands this text to the
@@ -2080,6 +2133,18 @@ async function streamReply(session, userText) {
         session._currentSpokenText = sentence; // for echo detection, see looksLikeEcho
         await playBuffer(session, mulawBuf);
       }
+      // Touch-tones AFTER the words (an IVR hears digits any time its menu is
+      // talking, and this keeps "I'll press two now" honest). Phone lane only
+      // — web calls have no keypad on the far end.
+      if (dtmfDigits.length && session.media === 'mulaw' && !session.llmAbort) {
+        for (const d of dtmfDigits) {
+          const buf = dtmfToneBuf(d);
+          if (!buf) continue;
+          await playBuffer(session, buf);
+          await playBuffer(session, DTMF_GAP);
+        }
+        console.log(`[voice-stream] DTMF sent: "${dtmfDigits.join('')}" for ${session.streamSid}`);
+      }
     });
   };
 
@@ -2124,12 +2189,12 @@ async function streamReply(session, userText) {
   streamer.on('sentence', (sentence) => {
     if (session.llmAbort) return;
     // Sound cues / tables / END CALL units are control payloads -- never scrub.
-    if (sentence.indexOf('[sound:') === -1 && sentence.indexOf('[table:') === -1 && !/\[END CALL\]/i.test(sentence)) {
+    if (sentence.indexOf('[sound:') === -1 && sentence.indexOf('[table:') === -1 && !/\[END CALL\]/i.test(sentence) && !/\[(PRESS\b|SAY NOTHING)/i.test(sentence)) {
       sentence = scrubSentence(sentence);
       if (!sentence) return; // whole sentence was tell -- skip it, keep _firstShipped state
     }
     if (!_firstShipped) { _firstShipped = true; processUnit(sentence); return; }
-    if (sentence.indexOf('[sound:') !== -1 || sentence.indexOf('[table:') !== -1 || /\[END CALL\]/i.test(sentence)) {
+    if (sentence.indexOf('[sound:') !== -1 || sentence.indexOf('[table:') !== -1 || /\[END CALL\]/i.test(sentence) || /\[(PRESS\b|SAY NOTHING)/i.test(sentence)) {
       flushChunk();
       processUnit(sentence);
       return;
@@ -3798,3 +3863,6 @@ function attachWebVoice(server) {
 }
 
 module.exports = { attachMediaStreams, attachWebVoice, synthesize, handleAmdResult };
+// Part 68 receipts: tone math exposed for the unit harness only — nothing
+// runtime imports _test.
+module.exports._test = { makeToneBuf, encodeUlaw, dtmfToneBuf, DTMF_GAP, DTMF_FREQS };
