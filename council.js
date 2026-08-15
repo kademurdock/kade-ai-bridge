@@ -56,8 +56,23 @@ function userAllowed(userId) {
   return userId === OWNER_ID || EXTRA_USERS.includes(userId);
 }
 
-/* ---------- the five seats (names hers to change; mandates are the job) ---------- */
-const DEFAULT_NAMES = ['Access', 'Looks', 'Rules', 'Keeper', 'Fresh Eyes'];
+/* ---------- the five seats — NAMED BY KADE, Aug 15 2026, her reasoning kept:
+ * ARIA (screen reader) — "it's literally the accessibility standard (WAI-ARIA)
+ *   AND a solo vocal performance. She's listening to the song your interface
+ *   sings when nobody's looking at it."
+ * PRISM (visual) — "takes the whole picture and breaks it into what actually
+ *   matters — color, contrast, composition. One screen, refracted into the
+ *   parts worth fixing."
+ * SENTINEL (compliance) — "rules are passive. A sentinel is actively watching.
+ *   Has that weight to it without sounding like a buzzkill."
+ * VAULT (janitor-treasurer) — "it's where you store things AND where you keep
+ *   the money. Organized, secure, nothing gets lost."
+ * PILGRIM (user's-eye) — "walks through your flows like someone arriving for
+ *   the first time... not a tourist — a pilgrim has purpose, they're paying
+ *   attention to the journey itself."
+ * Internal keys (access/looks/rules/keeper/fresheyes) stay stable for rung-2
+ * wiring; COUNCIL_SEAT_NAMES env can still override display names. ---------- */
+const DEFAULT_NAMES = ['Aria', 'Prism', 'Sentinel', 'Vault', 'Pilgrim'];
 const envNames = String(process.env.COUNCIL_SEAT_NAMES || '').split(',').map((s) => s.trim());
 const NAME = (i) => envNames[i] || DEFAULT_NAMES[i];
 
