@@ -406,6 +406,10 @@ async function runErrand(errand, deps) {
         const started = researchDesk.createJob({
           userId: errand.userId, agentId: errand.agentId, agentName: errand.agentName,
           question, depth,
+          // The errand does its own tap on the shoulder when the WHOLE job is
+          // done. Letting the research desk push too means two buzzes for one
+          // piece of news, three seconds apart.
+          notify: false,
         });
         if (!started.ok) {
           addStep(errand, 'research', `I couldn't start that lookup: ${started.error}`, { ok: false, error: started.error, question });

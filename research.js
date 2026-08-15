@@ -471,7 +471,7 @@ async function runJob(job, deps) {
     job.finishedAt = new Date().toISOString();
     const firstLine = job.report.split(/\n/).find((l) => l.trim().length > 40) || job.report.slice(0, 160);
     setStage(job, 'done', 'finished — report ready');
-    if (deps.runNotify) {
+    if (deps.runNotify && job.notifyOnDone !== false) {
       try {
         await deps.runNotify({
           agentId: job.agentId, agentName: job.agentName || 'Research',
@@ -529,7 +529,7 @@ async function pump(deps) {
  * exactly one place where "what a research job is" is defined. */
 let liveDeps = null;
 
-function createJob({ userId, agentId, agentName, question, depth, focus, includePersonalNotes } = {}) {
+function createJob({ userId, agentId, agentName, question, depth, focus, includePersonalNotes, notify = true } = {}) {
   if (!enabled()) return { ok: false, code: 503, error: `Research is unavailable: ${disabledWhy()}.` };
   userId = String(userId || '').trim();
   question = String(question || '').replace(/%%%/g, '').trim().slice(0, 600);
@@ -547,6 +547,11 @@ function createJob({ userId, agentId, agentName, question, depth, focus, include
     userId, agentId: String(agentId || ''), agentName: String(agentName || '').slice(0, 60),
     question, focus: String(focus || '').replace(/%%%/g, '').trim().slice(0, 400) || null,
     depth: d, includePersonalNotes: includePersonalNotes === true,
+    /* An internal caller (the errands desk) owns its own done-push; without
+     * this flag one errand taps her phone TWICE for one piece of news —
+     * caught in the Part 66 smoke, where both notifies landed 3 seconds
+     * apart. Set by createJob's `notify:false`, honoured at the push site. */
+    notifyOnDone: notify !== false,
     status: 'queued', stageNote: 'waiting for the research desk',
     createdAt: new Date().toISOString(), finishedAt: null,
     plan: {}, sources: [], reflect: null, report: null, personalNotes: null,
