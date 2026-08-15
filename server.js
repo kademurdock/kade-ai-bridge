@@ -4294,6 +4294,15 @@ try {
   attachErrands(app, { bridgeSecretOk, notifySecretOk, runNotify });
 } catch (e) { console.warn('[errand] attach failed (bridge unaffected):', e.message); }
 
+// Part 68 (Aug 15 2026) — THE COUNCIL: Kade's five-seat AI ops advisory.
+// Advisors never deciders; owner-only backstage staff; flash-class cheap
+// with a hard daily budget cap. Full charter atop council.js.
+// Kill switch COUNCIL_ENABLED=0; scoped secret COUNCIL_TOOL_SECRET.
+try {
+  const { attachCouncil } = require('./council');
+  attachCouncil(app, { bridgeSecretOk });
+} catch (e) { console.warn('[council] attach failed (bridge unaffected):', e.message); }
+
 // Part 63 (Aug 14 2026) — the platform's own memory: read lane over the
 // kademurdock/kade-ai-project snapshot repo, so the estate keeps its
 // knowledge when her computer is off. Full story atop memory.js.
