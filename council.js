@@ -200,6 +200,70 @@ function callSeat(model, system, user, maxTokens) {
   });
 }
 
+/* ---------- the council's memory (HER ask, Aug 15 evening) ----------
+ * Three organs, all tiny JSON on the volume, zero idle cost:
+ *  1. FINDINGS LEDGER — every finding fingerprinted and statused
+ *     (new / known / fixed / parked-by-her-word). Sweeps then speak only
+ *     CHANGES. This is the anti-nag engine the charter demands: without
+ *     it, the second weekly beat re-announces week one's findings as
+ *     news, and "a nagging council gets ignored, and then it's theater."
+ *  2. HER VERDICTS — park/unpark/note via /council/decision. Parked
+ *     findings stay tracked but unspoken unless they worsen. Advisors
+ *     never deciders; memory records HER decisions, enforces only quiet.
+ *  3. SEAT NOTEBOOKS — each seat sees its own last few notes before
+ *     answering, so Aria remembers being Aria. Capped at 8 lines. */
+const FINDINGS_FILE = path.join(DATA_DIR, 'council-findings.json');
+const NOTEBOOKS_FILE = path.join(DATA_DIR, 'council-notebooks.json');
+function readJsonFile(f, fallback) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; } }
+function writeJsonFile(f, v) { try { fs.writeFileSync(f, JSON.stringify(v)); } catch (e) { console.error(`[council] save ${path.basename(f)}:`, e.message); } }
+
+function diffSweepFindings(pages) {
+  const store = readJsonFile(FINDINGS_FILE, { findings: {} });
+  const now = new Date().toISOString();
+  const seen = new Set();
+  const fresh = []; const known = []; const parked = [];
+  for (const p of pages) {
+    if (p.error) continue;
+    for (const v of p.axe || []) {
+      const fid = `axe:${p.name}:${v.id}`;
+      seen.add(fid);
+      const f = store.findings[fid];
+      if (!f) {
+        store.findings[fid] = { id: fid, kind: 'axe', page: p.name, rule: v.id, impact: v.impact || 'minor', desc: v.help, nodes: v.nodes, status: 'new', firstSeen: now, lastSeen: now, timesSeen: 1 };
+        fresh.push(store.findings[fid]);
+      } else {
+        f.lastSeen = now; f.timesSeen += 1; f.desc = v.help;
+        const worse = v.nodes > (f.nodes || 0);
+        f.nodes = v.nodes;
+        if (f.status === 'fixed') { f.status = 'new'; delete f.fixedAt; fresh.push(f); } // regression IS news
+        else if (f.status === 'parked') { if (worse) fresh.push(f); else parked.push(f); } // parked stays quiet unless worse
+        else { f.status = 'known'; known.push(f); }
+      }
+    }
+  }
+  const fixed = [];
+  const capturedPages = new Set(pages.filter((p) => !p.error).map((p) => p.name));
+  for (const f of Object.values(store.findings)) {
+    if (f.kind === 'axe' && !seen.has(f.id) && capturedPages.has(f.page) && f.status !== 'fixed') {
+      f.status = 'fixed'; f.fixedAt = now; fixed.push(f);
+    }
+  }
+  writeJsonFile(FINDINGS_FILE, store);
+  return { fresh, known, fixed, parked };
+}
+
+function noteSeat(key, text) {
+  const nb = readJsonFile(NOTEBOOKS_FILE, {});
+  nb[key] = [{ at: new Date().toISOString().slice(0, 10), note: String(text).replace(/\s+/g, ' ').slice(0, 220) }, ...(nb[key] || [])].slice(0, 8);
+  writeJsonFile(NOTEBOOKS_FILE, nb);
+}
+function seatMemory(key) {
+  const notes = (readJsonFile(NOTEBOOKS_FILE, {})[key]) || [];
+  if (!notes.length) return '';
+  return '\n\nYOUR OWN RECENT NOTES, newest first — remember what you already said, and never re-announce an old finding as news:\n' +
+    notes.map((n) => `${n.at}: ${n.note}`).join('\n');
+}
+
 /* ---------- vision calls (rung 2: Prism gets real eyes) ---------- */
 function callVision(model, system, userText, imagesB64) {
   const content = [{ type: 'text', text: userText }];
@@ -290,7 +354,7 @@ async function runSweep(trigger, deps) {
   if (spent.usd >= BUDGET_USD) {
     return { stopped: true, spokenSummary: `The council's daily budget is spent — ${fmtUsd(spent.usd)} of ${fmtUsd(BUDGET_USD)} — so the sweep is stopping before it starts.` };
   }
-  const login = { url: 'https://kademurdock.com/login', email: process.env.VISCHECK_EMAIL || '', password: process.env.VISCHECK_PASS || '' };
+  const login = { url: 'https://kademurdock.com/login', email: process.env.VISCHECK_EMAIL || '', password: process.env.VISCHECK_PASS || '', afterIndex: 0 };
   const cap = await devboxSweep(SWEEP_PAGES, login.email ? login : null);
   const pages = cap.pages || [];
   const shots = pages.filter((p) => p.shot).map((p) => p.shot);
@@ -301,24 +365,34 @@ async function runSweep(trigger, deps) {
   }).join('\n');
   const axeTotal = pages.reduce((a, p) => a + ((p.axe || []).reduce((b, v) => b + v.nodes, 0)), 0);
 
+  /* MEMORY PASS: the ledger decides what counts as news. */
+  const mem = diffSweepFindings(pages);
+  const describe = (f) => `${f.rule} on the ${f.page} (${f.impact}, ${f.nodes} spot${f.nodes === 1 ? '' : 's'}) — ${f.desc}`;
+  const memLines = [
+    mem.fresh.length ? `NEW this sweep (this is the news): ${mem.fresh.map(describe).join('; ')}` : 'NEW this sweep: none.',
+    mem.fixed.length ? `FIXED since last sweep (worth celebrating out loud): ${mem.fixed.map((f) => `${f.rule} on the ${f.page}`).join('; ')}` : '',
+    mem.known.length ? `ALREADY KNOWN and previously reported (${mem.known.length}) — do NOT re-announce these as news; at most one counting sentence.` : '',
+    mem.parked.length ? `PARKED BY KADE'S OWN WORD (${mem.parked.length}) — stay silent about these; they only come back if they worsen.` : '',
+  ].filter(Boolean).join('\n');
+
   let cost = 0;
   const seatOut = [];
   /* Aria reads the REAL scan. */
   try {
-    const aria = await callSeat(SEATS[0].model, `${CHARTER}\n\n${SEATS[0].mandate}`,
-      `A real automated accessibility scan (axe-core) just ran on the platform's key web pages. Raw findings, one line per page:\n${axeLines}\n\nTranslate what matters into plain speech for Kade: the finding that most affects a screen-reader user first, what would fix it, and say plainly if the pages came back clean. Scan receipts, not guesses.`, 300);
+    const aria = await callSeat(SEATS[0].model, `${CHARTER}\n\n${SEATS[0].mandate}${seatMemory(SEATS[0].key)}`,
+      `A real automated accessibility scan (axe-core) just ran on the platform's key web pages. Raw findings, one line per page:\n${axeLines}\n\nTHE COUNCIL'S LEDGER has already sorted these against past sweeps:\n${memLines}\n\nTranslate what matters into plain speech for Kade: lead with what's NEW, celebrate what's FIXED, give knowns one counting sentence at most, keep parked items silent. If nothing is new and nothing broke, say so happily — that is a win, not a failure to find something.`, 300);
     seatOut.push({ seat: SEATS[0].name, ok: true, text: aria.text }); cost += aria.cost;
   } catch (e) { seatOut.push({ seat: SEATS[0].name, ok: false, text: `${SEATS[0].name} couldn't read the scan (${e.message}).` }); }
   /* Prism sees the REAL screens. */
   try {
-    const prism = await callVision(process.env.COUNCIL_VISION_MODEL || MODEL, `${CHARTER}\n\n${SEATS[1].mandate}`,
+    const prism = await callVision(process.env.COUNCIL_VISION_MODEL || MODEL, `${CHARTER}\n\n${SEATS[1].mandate}${seatMemory(SEATS[1].key)}`,
       `These are real screenshots of the platform's web pages, in order: ${pages.map((p) => p.name).join(', ')}. Kade cannot see them — be her eyes. Judge hierarchy, contrast, spacing, empty states, consistency, and whether it looks like someone cared. Name the ONE change that would matter most overall.`, shots);
     seatOut.push({ seat: SEATS[1].name, ok: true, text: prism.text }); cost += prism.cost;
   } catch (e) { seatOut.push({ seat: SEATS[1].name, ok: false, text: `${SEATS[1].name} couldn't see the screenshots (${e.message}).` }); }
   /* Sentinel, Vault, Pilgrim get the brief + both specialists' takes. */
   const material = `${PLATFORM_BRIEF}\n\nThe accessibility scan said:\n${axeLines}\n\n${SEATS[0].name} (screen reader seat) says: ${seatOut[0].text}\n\n${SEATS[1].name} (visual seat) says: ${seatOut[1] ? seatOut[1].text : 'no visual read this time'}`;
   const rest = await Promise.allSettled([2, 3, 4].map((i) =>
-    callSeat(SEATS[i].model, `${CHARTER}\n\n${SEATS[i].mandate}`,
+    callSeat(SEATS[i].model, `${CHARTER}\n\n${SEATS[i].mandate}${seatMemory(SEATS[i].key)}`,
       `The council is running a whole-platform check-in for Kade — her ask: what should change, improve, or get fixed? Material gathered this sweep:\n\n${material}\n\nGive your seat's take on the platform as it stands.`, 280)
   ));
   rest.forEach((r, idx) => {
@@ -330,7 +404,7 @@ async function runSweep(trigger, deps) {
   let composed = '';
   try {
     const comp = await callSeat(MODEL,
-      'You compose the council\'s five seat verdicts into ONE spoken summary for Kade, who is blind. Plain spoken prose, no markdown, under 170 words. This was a whole-platform SWEEP with real receipts (a real accessibility scan, real screenshots). Lead with the single most important finding, keep disagreements visible, never invent findings, and close framing the decision as hers.',
+      'You compose the council\'s five seat verdicts into ONE spoken summary for Kade, who is blind. Plain spoken prose, no markdown, under 170 words. This was a whole-platform SWEEP with real receipts (a real accessibility scan, real screenshots) run against the council\'s own ledger. Lead with what is NEW, celebrate what got FIXED, give already-known findings one counting sentence at most, never mention parked items, never invent findings, keep disagreements visible, and close framing the decision as hers. If the sweep found nothing new, say so with satisfaction.',
       `The seats answered:\n\n${seatOut.map((s) => `${s.seat} said: ${s.text}`).join('\n\n')}`, 380);
     composed = comp.text; cost += comp.cost;
   } catch (e) {
@@ -341,10 +415,13 @@ async function runSweep(trigger, deps) {
     id: Math.random().toString(36).slice(2, 10), at: new Date().toISOString(), kind: 'sweep', trigger,
     pitch: `PLATFORM SWEEP (${trigger}) — real axe scan of ${pages.length} pages (${axeTotal} violation spots total) + screenshot review`,
     pages: pages.map((p) => ({ name: p.name, ok: !p.error, violations: (p.axe || []).reduce((a, v) => a + v.nodes, 0) })),
-    seats: seatOut, composed, costUsd: Math.round(cost * 1e6) / 1e6, dayUsd: day.usd,
+    memory: { new: mem.fresh.length, fixed: mem.fixed.length, known: mem.known.length, parked: mem.parked.length,
+      newIds: mem.fresh.map((f) => f.id), fixedIds: mem.fixed.map((f) => f.id) },
+    loggedIn: cap.loggedIn !== false, seats: seatOut, composed, costUsd: Math.round(cost * 1e6) / 1e6, dayUsd: day.usd,
   };
   appendMinutes(entry);
-  console.log(`[council] sweep ${entry.id} (${trigger}): ${pages.length} pages, ${axeTotal} axe spots, cost ${fmtUsd(cost)}`);
+  seatOut.forEach((s, i) => { if (s.ok) noteSeat(SEATS[i].key, `sweep: ${s.text}`); });
+  console.log(`[council] sweep ${entry.id} (${trigger}): ${pages.length} pages, ${axeTotal} axe spots (${mem.fresh.length} new, ${mem.fixed.length} fixed, ${mem.known.length} known, ${mem.parked.length} parked), cost ${fmtUsd(cost)}`);
   if (deps && deps.runNotify) {
     try {
       await deps.runNotify({
@@ -372,7 +449,7 @@ async function runPitch(pitchText) {
   }
 
   const results = await Promise.allSettled(SEATS.map((s) =>
-    callSeat(s.model, `${CHARTER}\n\n${s.mandate}`, `Kade pitches the council: ${pitchText}`, 256)
+    callSeat(s.model, `${CHARTER}\n\n${s.mandate}${seatMemory(s.key)}`, `Kade pitches the council: ${pitchText}`, 256)
   ));
   const seats = results.map((r, i) => ({
     seat: SEATS[i].name,
@@ -414,6 +491,7 @@ async function runPitch(pitchText) {
     dayUsd: day.usd,
   };
   appendMinutes(entry);
+  seats.forEach((s, i) => { if (s.ok) noteSeat(SEATS[i].key, `pitch "${String(pitchText).slice(0, 60)}": ${s.text}`); });
   console.log(`[council] pitch ${entry.id}: ${seats.filter((s) => s.ok).length}/${SEATS.length} seats answered, cost ${fmtUsd(cost)}, day total ${fmtUsd(day.usd)} of ${fmtUsd(BUDGET_USD)}`);
   return { stopped: false, entry, spokenSummary: composed };
 }
@@ -491,6 +569,46 @@ function attachCouncil(app, deps = {}) {
     res.json({ started: true, note: 'The council is sweeping — a couple of minutes. The verdict lands in the minutes and taps her phone when done.' });
     runSweep(String((req.body && req.body.trigger) || 'her ask'), deps)
       .catch((e) => console.error('[council] sweep failed:', e.message));
+  });
+
+  /* HER VERDICTS (the memory system's decision lane). Park = the council
+   * goes quiet about it unless it worsens. Unpark = it counts as known
+   * again. Note = her word rides the finding. Every decision lands in the
+   * minutes, because the ledger records what she decided — that was the
+   * design from day one. */
+  app.post('/council/decision', require('express').json({ limit: '8kb' }), (req, res) => {
+    if (gate(req, res) === null) return;
+    const { id, verdict, word } = req.body || {};
+    const store = readJsonFile(FINDINGS_FILE, { findings: {} });
+    const f = store.findings[String(id || '')];
+    if (!f) return res.status(404).json({ error: 'No finding on the ledger by that id. The minutes carry finding ids.' });
+    if (verdict === 'park') { f.status = 'parked'; if (word) f.herWord = String(word).slice(0, 300); }
+    else if (verdict === 'unpark') { f.status = 'known'; delete f.herWord; }
+    else if (verdict === 'note') { f.herWord = String(word || '').slice(0, 300); }
+    else return res.status(400).json({ error: 'verdict must be park, unpark, or note' });
+    f.decidedAt = new Date().toISOString();
+    writeJsonFile(FINDINGS_FILE, store);
+    appendMinutes({ id: Math.random().toString(36).slice(2, 10), at: new Date().toISOString(), kind: 'decision',
+      pitch: `HER DECISION: ${verdict} — ${f.id}${word ? ` ("${String(word).slice(0, 120)}")` : ''}`,
+      seats: [], composed: `Recorded. ${f.desc || f.id} is now ${f.status}.`, costUsd: 0, dayUsd: readSpend().usd });
+    const spoken = verdict === 'park'
+      ? `Recorded — ${f.desc || f.id} is parked by your word. The council stays quiet about it unless it gets worse.`
+      : verdict === 'unpark' ? `Recorded — ${f.desc || f.id} counts as an open known finding again.`
+      : `Recorded — your note now rides that finding.`;
+    res.json({ ok: true, finding: f, spokenSummary: spoken });
+  });
+
+  app.get('/council/findings', (req, res) => {
+    if (gate(req, res) === null) return;
+    const store = readJsonFile(FINDINGS_FILE, { findings: {} });
+    const all = Object.values(store.findings);
+    const by = (s) => all.filter((f) => f.status === s);
+    const open = [...by('new'), ...by('known')];
+    const spoken = all.length
+      ? `The ledger holds ${all.length} finding${all.length === 1 ? '' : 's'}: ${by('new').length} new, ${by('known').length} known, ${by('parked').length} parked by your word, ${by('fixed').length} fixed. ` +
+        (open.length ? 'Open items: ' + open.map((f) => `${f.desc} on the ${f.page} (id ${f.id})`).join('; ') + '.' : 'Nothing open — the board is clean.')
+      : 'The ledger is empty — no sweep has filed findings yet.';
+    res.json({ spokenSummary: spoken, findings: all });
   });
 
   /* WEEKLY BEAT (her word, Aug 15: live now, Sunday mornings, on HER
