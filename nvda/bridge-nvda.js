@@ -294,7 +294,23 @@ function attachNvdaAgent(app, deps = {}) {
     if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = runs.get(req.query.runId);
     if (!run) return res.status(404).json({ error: 'no such run' });
-    res.json({ runId: run.runId, status: run.status, transcript: run.recorder.transcript() });
+    /* Part 67 (Aug 15, her ask: "anything to save that money without
+     * screwing up quality"): the transcript reply used to be the WHOLE run —
+     * unbounded — and every fetch of it lands in the character's context and
+     * stays there for the rest of the conversation. The chat lane now gets
+     * the TAIL (what "what just happened" actually needs); the full JSONL on
+     * the volume remains complete, and ?full=1 serves it for audits. */
+    const fullT = String(run.recorder.transcript() || '');
+    const wantFull = String(req.query.full || '') === '1';
+    const tailLines = Math.max(10, parseInt(process.env.NVDA_TRANSCRIPT_REPLY_LINES, 10) || 60);
+    let outT = fullT;
+    if (!wantFull) {
+      const lines = fullT.split('\n');
+      if (lines.length > tailLines) {
+        outT = `[…earlier ${lines.length - tailLines} lines trimmed for chat — add full=1 for the whole receipt]\n` + lines.slice(-tailLines).join('\n');
+      }
+    }
+    res.json({ runId: run.runId, status: run.status, transcript: outT });
   }));
 
   // The NVDA add-on posts the whole foreground tree here and polls /nvda/say
@@ -374,7 +390,18 @@ function attachNvdaAgent(app, deps = {}) {
     if (!nvdaSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
     const run = activeRunFor(req.query.userId || 'kade');
     if (!run) return res.json({ tree: '', title: '', chars: 0 });
-    res.json({ title: run.latestTitle, chars: (run.latestTree || '').length, tree: run.latestTree });
+    /* Part 67, same money-without-quality pass: the tree reply could be the
+     * full 12,000-char capture, per look, forever resident in context. The
+     * chat lane now gets the head (title + the focused region live at the
+     * top of NVDA's dump); ?full=1 keeps the whole thing for anything that
+     * genuinely needs to walk the far corners. */
+    const treeCap = Math.max(800, parseInt(process.env.NVDA_TREE_REPLY_CAP, 10) || 3500);
+    const fullTree = String(run.latestTree || '');
+    const wantFullTree = String(req.query.full || '') === '1';
+    const outTree = !wantFullTree && fullTree.length > treeCap
+      ? fullTree.slice(0, treeCap) + `\n…[${fullTree.length - treeCap} more chars trimmed for chat — add full=1 for the whole tree]`
+      : fullTree;
+    res.json({ title: run.latestTitle, chars: fullTree.length, tree: outTree });
   }));
 
   // Inject a phrase for the add-on to speak (testing + manual narration).
