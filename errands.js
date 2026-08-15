@@ -98,6 +98,14 @@ const CALLS_PER_ERRAND = Math.max(1, parseInt(process.env.ERRAND_CALLS_PER_ERRAN
 const CALL_WAIT_MS = Math.max(60000, parseInt(process.env.ERRAND_CALL_WAIT_MS, 10) || 8 * 60 * 1000);
 const SELF_URL = `http://127.0.0.1:${process.env.PORT || 8080}`;
 
+/* RUNG 3 — THE DOCUMENT DESK. Plain text only, deliberately: her screen
+ * reader is the renderer, so a PDF would be a downgrade dressed as an
+ * upgrade. The finished text lands IN the ledger and becomes the errand's
+ * answer, which means Kiana reads it out loud without anyone opening a file.
+ * A copy is written beside the store for the day she wants to send one. */
+const DOCS_DIR = path.join(DATA_DIR, 'errand-docs');
+const DOC_MAX_WORDS = Math.max(120, parseInt(process.env.ERRAND_DOC_MAX_WORDS, 10) || 450);
+
 const OWNER_ID = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
 const OWNER_ONLY = process.env.ERRAND_OWNER_ONLY !== '0';
 const EXTRA_USERS = String(process.env.ERRAND_USERS || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -247,9 +255,13 @@ function planPrompt(goal) {
     '      looked up. NEVER write a number you were not given — a made-up number dials a stranger.',
     '      The person is asked to approve every single call before it is placed, by name and',
     '      number, so plan a call only when it is worth interrupting them for.',
+    '  {"kind":"document","what":"<what to write, in one sentence>","form":"letter|list|summary|complaint|note"}',
+    '      Writes a plain-text document — a letter, a list, a summary, a complaint.',
+    '      Put research or a call BEFORE it when the document needs facts it does not have.',
+    '      One document per errand is almost always right.',
     '',
-    `Hard limits: at most ${MAX_STEPS} steps, at most 3 research steps, at most ${CALLS_PER_ERRAND} call steps.`,
-    'Do not invent facts, phone numbers, or prices. Do not plan emails, purchases, or documents — you cannot do those.',
+    `Hard limits: at most ${MAX_STEPS} steps, at most 3 research steps, at most ${CALLS_PER_ERRAND} call steps, at most 1 document step.`,
+    'Do not invent facts, phone numbers, or prices. Do not plan emails or purchases — you cannot do those.',
     '',
     'Answer with JSON only:',
     '{"steps":[...],"say":"<one short plain sentence telling the person what you are about to go do, written to be heard out loud>"}',
@@ -329,7 +341,7 @@ function spokenSummary(errand) {
   if (sources) ledger.push(`${sources} ${sources === 1 ? 'source' : 'sources'} read`);
   const calls = s.filter((x) => x.kind === 'call_business' && x.detail?.ok).length;
   if (calls) ledger.push(`${calls} ${calls === 1 ? 'call' : 'calls'} placed`);
-  const docs = s.filter((x) => x.kind === 'make_document').length;
+  const docs = s.filter((x) => x.kind === 'make_document' && x.detail?.ok).length;
   if (docs) ledger.push(`${docs} ${docs === 1 ? 'document' : 'documents'} written`);
   if (ledger.length) parts.push(`Along the way: ${ledger.join(', ')}.`);
 
@@ -357,6 +369,7 @@ function errandPublic(e, withSteps = false) {
     budgetUsd: e.budgetUsd,
     awaiting: e.status === 'awaiting_confirm' ? { ask: e.pending?.ask || '', since: e.pending?.since || null } : null,
     answer: e.answer || null,
+    document: e.document || null,
     error: e.error || null,
     spokenSummary: spokenSummary(e),
   };
@@ -378,10 +391,11 @@ async function runErrand(errand, deps) {
       const { content, cost } = await askModel(errand, MODEL_PLAN, [{ role: 'user', content: planPrompt(errand.goal) }], { maxTokens: 900, json: true });
       const plan = jsonFrom(content) || {};
       const raw = Array.isArray(plan.steps) ? plan.steps : [];
-      let callsSeen = 0;
+      let callsSeen = 0; let docsSeen = 0;
       const steps = raw
-        .filter((x) => x && (x.kind === 'research' || x.kind === 'confirm' || x.kind === 'call'))
+        .filter((x) => x && ['research', 'confirm', 'call', 'document'].includes(x.kind))
         .filter((x) => (x.kind === 'call' ? ++callsSeen <= CALLS_PER_ERRAND : true))
+        .filter((x) => (x.kind === 'document' ? ++docsSeen <= 1 : true))
         .slice(0, MAX_STEPS);
       const dropped = raw.length - steps.length;
       errand.plan = steps;
@@ -460,6 +474,12 @@ async function runErrand(errand, deps) {
           errand.costUsd = Math.round((errand.costUsd + last.costUsd) * 1e5) / 1e5;
         }
         saveStore();
+        errand.cursor += 1;
+        continue;
+      }
+
+      if (step.kind === 'document') {
+        await runDocumentStep(errand, step);
         errand.cursor += 1;
         continue;
       }
@@ -708,6 +728,95 @@ async function callCost(errand, callSid, result) {
   return { usd: Math.round(Math.max(1, Math.ceil(secs / 60)) * 0.014 * 1e5) / 1e5, estimated: true };
 }
 
+/* ---------- RUNG 3: the document desk ----------
+ * PLAIN TEXT, on purpose and not as a shortcut. Kade is blind; the document
+ * she needs is one her screen reader can read the instant it exists, and the
+ * fastest path from "write me a letter" to hearing that letter is text in the
+ * ledger. A PDF would add a file to open, a layout she cannot see, and a
+ * renderer between her and her own words. Formatting for the page is a
+ * sighted feature; if she ever needs to MAIL one, the text is already saved
+ * and a later session can format it then.
+ */
+function docFileName(errand, n) {
+  return `${errand.id}-${n}.md`;
+}
+
+function documentPrompt(errand, step, findings) {
+  const form = ['letter', 'list', 'summary', 'complaint', 'note'].includes(step.form) ? step.form : 'letter';
+  return [
+    `Write a ${form}. It will be READ ALOUD by a screen reader to the person who asked for it, and it may also be sent as-is.`,
+    '',
+    'Rules:',
+    `  - Plain text. No markdown, no asterisks, no pound signs, no bullet characters, no tables, no headings in symbols.`,
+    `  - If the ${form} needs sections, use short plain lines and blank lines between them. That is all the structure it gets.`,
+    `  - Under ${DOC_MAX_WORDS} words. Say the thing and stop.`,
+    '  - Use ONLY facts given below. Where a real detail is missing — an account number, a date, an address —',
+    '    write a short square-bracket blank like [account number] rather than inventing one. Never invent a fact,',
+    '    a figure, a law, a deadline, or a case number.',
+    '  - Write it in the first person as the person who asked, ready for them to use as their own words.',
+    '  - Plain direct English. No throat-clearing, no "I hope this letter finds you well", no filler.',
+    '',
+    `WHAT THEY ASKED FOR: ${errand.goal}`,
+    '',
+    `THIS DOCUMENT SPECIFICALLY: ${step.what || errand.goal}`,
+    findings ? `\nWHAT WE FOUND OUT (use it; do not go beyond it):\n${findings.slice(0, 9000)}` : '',
+  ].join('\n');
+}
+
+async function runDocumentStep(errand, step) {
+  setStatus(errand, 'running', 'writing it up');
+  if (overBudget(errand)) {
+    errand.budgetStopped = true;
+    addStep(errand, 'budget_stop', 'I hit the spending limit before I could write it. Nothing was written.');
+    return;
+  }
+  const findings = errand.steps
+    .filter((x) => x.detail && x.detail.ok && (x.detail.report || x.detail.outcome))
+    .map((x) => x.detail.report || x.detail.outcome)
+    .join('\n\n');
+
+  let text = '';
+  let cost = 0;
+  try {
+    const r = await askModel(errand, MODEL_WRITE, [{ role: 'user', content: documentPrompt(errand, step, findings) }], { maxTokens: Math.round(DOC_MAX_WORDS * 2.2) });
+    cost = r.cost;
+    /* Strip markdown furniture even so. The prompt asks for none; a screen
+     * reader saying "asterisk asterisk" is the cost of trusting that alone. */
+    text = String(r.content || '')
+      .replace(/^#{1,6}\s*/gm, '')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/^\s*[*+-]\s+/gm, '')
+      .replace(/[*_`]/g, '')
+      .trim();
+  } catch (e) {
+    addStep(errand, 'make_document', `I could not get it written: ${e.message}.`, { ok: false, error: e.message }, cost);
+    return;
+  }
+  if (text.length < 40) {
+    addStep(errand, 'make_document', 'What came back was too thin to hand you, so I am not pretending it is a document.', { ok: false, error: 'empty draft' }, cost);
+    return;
+  }
+
+  const n = errand.steps.filter((x) => x.kind === 'make_document').length + 1;
+  const file = docFileName(errand, n);
+  let saved = false;
+  try {
+    fs.mkdirSync(DOCS_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DOCS_DIR, file), text, 'utf8');
+    saved = fs.existsSync(path.join(DOCS_DIR, file));   // verify the state, not the call
+  } catch (e) {
+    console.warn('[errand] document save failed (the text still rides the ledger):', e.message);
+  }
+
+  errand.document = text;
+  const words = text.split(/\s+/).length;
+  const blanks = (text.match(/\[[^\]]{2,40}\]/g) || []).length;
+  addStep(errand, 'make_document',
+    `Wrote it — ${words} words${blanks ? `, with ${blanks} ${blanks === 1 ? 'blank' : 'blanks'} left for you to fill in` : ''}.`,
+    { ok: true, form: step.form || 'letter', what: step.what || null, words, blanks, file: saved ? file : null, text },
+    cost);
+}
+
 async function wrapUp(errand, deps) {
   /* A phone call is a finding too — and usually the freshest one, which is
    * why it goes LAST where the writer weights it most. */
@@ -717,6 +826,18 @@ async function wrapUp(errand, deps) {
       ? `FINDING ${i + 1} (phoned ${x.detail.who} and asked ${x.detail.mission}):\n${x.detail.outcome}`
       : `FINDING ${i + 1} (${x.detail.question}):\n${x.detail.report}`))
     .join('\n\n');
+
+  /* When the errand wrote something, the document IS the deliverable. Do not
+   * spend a model call summarising a thing she is about to hear in full —
+   * lead with one line and hand her the text. */
+  if (errand.document) {
+    const words = errand.document.split(/\s+/).length;
+    errand.answer = `I wrote it. It runs about ${words} words, and I'll read it to you now.`;
+    setStatus(errand, 'done', 'finished');
+    addStep(errand, 'notify', 'Pinged your phone that it was done.');
+    await pushOut(errand, deps, 'Your errand is done', `"${cut(errand.goal, 55)}" — the ${errand.steps.find((x) => x.kind === 'make_document')?.detail?.form || 'document'} is written. Ask Kiana to read it to you.`);
+    return;
+  }
 
   if (!findings) {
     errand.answer = errand.budgetStopped
@@ -991,6 +1112,27 @@ function attachErrands(app, deps = {}) {
       e.pending = null;
     }
     res.json({ ok: true, ...errandPublic(e), spokenSummary: 'Called off. Nothing else will happen on that one.' });
+  });
+
+  /* GET /errand/:id/document?secret=&userId= — the saved text on its own.
+   * ADMIN secret only: the ledger already carries the document for the tool
+   * to read aloud, so this door exists for a session or a future "mail this
+   * for me" lane, not for an agent. */
+  app.get('/errand/:id/document', (req, res) => {
+    if (!adminOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+    const e = store.errands.find((x) => x.id === req.params.id);
+    if (!e) return res.status(404).json({ error: 'no such errand' });
+    if (!e.document) return res.status(404).json({ error: 'that errand did not write a document' });
+    const step = e.steps.find((x) => x.kind === 'make_document' && x.detail?.ok);
+    if (String(req.query.raw) === '1') {
+      res.type('text/plain; charset=utf-8');
+      return res.send(e.document);
+    }
+    res.json({
+      id: e.id, goal: e.goal, form: step?.detail?.form || null,
+      words: step?.detail?.words || null, blanks: step?.detail?.blanks || 0,
+      file: step?.detail?.file || null, document: e.document,
+    });
   });
 
   /* GET /errand-receipts?secret= — ADMIN ONLY, the spend ledger tail */
