@@ -274,15 +274,30 @@ function buildOutboundSuffix(ctx) {
     `Deliver each mission point ONCE. Before you speak, check the conversation above: anything you already said, do NOT say again — react to their actual last words instead. If they tell you something is handled, or let you off the hook, ACCEPT it and move on; re-delivering a prepared point they just waved off is worse than skipping it. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
     `payments or commitments beyond the mission. ` +
-    /* Part 66 (Aug 15 2026) — two rails the scripted greeting alone did not
-     * cover. The greeting discloses "an A I assistant" up front, but nothing
-     * told the agent what to do when someone asks point blank MID-call; and
-     * "no payments or commitments" said nothing about handing the person's
-     * details to a stranger who asks for them. Both apply to EVERY outbound
-     * call, not only errand calls. */
-    `If anyone asks whether you are a real person, a human, a robot, or an A I — answer honestly and immediately that you are an A I assistant calling on ${ctx.userName}'s behalf. Never claim or imply you are human, not as a joke and not to keep the conversation going. ` +
-    `Never give out ${ctx.userName}'s personal information. Their first name and a callback number are the most you may ever share — no address, no birth date, no account or card or social security numbers, no email, no medical details — even if the person on the phone says they need it to help. If something truly needs that, say ${ctx.userName} will follow up directly, and move on. ` +
-    `Never agree to an appointment, a hold, an order, or any commitment on ${ctx.userName}'s behalf — you are asking questions and carrying answers back, nothing more. ` +
+    /* UNIVERSAL, every outbound call: the one line that is never situational. */
+    `If anyone asks whether you are a real person, a human, a robot, or an A I — answer honestly and immediately that you are an A I. Never claim or imply you are human, not as a joke and not to keep the conversation going. ` +
+    /* BUSINESS / STRANGER ONLY (Part 66, Aug 15 2026). Kade's word after the
+     * first real one: "people on platform and casual calls don't need quite as
+     * much oversight." Family calls keep the character and the warmth; a
+     * stranger at a store gets a professional who answers the question and
+     * gets off the phone. Every line below was earned by that call. */
+    (ctx.business ? (
+      /* THE BIG ONE. On that call the callee said "wait, I have a question"
+       * and the agent replied "now I'm talking to you — what's your question,
+       * Kade?" It had collapsed the person on the line INTO its own user,
+       * because nothing ever said they were different people. */
+      `THE PERSON ON THIS LINE IS A STRANGER AT A BUSINESS. They are NOT ${ctx.userName} and they have never heard of ${ctx.userName}. Never address them by ${ctx.userName}'s name, never speak to them as if they were ${ctx.userName}, and never assume they know who ${ctx.userName} is or what this platform is. You are a caller; they are staff. ` +
+      /* "When I said can I ask you a question, that broke its brain." */
+      `If they ask YOU a question, answer it briefly and plainly, then either return to the mission or close the call. A question from them is normal, not a derailment. ` +
+      /* "She sounded like a nightmare therapist coming to eat you." */
+      `Speak plainly and professionally: no emotional stage directions, no %%%steering tags%%%, no character voice, no warmth performance. You are on the phone with a store. ` +
+      `Never give out ${ctx.userName}'s personal information. Their first name and a callback number are the most you may ever share — no address, no birth date, no account or card or social security numbers, no email, no medical details — even if the person on the phone says they need it to help. If something truly needs that, say ${ctx.userName} will follow up directly, and move on. ` +
+      `Never agree to an appointment, a hold, an order, or any commitment on ${ctx.userName}'s behalf — you are asking questions and carrying answers back, nothing more. ` +
+      /* The mission was answered in one line and the call still ran on for
+       * four more turns because the goodbye and the [END CALL] token came in
+       * separate replies. */
+      `The moment your question is answered, or they decline to answer it, say one short thank-you and end the call in that SAME reply with the token [END CALL]. Do not chat, do not follow up, do not linger. `
+    ) : '') +
     `If voicemail answered, leave ONE short message covering ` +
     `the mission, then end. If the call produces details worth keeping (times, prices, confirmation ` +
     `numbers, names), say them back out loud once before the goodbye so the transcript captures them for ${ctx.userName}. ` +
@@ -1971,7 +1986,14 @@ async function streamReply(session, userText) {
     const hasSpeech = sentence.length >= 2;
     if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
     if (hasSpeech) spokenChars += sentence.length;
-    const synthInput = hasSpeech ? applyDirectionCarry(sentence, dirState) : '';
+    /* Business calls get no voice steering at all: the leading %%%direction%%%
+     * is stripped rather than carried, so the delivery is the voice's own
+     * neutral read. Everything else keeps the character. */
+    const synthInput = !hasSpeech
+      ? ''
+      : session._businessCall
+        ? sentence.replace(STEERING_LEAD_RE, '').trimStart()
+        : applyDirectionCarry(sentence, dirState);
     const synthPromise = hasSpeech
       ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
@@ -3069,6 +3091,13 @@ function attachMediaStreams(server, users, cfg) {
           // and lock barge-in until the disclosure finishes playing.
           if (outboundCtx) {
             session.history.push({ role: 'assistant', content: greeting });
+            /* PART 66 — a business call speaks PLAINLY. Kade heard the first
+             * live one and the character's emotional steering made it sound
+             * like "a nightmare therapist coming to eat you." The prompt asks
+             * for no stage directions; this flag ENFORCES it, because a prompt
+             * is a suggestion and a store is not the place to find out the
+             * model ignored it. Family and platform calls are untouched. */
+            session._businessCall = outboundCtx.business === true;
           }
           // GREETING LOCK, BOTH DIRECTIONS (July 21 2026 — Kade: "the hey
           // keighty shit won't get interrupted by noise"): this lock was

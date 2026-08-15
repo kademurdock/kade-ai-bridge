@@ -612,7 +612,9 @@ async function placeCall(errand, step, deps) {
       secret: process.env.BRIDGE_SECRET,
       to: number,
       userId: errand.userId,
-      userName: process.env.ERRAND_CALLER_NAME || 'Kade',
+      // A business hears the FULL name — "an A I assistant calling on behalf of
+      // a customer, Kade Murdock." Her word: nobody at a store knows a "Kade."
+      userName: process.env.ERRAND_CALLER_NAME || 'Kade Murdock',
       agentId: errand.agentId || undefined,
       agentName: errand.agentName || 'Kiana',
       purpose: why,

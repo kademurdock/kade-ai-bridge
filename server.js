@@ -2021,6 +2021,12 @@ app.post('/outbound-call', async (req, res) => {
   // First name only when speaking (Kade's ask: "calling for Kade", not
   // "calling for Kade Murdock"). Full name stays in records/transcripts.
   const spokenUserName = String(userName || '').trim().split(/\s+/)[0] || 'a Kade-AI user';
+  /* PART 66 (Aug 15 2026), straight off Kade's ear on the first real business
+   * call: "it did say A I calling for Kade, but odds are someone at a business
+   * isn't gonna know who Kade is." A first name is right for family — it is
+   * meaningless to a stranger at a store. A business hears the FULL name and
+   * the word customer, which is the frame that makes the call make sense. */
+  const businessUserName = String(userName || '').trim() || 'a customer';
   // GREETING TIERS (July 12 2026, Kade: "none of this weird fourth-wall
   // stuff"). Registered family who KNOW the agent get greeted like a friend;
   // the full formal AI-disclosure + recording notice stays for strangers and
@@ -2067,8 +2073,8 @@ app.post('/outbound-call', async (req, res) => {
     ? `It's ${agentName || DEFAULT_AGENT_NAME}! ${framePurpose(purpose)}`
     : (calleeRec && disclose !== true)
       ? `It's ${agentName || DEFAULT_AGENT_NAME} — ${spokenUserName}'s A I. ${framePurpose(purpose)}`
-      : `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
-        `${spokenUserName}. This call may be recorded. ` +
+      : `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling on behalf of a customer, ` +
+        `${businessUserName}. This call may be recorded, and if I go quiet for a second I'm just thinking. ` +
         framePurpose(purpose);
   const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
   const greeting2Text = calleeName ? introText : null;
@@ -2120,6 +2126,12 @@ app.post('/outbound-call', async (req, res) => {
       // voice-stream appends it to the mission context.
       context: String(context || '').slice(0, 4000) || null,
       calleeName: calleeName || null,
+      /* Is the person answering a STRANGER at a business? Drives the tighter
+       * rails in buildOutboundSuffix and turns the character's emotional
+       * steering off — her word on the first live one: the voice direction
+       * made it sound like "a nightmare therapist coming to eat you." Family
+       * and platform calls keep the character; a store gets a professional. */
+      business: disclose === true,
       to: e164,
       agentId: agentId || DEFAULT_AGENT,
       agentName: agentName || DEFAULT_AGENT_NAME,
