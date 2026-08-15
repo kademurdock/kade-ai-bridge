@@ -1986,15 +1986,19 @@ async function streamReply(session, userText) {
     const hasSpeech = sentence.length >= 2;
     if (!hasSpeech && !gameCues.length) return; // token-only fragment, nothing to speak
     if (hasSpeech) spokenChars += sentence.length;
-    /* Business calls get no voice steering at all: the leading %%%direction%%%
-     * is stripped rather than carried, so the delivery is the voice's own
-     * neutral read. Everything else keeps the character. */
+    /* Business calls get no voice steering at all — and the strip is GLOBAL,
+     * not leading-only (final-check fix): synthesize() hands this text to the
+     * TTS proxy, whose own tag parser honors %%%…%%% ANYWHERE in the string,
+     * so a mid-sentence tag would have steered the voice right past the old
+     * leading-only strip. A sentence that strips to nothing was pure stage
+     * direction; it takes the no-speech path instead of synthesizing "".
+     * Everything that isn't a business call keeps the character untouched. */
     const synthInput = !hasSpeech
       ? ''
       : session._businessCall
-        ? sentence.replace(STEERING_LEAD_RE, '').trimStart()
+        ? sentence.replace(/%%%[\s\S]*?%%%/g, ' ').replace(/\s+/g, ' ').trim()
         : applyDirectionCarry(sentence, dirState);
-    const synthPromise = hasSpeech
+    const synthPromise = hasSpeech && synthInput
       ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
           return null;

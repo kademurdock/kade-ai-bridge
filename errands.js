@@ -1111,7 +1111,13 @@ function attachErrands(app, deps = {}) {
       setStatus(e, 'cancelled', 'cancelled');
       e.pending = null;
     }
-    res.json({ ok: true, ...errandPublic(e), spokenSummary: 'Called off. Nothing else will happen on that one.' });
+    /* Honest wording for the running case (final-check fix): a live phone
+     * call cannot be yanked mid-ring — it finishes on its own and THEN the
+     * runner sees the cancel. "Nothing else will happen" was a small lie in
+     * exactly the situation where precision matters most. */
+    res.json({ ok: true, ...errandPublic(e), spokenSummary: e.status === 'running'
+      ? 'Called off. If a call is already ringing it will wrap up on its own, but nothing new starts after that.'
+      : 'Called off. Nothing else will happen on that one.' });
   });
 
   /* GET /errand/:id/document?secret=&userId= — the saved text on its own.
@@ -1145,8 +1151,11 @@ function attachErrands(app, deps = {}) {
   });
 
   /* Anything left mid-flight by a redeploy: an errand that was RUNNING when the
-   * container died is not running now. Say so in its own ledger rather than
-   * leaving a ghost that reads "still working" forever. Errands parked on
+   * container died is not running now, and a QUEUED one is deliberately failed
+   * too rather than auto-resumed — a fresh container quietly re-running model
+   * calls with nobody watching is how surprise spend happens, and a crash-loop
+   * would re-run them every boot. Say so in the ledger rather than leaving a
+   * ghost that reads "still working" forever. Errands parked on
    * awaiting_confirm survive untouched — that is the whole point of the
    * volume-backed store. */
   let revived = 0;
