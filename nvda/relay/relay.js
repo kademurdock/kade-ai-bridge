@@ -122,7 +122,18 @@ class NvdaRelay {
   }
 
   _onConnection(sock) {
-    const client = { id: this.nextId++, sock, channel: null, role: null, buffer: '', proto: null };
+    const client = { id: this.nextId++, sock, channel: null, role: null, buffer: '', proto: null, joinTimer: null };
+    /* Aug 15 2026 — THE REAPER. After the squatters left, the relay still
+     * never slept, and the likeliest reason is sockets that connect and
+     * never join (scanners, half-opens) holding "traffic" forever. A
+     * socket gets 60 seconds to say join or it's gone; a legitimate NVDA
+     * add-on joins within one. */
+    client.joinTimer = setTimeout(() => {
+      if (!client.channel) {
+        this.log(`reaped unjoined socket id=${client.id} (60s, no join)`);
+        try { sock.destroy(); } catch (_) {}
+      }
+    }, 60_000);
     sock.setEncoding('utf8');
     sock.on('data', (chunk) => this._onData(client, chunk));
     sock.on('error', () => this._drop(client));
@@ -168,6 +179,23 @@ class NvdaRelay {
 
   _join(client, msg) {
     const key = String(msg.channel || '');
+    /* Aug 15 2026 — THE DOOR GETS A POLICY. sleepApplication was on and the
+     * service never slept: the logs showed a foreign controlled machine
+     * parked nearly four hours in channel "appleres…" plus stray
+     * "relaysvc…" joins — neither shape exists anywhere in this codebase,
+     * and Kade doesn't know them. An NVDA Remote relay on a public TCP
+     * proxy WILL be found, and an open one relays strangers' screen-reader
+     * sessions on her dime. Rooms are minted-keys-only now: the bridge
+     * hands out kade-<24 hex> and reads it to her aloud, so the real flow
+     * pays nothing. Debug escape hatch: RELAY_OPEN=1 restores the old
+     * open door. */
+    if (process.env.RELAY_OPEN !== '1' && !/^kade-[0-9a-f]{24}$/.test(key)) {
+      this.log(`REFUSED join id=${client.id} channel=${key.slice(0, 8)}… (minted keys only)`);
+      this._sendTo(client, { type: 'error', message: 'This relay admits invited sessions only.' });
+      try { client.sock.destroy(); } catch (_) {}
+      return;
+    }
+    if (client.joinTimer) { clearTimeout(client.joinTimer); client.joinTimer = null; }
     client.channel = key;
     client.role = msg.connection_type || 'master';
     if (!this.channels.has(key)) this.channels.set(key, new Map());

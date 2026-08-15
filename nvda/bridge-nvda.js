@@ -98,9 +98,13 @@ function attachNvdaAgent(app, deps = {}) {
 
   function newRun(goal, userId, mode, wantKey) {
     const runId = 'run_' + crypto.randomBytes(5).toString('hex');
-    // Allow a caller-supplied, easy-to-type key (sanitized); else random.
-    const clean = String(wantKey || '').trim();
-    const channelKey = /^[a-zA-Z0-9_-]{4,60}$/.test(clean) ? clean : 'kade-' + crypto.randomBytes(12).toString('hex');
+    /* Aug 15 2026: caller-supplied keys are DEAD, deliberately — a
+     * human-picked word is a guessable room, and the relay now refuses
+     * any channel that is not a minted kade-<24 hex> key. wantKey is
+     * ignored on purpose; the minted key rides back in the response and
+     * Kiana reads it aloud, so nothing easier was ever needed. */
+    void wantKey;
+    const channelKey = 'kade-' + crypto.randomBytes(12).toString('hex');
     const observer = new Observer();
     const recorder = new Recorder({ file: path.join(VOL, `nvda_transcript_${runId}.jsonl`), goal });
     const safety = new Safety();
