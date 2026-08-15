@@ -500,20 +500,82 @@ async function runJob(job, deps) {
   }
 }
 
+/* The re-arm flag closes a real race: a job queued in the window between the
+ * loop finding nothing and `working` going false would call pump(), get the
+ * early return, and then sit there — for errands that meant a confirmed
+ * errand stalling until its research deadline. `again` makes the running
+ * pump do one more lap instead. */
+let again = false;
 async function pump(deps) {
-  if (working) return;
+  if (working) { again = true; return; }
   working = true;
   try {
-    for (;;) {
-      const next = store.jobs.find((j) => j.status === 'queued');
-      if (!next) break;
-      await runJob(next, deps);
-    }
+    do {
+      again = false;
+      for (;;) {
+        const next = store.jobs.find((j) => j.status === 'queued');
+        if (!next) break;
+        await runJob(next, deps);
+      }
+    } while (again);
   } finally { working = false; }
+}
+
+/* ---------- the desk's INTERNAL door (Part 66, Aug 15 2026) ----------
+ * The errands engine runs research as a STEP, so it needs to start and read
+ * jobs without going back out over HTTP to its own process. The route below
+ * and the errand desk both go through createJob, deliberately: caps, queue
+ * limits and the job record stay identical no matter who asked, so there is
+ * exactly one place where "what a research job is" is defined. */
+let liveDeps = null;
+
+function createJob({ userId, agentId, agentName, question, depth, focus, includePersonalNotes } = {}) {
+  if (!enabled()) return { ok: false, code: 503, error: `Research is unavailable: ${disabledWhy()}.` };
+  userId = String(userId || '').trim();
+  question = String(question || '').replace(/%%%/g, '').trim().slice(0, 600);
+  if (!userId || question.length < 8) return { ok: false, code: 400, error: 'userId and a real question are required' };
+  const d = DEPTHS[depth] ? depth : 'standard';
+
+  const today = centralDay();
+  const todays = store.jobs.filter((j) => j.userId === userId && j.createdAt.slice(0, 10) === today).length;
+  if (todays >= DAILY_CAP) return { ok: false, code: 429, error: `daily research cap reached (${DAILY_CAP})` };
+  const active = store.jobs.filter((j) => ['queued', 'planning', 'searching', 'reading', 'thinking', 'writing'].includes(j.status));
+  if (active.length >= QUEUE_CAP) return { ok: false, code: 429, error: 'the research desk is full right now — try again in a few minutes' };
+
+  const job = {
+    id: crypto.randomBytes(5).toString('hex'),
+    userId, agentId: String(agentId || ''), agentName: String(agentName || '').slice(0, 60),
+    question, focus: String(focus || '').replace(/%%%/g, '').trim().slice(0, 400) || null,
+    depth: d, includePersonalNotes: includePersonalNotes === true,
+    status: 'queued', stageNote: 'waiting for the research desk',
+    createdAt: new Date().toISOString(), finishedAt: null,
+    plan: {}, sources: [], reflect: null, report: null, personalNotes: null,
+    costs: { tavilyCredits: 0, tokens: {}, estUSD: 0 }, error: null, cancelRequested: false,
+  };
+  store.jobs.unshift(job);
+  if (store.jobs.length > JOBS_KEPT) store.jobs.length = JOBS_KEPT;
+  saveStore();
+  setImmediate(() => pump(liveDeps || {}).catch((e) => console.error('[research] pump:', e.message)));
+  return { ok: true, id: job.id, position: active.length, etaMinutes: DEPTHS[d].etaMin + active.length * 3 };
+}
+
+function getJob(id, { withReport = false } = {}) {
+  const j = store.jobs.find((x) => x.id === id);
+  return j ? jobPublic(j, withReport) : null;
+}
+
+function cancelJob(id) {
+  const j = store.jobs.find((x) => x.id === id);
+  if (!j) return false;
+  if (['done', 'failed', 'cancelled'].includes(j.status)) return true;
+  if (j.status === 'queued') { j.status = 'cancelled'; j.stageNote = 'cancelled before it started'; j.finishedAt = new Date().toISOString(); saveStore(); }
+  else j.cancelRequested = true;
+  return true;
 }
 
 /* ---------- routes ---------- */
 function attachResearch(app, deps = {}) {
+  liveDeps = deps; // the internal door (createJob) pumps with the same deps the routes use
   const authOk = (req, provided) =>
     (deps.bridgeSecretOk && deps.bridgeSecretOk(req, provided)) ||
     (deps.notifySecretOk && deps.notifySecretOk(req, provided));
@@ -521,33 +583,13 @@ function attachResearch(app, deps = {}) {
   /* POST /research/start {userId, agentId, agentName, question, depth, focus, include_personal_notes} */
   app.post('/research/start', express.json({ limit: '32kb' }), (req, res) => {
     if (!authOk(req, req.body?.secret)) return res.status(403).json({ error: 'Unauthorized' });
-    if (!enabled()) return res.status(503).json({ error: `Research is unavailable: ${disabledWhy()}.` });
-    const userId = String(req.body?.userId || '').trim();
-    const question = String(req.body?.question || '').replace(/%%%/g, '').trim().slice(0, 600);
-    if (!userId || question.length < 8) return res.status(400).json({ error: 'userId and a real question are required' });
-    const depth = DEPTHS[req.body?.depth] ? req.body.depth : 'standard';
-
-    const today = centralDay();
-    const todays = store.jobs.filter((j) => j.userId === userId && j.createdAt.slice(0, 10) === today).length;
-    if (todays >= DAILY_CAP) return res.status(429).json({ error: `daily research cap reached (${DAILY_CAP})` });
-    const active = store.jobs.filter((j) => ['queued', 'planning', 'searching', 'reading', 'thinking', 'writing'].includes(j.status));
-    if (active.length >= QUEUE_CAP) return res.status(429).json({ error: 'the research desk is full right now — try again in a few minutes' });
-
-    const job = {
-      id: crypto.randomBytes(5).toString('hex'),
-      userId, agentId: String(req.body?.agentId || ''), agentName: String(req.body?.agentName || '').slice(0, 60),
-      question, focus: String(req.body?.focus || '').replace(/%%%/g, '').trim().slice(0, 400) || null,
-      depth, includePersonalNotes: req.body?.include_personal_notes === true,
-      status: 'queued', stageNote: 'waiting for the research desk',
-      createdAt: new Date().toISOString(), finishedAt: null,
-      plan: {}, sources: [], reflect: null, report: null, personalNotes: null,
-      costs: { tavilyCredits: 0, tokens: {}, estUSD: 0 }, error: null, cancelRequested: false,
-    };
-    store.jobs.unshift(job);
-    if (store.jobs.length > JOBS_KEPT) store.jobs.length = JOBS_KEPT;
-    saveStore();
-    setImmediate(() => pump(deps).catch((e) => console.error('[research] pump:', e.message)));
-    res.json({ ok: true, id: job.id, position: active.length, etaMinutes: DEPTHS[depth].etaMin + active.length * 3 });
+    const r = createJob({
+      userId: req.body?.userId, agentId: req.body?.agentId, agentName: req.body?.agentName,
+      question: req.body?.question, depth: req.body?.depth, focus: req.body?.focus,
+      includePersonalNotes: req.body?.include_personal_notes,
+    });
+    if (!r.ok) return res.status(r.code || 400).json({ error: r.error });
+    res.json({ ok: true, id: r.id, position: r.position, etaMinutes: r.etaMinutes });
   });
 
   /* GET /research/status?userId=&id= — one job in detail, or the recent list */
@@ -597,4 +639,8 @@ function attachResearch(app, deps = {}) {
   console.log(`[research] attached — ${enabled() ? 'ENABLED' : `DISABLED (${disabledWhy()})`}`);
 }
 
-module.exports = { attachResearch, _internals: { runJob, DEPTHS, jobPublic, store } };
+module.exports = {
+  attachResearch,
+  researchDesk: { createJob, getJob, cancelJob, enabled, disabledWhy, DEPTHS },
+  _internals: { runJob, DEPTHS, jobPublic, store },
+};

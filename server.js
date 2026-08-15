@@ -4264,6 +4264,15 @@ try {
   attachNvdaAgent(app, { bridgeSecretOk, runNotify });
 } catch (e) { console.warn('[nvda] attach failed (bridge unaffected):', e.message); }
 
+// Part 66 (Aug 15 2026) — ERRANDS WITH RECEIPTS: tracked, resumable,
+// multi-step jobs whose audit trail is the product. Attached AFTER research
+// because an errand's research step borrows that desk's internal door.
+// Additive + fail-soft; kill switch ERRANDS_ENABLED=0. Full story atop errands.js.
+try {
+  const { attachErrands } = require('./errands');
+  attachErrands(app, { bridgeSecretOk, notifySecretOk, runNotify });
+} catch (e) { console.warn('[errand] attach failed (bridge unaffected):', e.message); }
+
 // Part 63 (Aug 14 2026) — the platform's own memory: read lane over the
 // kademurdock/kade-ai-project snapshot repo, so the estate keeps its
 // knowledge when her computer is off. Full story atop memory.js.
