@@ -4300,7 +4300,7 @@ try {
 // Kill switch COUNCIL_ENABLED=0; scoped secret COUNCIL_TOOL_SECRET.
 try {
   const { attachCouncil } = require('./council');
-  attachCouncil(app, { bridgeSecretOk });
+  attachCouncil(app, { bridgeSecretOk, runNotify });
 } catch (e) { console.warn('[council] attach failed (bridge unaffected):', e.message); }
 
 // Part 63 (Aug 14 2026) — the platform's own memory: read lane over the

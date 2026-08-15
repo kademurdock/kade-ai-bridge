@@ -200,6 +200,163 @@ function callSeat(model, system, user, maxTokens) {
   });
 }
 
+/* ---------- vision calls (rung 2: Prism gets real eyes) ---------- */
+function callVision(model, system, userText, imagesB64) {
+  const content = [{ type: 'text', text: userText }];
+  for (const b64 of imagesB64.slice(0, 6)) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } });
+  }
+  const body = JSON.stringify({
+    model,
+    messages: [{ role: 'system', content: system }, { role: 'user', content }],
+    max_tokens: 400,
+    temperature: 0.4,
+    reasoning: { effort: 'none', enabled: false },
+  });
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'openrouter.ai', path: '/api/v1/chat/completions', method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+        'HTTP-Referer': 'https://kademurdock.com', 'X-Title': 'Kade-AI Council',
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (j.error) return reject(new Error(j.error.message || 'upstream error'));
+          const text = (((j.choices || [])[0] || {}).message || {}).content || '';
+          const u = j.usage || {};
+          const cost = ((u.prompt_tokens || 0) * PRICE_IN + (u.completion_tokens || 0) * PRICE_OUT) / 1e6;
+          resolve({ text: String(text).trim(), cost });
+        } catch (e) { reject(new Error(`bad upstream reply: ${e.message}`)); }
+      });
+    });
+    req.setTimeout(60000, () => req.destroy(new Error('vision call timed out after 60s')));
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+/* ---------- the devbox eyes (rung 2) ---------- */
+function devboxSweep(pages, login) {
+  const body = JSON.stringify({ pages, login });
+  const u = new URL(`${process.env.DEVBOX_URL || 'https://forge-devbox-production.up.railway.app'}/sweep`);
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: u.hostname, path: u.pathname, method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.DEVBOX_SECRET || ''}`,
+        'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (res.statusCode !== 200) return reject(new Error(j.error || `devbox HTTP ${res.statusCode}`));
+          resolve(j);
+        } catch (e) { reject(new Error(`devbox reply unreadable: ${e.message}`)); }
+      });
+    });
+    req.setTimeout(300000, () => req.destroy(new Error('the devbox sweep ran past 5 minutes')));
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+/* ---------- the full-platform sweep (rung 2: real receipts, her ask) ---------- */
+const SWEEP_PAGES = [
+  { name: 'login page', url: 'https://kademurdock.com/login' },
+  { name: 'chat home', url: 'https://kademurdock.com/' },
+  { name: 'tools hub', url: 'https://kademurdock.com/tools' },
+  { name: 'help site', url: 'https://kademurdock.com/help' },
+];
+const PLATFORM_BRIEF =
+  'The platform: kademurdock.com, a self-hosted AI chat home a blind owner (Kade) runs for family and friends — ' +
+  'about ten real people. Blind-first is the house law: screen-reader flow is sacred, game visuals are hidden from ' +
+  'screen readers on purpose. Surfaces: web chat with ~223 AI characters, voice calls in and out over a real phone ' +
+  'number, a native iOS app (TestFlight, App Store review in progress), voice rooms (Clubhouse), a game parlor, a ' +
+  'help site, and admin dashboards only Kade sees. Money is tight by design: model spend rides prepaid pots with ' +
+  'runway watchers. The family is non-technical.';
+
+async function runSweep(trigger, deps) {
+  const spent = readSpend();
+  if (spent.usd >= BUDGET_USD) {
+    return { stopped: true, spokenSummary: `The council's daily budget is spent — ${fmtUsd(spent.usd)} of ${fmtUsd(BUDGET_USD)} — so the sweep is stopping before it starts.` };
+  }
+  const login = { url: 'https://kademurdock.com/login', email: process.env.VISCHECK_EMAIL || '', password: process.env.VISCHECK_PASS || '' };
+  const cap = await devboxSweep(SWEEP_PAGES, login.email ? login : null);
+  const pages = cap.pages || [];
+  const shots = pages.filter((p) => p.shot).map((p) => p.shot);
+  const axeLines = pages.map((p) => {
+    if (p.error) return `${p.name}: capture failed (${p.error})`;
+    if (!p.axe || !p.axe.length) return `${p.name}: no violations found`;
+    return `${p.name}: ` + p.axe.map((v) => `${v.id} (${v.impact || 'minor'}, ${v.nodes} spot${v.nodes === 1 ? '' : 's'}) — ${v.help}`).join('; ');
+  }).join('\n');
+  const axeTotal = pages.reduce((a, p) => a + ((p.axe || []).reduce((b, v) => b + v.nodes, 0)), 0);
+
+  let cost = 0;
+  const seatOut = [];
+  /* Aria reads the REAL scan. */
+  try {
+    const aria = await callSeat(SEATS[0].model, `${CHARTER}\n\n${SEATS[0].mandate}`,
+      `A real automated accessibility scan (axe-core) just ran on the platform's key web pages. Raw findings, one line per page:\n${axeLines}\n\nTranslate what matters into plain speech for Kade: the finding that most affects a screen-reader user first, what would fix it, and say plainly if the pages came back clean. Scan receipts, not guesses.`, 300);
+    seatOut.push({ seat: SEATS[0].name, ok: true, text: aria.text }); cost += aria.cost;
+  } catch (e) { seatOut.push({ seat: SEATS[0].name, ok: false, text: `${SEATS[0].name} couldn't read the scan (${e.message}).` }); }
+  /* Prism sees the REAL screens. */
+  try {
+    const prism = await callVision(process.env.COUNCIL_VISION_MODEL || MODEL, `${CHARTER}\n\n${SEATS[1].mandate}`,
+      `These are real screenshots of the platform's web pages, in order: ${pages.map((p) => p.name).join(', ')}. Kade cannot see them — be her eyes. Judge hierarchy, contrast, spacing, empty states, consistency, and whether it looks like someone cared. Name the ONE change that would matter most overall.`, shots);
+    seatOut.push({ seat: SEATS[1].name, ok: true, text: prism.text }); cost += prism.cost;
+  } catch (e) { seatOut.push({ seat: SEATS[1].name, ok: false, text: `${SEATS[1].name} couldn't see the screenshots (${e.message}).` }); }
+  /* Sentinel, Vault, Pilgrim get the brief + both specialists' takes. */
+  const material = `${PLATFORM_BRIEF}\n\nThe accessibility scan said:\n${axeLines}\n\n${SEATS[0].name} (screen reader seat) says: ${seatOut[0].text}\n\n${SEATS[1].name} (visual seat) says: ${seatOut[1] ? seatOut[1].text : 'no visual read this time'}`;
+  const rest = await Promise.allSettled([2, 3, 4].map((i) =>
+    callSeat(SEATS[i].model, `${CHARTER}\n\n${SEATS[i].mandate}`,
+      `The council is running a whole-platform check-in for Kade — her ask: what should change, improve, or get fixed? Material gathered this sweep:\n\n${material}\n\nGive your seat's take on the platform as it stands.`, 280)
+  ));
+  rest.forEach((r, idx) => {
+    const i = idx + 2;
+    seatOut.push({ seat: SEATS[i].name, ok: r.status === 'fulfilled', text: r.status === 'fulfilled' ? r.value.text : `${SEATS[i].name} couldn't answer (${r.reason && r.reason.message}).` });
+    if (r.status === 'fulfilled') cost += r.value.cost;
+  });
+  /* Compose. */
+  let composed = '';
+  try {
+    const comp = await callSeat(MODEL,
+      'You compose the council\'s five seat verdicts into ONE spoken summary for Kade, who is blind. Plain spoken prose, no markdown, under 170 words. This was a whole-platform SWEEP with real receipts (a real accessibility scan, real screenshots). Lead with the single most important finding, keep disagreements visible, never invent findings, and close framing the decision as hers.',
+      `The seats answered:\n\n${seatOut.map((s) => `${s.seat} said: ${s.text}`).join('\n\n')}`, 380);
+    composed = comp.text; cost += comp.cost;
+  } catch (e) {
+    composed = 'The sweep ran but the composer stumbled; the seat verdicts are on the ledger one by one.';
+  }
+  const day = addSpend(cost);
+  const entry = {
+    id: Math.random().toString(36).slice(2, 10), at: new Date().toISOString(), kind: 'sweep', trigger,
+    pitch: `PLATFORM SWEEP (${trigger}) — real axe scan of ${pages.length} pages (${axeTotal} violation spots total) + screenshot review`,
+    pages: pages.map((p) => ({ name: p.name, ok: !p.error, violations: (p.axe || []).reduce((a, v) => a + v.nodes, 0) })),
+    seats: seatOut, composed, costUsd: Math.round(cost * 1e6) / 1e6, dayUsd: day.usd,
+  };
+  appendMinutes(entry);
+  console.log(`[council] sweep ${entry.id} (${trigger}): ${pages.length} pages, ${axeTotal} axe spots, cost ${fmtUsd(cost)}`);
+  if (deps && deps.runNotify) {
+    try {
+      await deps.runNotify({
+        agentId: 'kade-council', agentName: 'The Council', urgent: false, userId: OWNER_ID, category: 'KADE_COUNCIL',
+        title: 'Council sweep done',
+        body: `The council swept the platform (${pages.length} pages, real scan). Ask Kiana for the council's last minutes to hear it.`,
+      });
+    } catch (e) { console.warn('[council] sweep digest push failed:', e.message); }
+  }
+  return { stopped: false, entry, spokenSummary: composed };
+}
+
 /* ---------- the pitch (fan out, compose, ledger) ---------- */
 async function runPitch(pitchText) {
   /* BUDGET GATE — before every spending step, errands-style. A pitch is
@@ -327,8 +484,35 @@ function attachCouncil(app, deps = {}) {
     res.json({ spokenSummary: `The last pitch was: ${e.pitch.slice(0, 200)}. The council's take: ${e.composed}`, entry: e });
   });
 
+  app.post('/council/sweep', require('express').json({ limit: '8kb' }), async (req, res) => {
+    if (gate(req, res) === null) return;
+    /* The sweep takes ~2 minutes; answer NOW, run behind, land in minutes,
+     * tap her phone when done. Nobody sits on a hanging request. */
+    res.json({ started: true, note: 'The council is sweeping — a couple of minutes. The verdict lands in the minutes and taps her phone when done.' });
+    runSweep(String((req.body && req.body.trigger) || 'her ask'), deps)
+      .catch((e) => console.error('[council] sweep failed:', e.message));
+  });
+
+  /* WEEKLY BEAT (her word, Aug 15: live now, Sunday mornings, on HER
+   * platform). Central-time Sunday after 9am, once per week, persisted on
+   * the volume so restarts can't double-fire. Kill: COUNCIL_BEAT_WEEKLY=0. */
+  const BEATS_FILE = path.join(DATA_DIR, 'council-beats.json');
+  const readBeats = () => { try { return JSON.parse(fs.readFileSync(BEATS_FILE, 'utf8')); } catch { return {}; } };
+  setInterval(() => {
+    if (process.env.COUNCIL_BEAT_WEEKLY === '0' || !enabled()) return;
+    const c = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+    if (c.getDay() !== 0 || c.getHours() < 9) return;
+    const weekKey = `${c.getFullYear()}-w${Math.floor(c.getTime() / (7 * 86400000))}`;
+    const beats = readBeats();
+    if (beats.lastWeekly === weekKey) return;
+    beats.lastWeekly = weekKey;
+    try { fs.writeFileSync(BEATS_FILE, JSON.stringify(beats)); } catch (e) { console.error('[council] beats save:', e.message); return; }
+    console.log('[council] weekly beat firing');
+    runSweep('weekly beat', deps).catch((e) => console.error('[council] weekly beat failed:', e.message));
+  }, 30 * 60 * 1000);
+
   const names = SEATS.map((s) => s.name).join(', ');
-  console.log(`[council] attached — ${enabled() ? 'ENABLED' : `DISABLED (${disabledWhy()})`} (5 seats: ${names}; budget $${BUDGET_USD.toFixed(2)}/day; ${OWNER_ONLY ? 'owner-only' : 'OPEN'})`);
+  console.log(`[council] attached — ${enabled() ? 'ENABLED' : `DISABLED (${disabledWhy()})`} (5 seats: ${names}; budget $${BUDGET_USD.toFixed(2)}/day; ${OWNER_ONLY ? 'owner-only' : 'OPEN'}; weekly beat ${process.env.COUNCIL_BEAT_WEEKLY === '0' ? 'OFF' : 'ON (Sun 9am Central)'})`);
 }
 
 module.exports = { attachCouncil, _internals: { SEATS, CHARTER, readSpend, readMinutes, fmtUsd } };
