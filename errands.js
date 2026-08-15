@@ -589,7 +589,10 @@ async function runCallStep(errand, step, deps) {
   step.approvedNumber = null;
   step.pendingNumber = resolved.number;
   step.pendingName = resolved.name;
-  const ask = `You want me to call ${resolved.name} at ${prettyNumber(resolved.number)}, to ask ${String(step.why || 'about this errand').replace(/\.$/, '')}. Should I make that call?`;
+  /* Read out loud, so it is built as three short spoken sentences instead of
+   * one clause pile — the first version ran "to ask What are your store hours
+   * today?. Should I make that call?" straight together. */
+  const ask = `You want me to call ${resolved.name} at ${prettyNumber(resolved.number)}. What I'd ask them: ${sentence(step.why || 'about this errand')} Should I make that call?`;
   errand.pending = { ask, since: new Date().toISOString(), cursor: errand.cursor, kind: 'call_confirm' };
   addStep(errand, 'wait_confirm', `I stopped to ask before dialing anyone: ${ask}`, { ask, who: resolved.name, number: resolved.number, foundIn: resolved.from });
   setStatus(errand, 'awaiting_confirm', 'waiting on your yes before I call anyone');
@@ -613,6 +616,10 @@ async function placeCall(errand, step, deps) {
       agentId: errand.agentId || undefined,
       agentName: errand.agentName || 'Kiana',
       purpose: why,
+      // A call step is a call to a BUSINESS. Always take the greeting that
+      // names itself an A I and gives the recording notice, even if the number
+      // turns out to be in the family registry.
+      disclose: true,
       /* Mission material: what the errand already learned, so the agent has
        * facts instead of improvisation. Never her private notes. */
       context: findingsText(errand).slice(0, 3000) || undefined,

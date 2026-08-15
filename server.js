@@ -1897,7 +1897,7 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness, disclose } = req.body || {};
   // KADE July 2 2026: the model sometimes fills calleeName with junk like
   // "whoever it is" or "the person" — which produced the live gem
   // "Hi, is this whoever it is?". A name is only a name if it looks like one.
@@ -2053,10 +2053,19 @@ app.post('/outbound-call', async (req, res) => {
     }
   }
 
-  const ownAgent = !!(calleeRec && calleeRec.agentId === (agentId || DEFAULT_AGENT));
+  /* PART 66 (Aug 15 2026): `disclose:true` forces the stranger greeting — the
+   * one that names itself an A I and gives the recording notice — no matter
+   * who the number belongs to. The errands desk sets it on every call step,
+   * because a call_business step is a call to a BUSINESS by definition, and
+   * if the number happens to sit in the family registry the friendly "It's
+   * Kiana!" branch would quietly drop both the disclosure and the recording
+   * notice. Found by reading the transcript of the rung-2 smoke, which dialled
+   * Kade's OWN registered number and therefore took the friendly branch — a
+   * correct behaviour that would have been the wrong one on a real errand. */
+  const ownAgent = disclose !== true && !!(calleeRec && calleeRec.agentId === (agentId || DEFAULT_AGENT));
   const introText = ownAgent
     ? `It's ${agentName || DEFAULT_AGENT_NAME}! ${framePurpose(purpose)}`
-    : calleeRec
+    : (calleeRec && disclose !== true)
       ? `It's ${agentName || DEFAULT_AGENT_NAME} — ${spokenUserName}'s A I. ${framePurpose(purpose)}`
       : `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling for ` +
         `${spokenUserName}. This call may be recorded. ` +
