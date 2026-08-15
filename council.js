@@ -358,10 +358,16 @@ async function runSweep(trigger, deps) {
   const cap = await devboxSweep(SWEEP_PAGES, login.email ? login : null);
   const pages = cap.pages || [];
   const shots = pages.filter((p) => p.shot).map((p) => p.shot);
+  /* Every axe line is a rule being BROKEN. The first live sweep taught a
+   * hard lesson: axe's help text states the RULE ("Elements must only use
+   * supported ARIA attributes") and a flash-class seat read that as an
+   * achievement, then the composer promoted it to "fully accessible." A
+   * council that misreads receipts is worse than no council — so the
+   * framing is now unmissable. */
   const axeLines = pages.map((p) => {
-    if (p.error) return `${p.name}: capture failed (${p.error})`;
-    if (!p.axe || !p.axe.length) return `${p.name}: no violations found`;
-    return `${p.name}: ` + p.axe.map((v) => `${v.id} (${v.impact || 'minor'}, ${v.nodes} spot${v.nodes === 1 ? '' : 's'}) — ${v.help}`).join('; ');
+    if (p.error) return `${p.name}: capture FAILED (${p.error}) — no verdict possible for this page`;
+    if (!p.axe || !p.axe.length) return `${p.name}: CLEAN — zero violations`;
+    return `${p.name}: ` + p.axe.map((v) => `BROKEN RULE ${v.id} (${v.impact || 'minor'}, ${v.nodes} spot${v.nodes === 1 ? '' : 's'} failing): the rule says "${v.help}" and this page violates it right now`).join('; ');
   }).join('\n');
   const axeTotal = pages.reduce((a, p) => a + ((p.axe || []).reduce((b, v) => b + v.nodes, 0)), 0);
 
@@ -380,7 +386,7 @@ async function runSweep(trigger, deps) {
   /* Aria reads the REAL scan. */
   try {
     const aria = await callSeat(SEATS[0].model, `${CHARTER}\n\n${SEATS[0].mandate}${seatMemory(SEATS[0].key)}`,
-      `A real automated accessibility scan (axe-core) just ran on the platform's key web pages. Raw findings, one line per page:\n${axeLines}\n\nTHE COUNCIL'S LEDGER has already sorted these against past sweeps:\n${memLines}\n\nTranslate what matters into plain speech for Kade: lead with what's NEW, celebrate what's FIXED, give knowns one counting sentence at most, keep parked items silent. If nothing is new and nothing broke, say so happily — that is a win, not a failure to find something.`, 300);
+      `A real automated accessibility scan (axe-core) just ran on the platform's key web pages. READ CAREFULLY: every finding below is a rule currently BROKEN on that page — a problem, never an achievement. Only a line saying CLEAN means the page passed.\n${axeLines}\n\nTHE COUNCIL'S LEDGER has already sorted these against past sweeps:\n${memLines}\n\nTranslate what matters into plain speech for Kade: lead with what's NEW and broken, celebrate only what the ledger says was FIXED, give knowns one counting sentence at most, keep parked items silent. If nothing is new and nothing broke, say so happily — that is a win, not a failure to find something.`, 300);
     seatOut.push({ seat: SEATS[0].name, ok: true, text: aria.text }); cost += aria.cost;
   } catch (e) { seatOut.push({ seat: SEATS[0].name, ok: false, text: `${SEATS[0].name} couldn't read the scan (${e.message}).` }); }
   /* Prism sees the REAL screens. */
