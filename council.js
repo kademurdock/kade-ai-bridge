@@ -440,6 +440,184 @@ async function runSweep(trigger, deps) {
   return { stopped: false, entry, spokenSummary: composed };
 }
 
+
+/* ═══════════════ RUNG 3 (Part 71, Aug 16 2026, per the Part-68 plan) ═══════════════
+ * B. THE SHIP REVIEW — opt-in per ship, her call whether it ever becomes
+ *    standing duty. A session (or Forge) hands the council the artifact set
+ *    BEFORE the digest fires: what shipped, the help copy, the What's-New
+ *    draft. Five seats read it, one plain ship note comes back and lands in
+ *    the minutes. Text-only in this rung — Prism says plainly when it would
+ *    need a real screenshot to say more.
+ * C. VAULT'S MONTHLY SWEEP — the janitor-treasurer beat: money runways and
+ *    burn read from the SAME /platform-status she hears (receipts over
+ *    vibes, literally the same numbers), backup streak, crash ring, the
+ *    bridge volume's own housekeeping sizes, council + errand month spend,
+ *    and — when a caller attaches one — a fleet-model audit. Vault speaks
+ *    alone (one seat, no composer): a treasurer's report, not a debate.
+ *    Timer: 1st of the month, Central, after 10am, persisted on the volume;
+ *    kill switch COUNCIL_BEAT_VAULT=0; manual fire POST /council/vault-sweep.
+ * Charter unchanged: advisors never deciders; Vault PROPOSES cleanups, never
+ * executes; one digest max; budget gate BEFORE every spending step. */
+
+function selfPlatformStatus() {
+  /* The bridge asks ITSELF — same endpoint, same numbers she hears. Header
+   * auth per the July-13 rule (no secrets in query strings, even localhost). */
+  const http = require('http');
+  return new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port: process.env.PORT || 8080, path: '/platform-status', method: 'GET',
+      headers: { 'x-kade-secret': process.env.BRIDGE_SECRET || '' },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.setTimeout(20000, () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+function volumeHousekeeping() {
+  /* One level deep, honest sizes, biggest first — Vault's own closet. */
+  try {
+    const out = [];
+    for (const name of fs.readdirSync(DATA_DIR)) {
+      try {
+        const p = path.join(DATA_DIR, name);
+        const st = fs.statSync(p);
+        if (st.isDirectory()) {
+          let sum = 0;
+          for (const f of fs.readdirSync(p)) { try { sum += fs.statSync(path.join(p, f)).size; } catch { /* skip */ } }
+          out.push({ name: name + '/', bytes: sum });
+        } else out.push({ name, bytes: st.size });
+      } catch { /* skip unreadable */ }
+    }
+    out.sort((a, b) => b.bytes - a.bytes);
+    return out;
+  } catch { return []; }
+}
+
+function monthSpendFromLedgers() {
+  const month = new Date().toISOString().slice(0, 7);
+  let council = 0; let errands = 0;
+  try {
+    for (const l of fs.readFileSync(MINUTES_FILE, 'utf8').trim().split('\n')) {
+      try { const e = JSON.parse(l); if (String(e.at || '').slice(0, 7) === month) council += e.costUsd || 0; } catch { /* skip */ }
+    }
+  } catch { /* no minutes yet */ }
+  try {
+    for (const l of fs.readFileSync(path.join(DATA_DIR, 'errand-receipts.jsonl'), 'utf8').trim().split('\n')) {
+      try { const e = JSON.parse(l); if (String(e.at || '').slice(0, 7) === month) errands += e.costUsd || e.usd || 0; } catch { /* skip */ }
+    }
+  } catch { /* no errand receipts yet */ }
+  return { month, council: Math.round(council * 1e4) / 1e4, errands: Math.round(errands * 1e4) / 1e4 };
+}
+
+function fmtBytes(n) {
+  if (n > 1e9) return (n / 1e9).toFixed(1) + ' gigabytes';
+  if (n > 1e6) return (n / 1e6).toFixed(1) + ' megabytes';
+  if (n > 1e3) return Math.round(n / 1e3) + ' kilobytes';
+  return n + ' bytes';
+}
+
+async function runVaultSweep(trigger, fleet, deps) {
+  const spent = readSpend();
+  if (spent.usd >= BUDGET_USD) {
+    return { stopped: true, spokenSummary: `The council's daily budget is spent — ${fmtUsd(spent.usd)} of ${fmtUsd(BUDGET_USD)} — so Vault's sweep is stopping before it starts.` };
+  }
+  const [status] = await Promise.all([selfPlatformStatus()]);
+  const vol = volumeHousekeeping();
+  const ledgers = monthSpendFromLedgers();
+
+  const lines = [];
+  if (status && status.balances && status.balances.rows) {
+    for (const r of status.balances.rows) {
+      lines.push(`MONEY — ${r.name}: ${r.unit === '$' ? '$' + r.value : r.value + ' credits'} left, about ${r.runwayDays} day${r.runwayDays === 1 ? '' : 's'} at the current burn${r.low ? ' — BELOW ITS FLOOR, this is the headline' : ''}.`);
+    }
+  } else lines.push('MONEY — the balance read failed this pass; the runway watcher still guards it.');
+  if (status && status.spend && status.spend.rows) {
+    for (const r of status.spend.rows.slice(0, 5)) lines.push(`BURN — ${r.name}: ${r.spokenLine || (r.yesterday + ' yesterday vs ' + r.avg + ' average')}.`);
+  }
+  if (status && status.backups) lines.push(`BACKUPS — ${status.backups.ok ? 'green' : 'MISSING'}, latest ${status.backups.date}, ${fmtBytes(status.backups.size || 0)}.`);
+  if (status && status.canary) lines.push(`CANARY — ${status.canary.ok ? 'green' : 'FAILING'}, ${status.canary.greenStreak || 0} straight passes.`);
+  if (status && status.crashes) lines.push(`CRASHES — ${status.crashes.today || 0} today, ${status.crashes.yesterday || 0} yesterday; last was build ${status.crashes.lastBuild || 'unknown'}.`);
+  lines.push(`THIS MONTH'S COUNCIL SPEND — $${ledgers.council.toFixed(4)}; errand spend $${ledgers.errands.toFixed(4)} (month ${ledgers.month}).`);
+  const topVol = vol.slice(0, 8).map((v) => `${v.name} ${fmtBytes(v.bytes)}`).join(', ');
+  if (topVol) lines.push(`THE BRIDGE'S OWN CLOSET (data volume, biggest first) — ${topVol}.`);
+  if (fleet && fleet.total) {
+    const spread = Object.entries(fleet.counts || {}).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${n} on ${m}`).join(', ');
+    lines.push(`FLEET-MODEL AUDIT (fresh, attached by the caller) — ${fleet.total} agents: ${spread}.${fleet.note ? ' ' + fleet.note : ''}`);
+  }
+
+  let text = ''; let cost = 0;
+  try {
+    const vault = SEATS[3];
+    const r = await callSeat(vault.model, `${CHARTER}\n\n${vault.mandate}${seatMemory(vault.key)}`,
+      `Your monthly treasurer-and-janitor sweep, with real numbers gathered this minute (every line is a receipt, not a guess):\n${lines.join('\n')}\n\nSpeak your monthly report to Kade: lead with money and runways (if anything is below its floor, that IS the report's first sentence), then backups and crashes in a breath, then the one or two housekeeping observations that actually matter. PROPOSE at most two cleanups if any are worth her time — never more, and never execute. If the estate is simply healthy, say so with satisfaction and stop. Six to nine spoken sentences.`, 380);
+    text = r.text; cost = r.cost;
+  } catch (e) { text = `Vault's sweep gathered its numbers but the seat call failed (${e.message}); the raw lines are on the ledger.`; }
+
+  const day = addSpend(cost);
+  const entry = {
+    id: Math.random().toString(36).slice(2, 10), at: new Date().toISOString(), kind: 'vault-monthly', trigger,
+    pitch: `VAULT'S MONTHLY SWEEP (${trigger}) — balances, burn, backups, crashes, volume housekeeping${fleet && fleet.total ? ', fleet-model audit (' + fleet.total + ' agents)' : ''}`,
+    receipts: lines, seats: [{ seat: SEATS[3].name, ok: !!text, text }], composed: text,
+    costUsd: Math.round(cost * 1e6) / 1e6, dayUsd: day.usd,
+  };
+  appendMinutes(entry);
+  noteSeat(SEATS[3].key, `monthly sweep: ${text}`);
+  console.log(`[council] vault sweep ${entry.id} (${trigger}): ${lines.length} receipt lines, cost ${fmtUsd(cost)}, day total ${fmtUsd(day.usd)}`);
+  if (deps && deps.runNotify) {
+    try {
+      await deps.runNotify({
+        agentId: 'kade-council', agentName: 'The Council', urgent: false, userId: OWNER_ID, category: 'KADE_COUNCIL',
+        title: 'Vault\'s monthly sweep', body: 'Vault finished the monthly money-and-housekeeping sweep. Ask Kiana for the council\'s last minutes to hear it.',
+      });
+    } catch (e) { console.warn('[council] vault digest push failed:', e.message); }
+  }
+  return { stopped: false, entry, spokenSummary: text };
+}
+
+async function runShipReview(material) {
+  const spent = readSpend();
+  if (spent.usd >= BUDGET_USD) {
+    return { stopped: true, spokenSummary: `The council's daily budget is spent — ${fmtUsd(spent.usd)} of ${fmtUsd(BUDGET_USD)} — so the ship review is stopping before it starts.` };
+  }
+  const packet =
+    `A ship review, before anything reaches the family. What shipped: ${material.title}.\n\nThe plain description:\n${material.shipped}` +
+    (material.helpCopy ? `\n\nThe help copy the family will read:\n${material.helpCopy}` : '\n\n(No help copy attached — if this ship needed one, say so.)') +
+    (material.digestDraft ? `\n\nThe What's-New digest draft (under 300 characters, goes to every linked family phone):\n${material.digestDraft}` : '\n\n(No digest draft attached.)');
+  const results = await Promise.allSettled(SEATS.map((s) =>
+    callSeat(s.model, `${CHARTER}\n\n${s.mandate}${seatMemory(s.key)}`,
+      `${packet}\n\nReview this SHIP from your seat before it goes out: is anything unclear, risky, off-brand for a blind-first family platform, or simply missing? Text only this rung — say plainly if your seat would need a screenshot or a listen-through to say more. NO NOTES is a dignified verdict.`, 220)
+  ));
+  const seats = results.map((r, i) => ({
+    seat: SEATS[i].name, ok: r.status === 'fulfilled',
+    text: r.status === 'fulfilled' ? r.value.text : `${SEATS[i].name} couldn't answer this time (${r.reason && r.reason.message}).`,
+  }));
+  let cost = results.reduce((a, r) => a + (r.status === 'fulfilled' ? r.value.cost : 0), 0);
+  let composed = '';
+  try {
+    const comp = await callSeat(MODEL,
+      'You compose five council seat reviews of a SHIP (a feature about to reach a small family of non-technical users, owner is blind) into ONE plain spoken ship note, under 120 words, no markdown. Lead with whether the ship is good to go as-is; then the one or two notes that genuinely matter, naming which seat raised them; keep disagreements visible; if every seat said NO NOTES, say the ship is clean in one happy sentence. Close framing the go as hers.',
+      `${packet}\n\nThe seats said:\n\n${seats.map((s) => `${s.seat}: ${s.text}`).join('\n\n')}`, 260);
+    composed = comp.text; cost += comp.cost;
+  } catch (e) {
+    composed = 'The seats reviewed the ship but the composer stumbled; their notes are on the ledger one by one.';
+  }
+  const day = addSpend(cost);
+  const entry = {
+    id: Math.random().toString(36).slice(2, 10), at: new Date().toISOString(), kind: 'ship-review',
+    pitch: `SHIP REVIEW: ${String(material.title).slice(0, 200)}`,
+    seats, composed, costUsd: Math.round(cost * 1e6) / 1e6, dayUsd: day.usd,
+  };
+  appendMinutes(entry);
+  seats.forEach((s, i) => { if (s.ok) noteSeat(SEATS[i].key, `ship review "${String(material.title).slice(0, 50)}": ${s.text}`); });
+  console.log(`[council] ship review ${entry.id}: ${seats.filter((s) => s.ok).length}/${SEATS.length} seats, cost ${fmtUsd(cost)}, day total ${fmtUsd(day.usd)}`);
+  return { stopped: false, entry, spokenSummary: composed };
+}
+
 /* ---------- the pitch (fan out, compose, ledger) ---------- */
 async function runPitch(pitchText) {
   /* BUDGET GATE — before every spending step, errands-style. A pitch is
@@ -617,6 +795,39 @@ function attachCouncil(app, deps = {}) {
     res.json({ spokenSummary: spoken, findings: all });
   });
 
+  /* RUNG 3 routes (Part 71): the ship review (opt-in per ship) and Vault's
+   * monthly sweep (manual fire; the timer below owns the schedule). */
+  app.post('/council/ship-review', require('express').json({ limit: '64kb' }), async (req, res) => {
+    if (gate(req, res) === null) return;
+    const b = req.body || {};
+    const title = String(b.title || '').trim();
+    const shipped = String(b.shipped || '').trim();
+    if (title.length < 3 || shipped.length < 20) {
+      return res.status(400).json({ error: 'A ship review needs a title and a real plain-language description of what shipped.' });
+    }
+    try {
+      const out = await runShipReview({ title, shipped, helpCopy: String(b.helpCopy || '').slice(0, 8000), digestDraft: String(b.digestDraft || '').slice(0, 600) });
+      if (out.stopped) return res.json({ stopped: true, spokenSummary: out.spokenSummary });
+      res.json({ id: out.entry.id, spokenSummary: out.spokenSummary, seats: out.entry.seats, costUsd: out.entry.costUsd });
+    } catch (e) {
+      console.error('[council] ship review failed:', e.message);
+      res.status(502).json({ error: `The council could not review the ship: ${e.message}` });
+    }
+  });
+
+  app.post('/council/vault-sweep', require('express').json({ limit: '32kb' }), async (req, res) => {
+    if (gate(req, res) === null) return;
+    const b = req.body || {};
+    try {
+      const out = await runVaultSweep(String(b.trigger || 'her ask'), b.fleet || null, deps);
+      if (out.stopped) return res.json({ stopped: true, spokenSummary: out.spokenSummary });
+      res.json({ id: out.entry.id, spokenSummary: out.spokenSummary, costUsd: out.entry.costUsd });
+    } catch (e) {
+      console.error('[council] vault sweep failed:', e.message);
+      res.status(502).json({ error: `Vault could not sweep: ${e.message}` });
+    }
+  });
+
   /* WEEKLY BEAT (her word, Aug 15: live now, Sunday mornings, on HER
    * platform). Central-time Sunday after 9am, once per week, persisted on
    * the volume so restarts can't double-fire. Kill: COUNCIL_BEAT_WEEKLY=0. */
@@ -635,8 +846,24 @@ function attachCouncil(app, deps = {}) {
     runSweep('weekly beat', deps).catch((e) => console.error('[council] weekly beat failed:', e.message));
   }, 30 * 60 * 1000);
 
+
+  /* VAULT'S MONTHLY BEAT (rung 3): 1st of the month, Central, after 10am,
+   * once, persisted on the volume. Kill: COUNCIL_BEAT_VAULT=0. */
+  setInterval(() => {
+    if (process.env.COUNCIL_BEAT_VAULT === '0' || !enabled()) return;
+    const c = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+    if (c.getDate() !== 1 || c.getHours() < 10) return;
+    const monthKey = `${c.getFullYear()}-m${c.getMonth() + 1}`;
+    const beats = readBeats();
+    if (beats.lastVaultMonthly === monthKey) return;
+    beats.lastVaultMonthly = monthKey;
+    try { fs.writeFileSync(BEATS_FILE, JSON.stringify(beats)); } catch (e) { console.error('[council] beats save:', e.message); return; }
+    console.log('[council] vault monthly beat firing');
+    runVaultSweep('monthly beat', null, deps).catch((e) => console.error('[council] vault monthly failed:', e.message));
+  }, 30 * 60 * 1000);
+
   const names = SEATS.map((s) => s.name).join(', ');
-  console.log(`[council] attached — ${enabled() ? 'ENABLED' : `DISABLED (${disabledWhy()})`} (5 seats: ${names}; budget $${BUDGET_USD.toFixed(2)}/day; ${OWNER_ONLY ? 'owner-only' : 'OPEN'}; weekly beat ${process.env.COUNCIL_BEAT_WEEKLY === '0' ? 'OFF' : 'ON (Sun 9am Central)'})`);
+  console.log(`[council] attached — ${enabled() ? 'ENABLED' : `DISABLED (${disabledWhy()})`} (5 seats: ${names}; budget $${BUDGET_USD.toFixed(2)}/day; ${OWNER_ONLY ? 'owner-only' : 'OPEN'}; weekly beat ${process.env.COUNCIL_BEAT_WEEKLY === '0' ? 'OFF' : 'ON (Sun 9am Central)'}; vault monthly ${process.env.COUNCIL_BEAT_VAULT === '0' ? 'OFF' : 'ON (1st, 10am Central)'}; ship-review lane ready)`);
 }
 
 module.exports = { attachCouncil, _internals: { SEATS, CHARTER, readSpend, readMinutes, fmtUsd } };
