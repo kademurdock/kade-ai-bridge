@@ -486,11 +486,35 @@ function crashWhoPhrase(entries) {
   if (names.length === 2) return ` — ${names[0]} and ${names[1]}`;
   return ` — ${names[0]} and ${names.length - 1} others`;
 }
-app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
+/* ⭐ Aug 18 2026 — THE CAP THAT WAS EATING HER CRASH REPORTS.
+ *
+ * This route carried a hard 20-per-UTC-day limit. One freeze produces FOUR
+ * ring entries (1 crash + ~3 clean-exit sentinels), so the cap was really
+ * "five freezes a day" — and on Aug 18, mid-freeze-hunt across builds
+ * 210→217, she blew through it before lunch. Every report after that was
+ * 429'd and dropped, which is why the ring went byte-for-byte identical while
+ * she was still crashing and still telling us about it. The app was faithful;
+ * its own sink was refusing. A rate limit whose failure mode is "lose exactly
+ * the diagnostics you are hunting" is the wrong limit.
+ *
+ * Now env-tunable (`DIAG_MAX_PER_DAY`) and defaulted 10x higher. It is still
+ * a real cap — this route is deliberately no-auth so the app never needs a
+ * secret to tell on itself, and an unbounded no-auth sink is an invitation.
+ *
+ * The route-level 64kb parser is also raised to match the global 600kb one.
+ * It was dead code (express.json no-ops when req.body is already parsed, and
+ * the global parser at the top of this file runs first) but it read as a real
+ * 64KB ceiling to anyone auditing this route, and real payloads are
+ * 100–300KB. */
+const DIAG_MAX_PER_DAY = Number(process.env.DIAG_MAX_PER_DAY || 200);
+app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     if (diagDayStamp !== today) { diagDayStamp = today; diagDayCount = 0; }
-    if (++diagDayCount > 20) return res.status(429).json({ ok: false });
+    if (++diagDayCount > DIAG_MAX_PER_DAY) {
+      console.warn(`[diag] DROPPED a report — daily cap ${DIAG_MAX_PER_DAY} reached (raise DIAG_MAX_PER_DAY)`);
+      return res.status(429).json({ ok: false, reason: 'daily cap' });
+    }
     const b = req.body || {};
     const entry = {
       at: new Date().toISOString(),
@@ -504,7 +528,16 @@ app.post('/diagnostics', express.json({ limit: '64kb' }), (req, res) => {
       breadcrumbs: String(b.breadcrumbs || '').slice(0, 4000),
     };
     diagRing.push(entry);
-    while (diagRing.length > 20) diagRing.shift();
+    /* ⭐ Aug 18 2026: the ring was 20 entries, evicted oldest-first. Because a
+     * single freeze writes ~3 cheap `abnormal` sentinels alongside its ONE
+     * expensive `crash` payload, a busy day pushed the payloads carrying the
+     * actual stack traces out of the ring while the sentinels survived. Now
+     * 40 deep, and eviction takes the oldest ABNORMAL first — a crash entry
+     * is only dropped when there is nothing cheaper left to drop. */
+    while (diagRing.length > 40) {
+      const i = diagRing.findIndex((e) => e.kind !== 'crash');
+      diagRing.splice(i >= 0 ? i : 0, 1);
+    }
     saveDiagRing();
     // The durable copy: a summary line in the deploy logs. Pull the crash
     // signature out of MetricKit's shape when parseable.
