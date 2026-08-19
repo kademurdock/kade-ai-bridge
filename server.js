@@ -3438,7 +3438,8 @@ setInterval(async () => {
 //   summary        daily  08:00   (KADE DREAMING relationship summaries + decay)
 //   restart        daily  10:00   (memory-hygiene exit; fork refuses if booted <2h)
 //   files          daily  11:00   (expired-file sweep)
-//   consolidation  weekly Sun 09:00 (platform-wide memory consolidation — NOTE:
+//   consolidation  DAILY 09:00 (Aug 19 2026; was weekly Sun. CLOCK_CONSOLIDATE_DOW=0
+//                  restores Sunday-only.) platform-wide memory consolidation — NOTE:
 //                  this replaces BOTH the fork's sweep and the bucket-list
 //                  MEMCONSOLIDATE timer above; keep MEMCONSOLIDATE_ENABLED=false)
 //
@@ -3447,11 +3448,36 @@ setInterval(async () => {
 // volume-persisted so redeploys can't double-fire dailies. Fail-soft: a failed
 // poke logs and retries next tick — never touches calls/SMS.
 const CLOCK_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'kadeclock.json');
+/* ⭐⭐ CONSOLIDATION CADENCE (Aug 19 2026, her call: "make it daily
+ * consolidation if it doesn't cost too much").
+ *
+ * It was Sunday-only (`weeklyDowUTC: 0`). Meanwhile the FORK carried
+ * MEMORY_CONSOLIDATION_SWEEP_DAY=daily — but that whole path is inert under
+ * KADE_CLOCK_EXTERNAL=1, so the intent said daily and the platform did weekly.
+ * This is the knob that actually governs it.
+ *
+ * THE COST, MEASURED BEFORE FLIPPING IT (she asked, and on a fixed income the
+ * number matters): 21 active memory buckets, 108,719 chars of live cards
+ * (~27K tokens). The memory agent is deepseek-v4-flash at $0.082 in /
+ * $0.165 out per million. One full pass is roughly a CENT; going from weekly
+ * to daily adds six runs a week, about **26 cents a month**. Next to the
+ * memory writer that already fires after every single turn platform-wide,
+ * this is a rounding error.
+ *
+ * REVERT WITHOUT A DEPLOY: CLOCK_CONSOLIDATE_DOW=0 restores Sunday-only
+ * (or any 0-6 for a different weekday). 'daily' / '*' / '-1' = every day. */
+function clockConsolidateDow() {
+  const raw = String(process.env.CLOCK_CONSOLIDATE_DOW ?? 'daily').trim().toLowerCase();
+  if (raw === 'daily' || raw === '*' || raw === '-1' || raw === 'everyday') return undefined;
+  const n = parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 6 ? n : undefined;
+}
+
 const CLOCK_JOBS = [
   { name: 'summary', hourEnv: 'CLOCK_SUMMARY_HOUR', defHour: 8 },
   { name: 'restart', hourEnv: 'CLOCK_RESTART_HOUR', defHour: 10 },
   { name: 'files', hourEnv: 'CLOCK_FILES_HOUR', defHour: 11 },
-  { name: 'consolidation', hourEnv: 'CLOCK_CONSOLIDATE_HOUR', defHour: 9, weeklyDowUTC: 0 },
+  { name: 'consolidation', hourEnv: 'CLOCK_CONSOLIDATE_HOUR', defHour: 9, weeklyDowUTC: clockConsolidateDow() },
 ];
 let clockState = {};
 try { clockState = JSON.parse(fs.readFileSync(CLOCK_FILE, 'utf8')); } catch { /* first run */ }
