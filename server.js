@@ -4073,6 +4073,30 @@ const BALANCE_WATCH_FILE = path.join(
 const BALANCE_WATCH_HHMM = process.env.BALANCE_WATCH_HHMM || '07:30';
 const BALANCE_RUNWAY_DAYS = parseInt(process.env.BALANCE_RUNWAY_DAYS || '14', 10);
 
+/* ⭐ Aug 19 2026 — A POT THAT CARRIES NOTHING MUST NOT BE ABLE TO MAKE THE
+ * WHOLE ESTATE REPORT "not ok".
+ *
+ * On Aug 18 the fleet left Moonshot entirely: 221 agents to `z-ai/glm-5.2`
+ * and the two vision agents (Describe-It, Whittney) to
+ * `google/gemini-3.1-flash-lite`, both on the OpenRouter pot. Moonshot's
+ * $4.30 is a TRUE reading of a DEAD pot — nothing bills against it and
+ * nothing breaks when it empties — but the watch kept calling it an
+ * emergency, `/platform-status` kept answering `ok: false`, and that is
+ * precisely how a real alert gets missed one day.
+ *
+ * Her word, Aug 19: silence it. Skipped pots keep their READING (so she can
+ * still ask what is in there and a future session can still see it) but can
+ * never be `low`, never fire a push, and never drag `ok` down.
+ *
+ * RE-ARM: set `BALANCE_WATCH_SKIP=` (empty) on the bridge service, or list
+ * whichever keys should be ignored instead. Nothing else changes. */
+const BALANCE_WATCH_SKIP = new Set(
+  String(process.env.BALANCE_WATCH_SKIP ?? 'moonshot')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+
 // floor = dollars (or Flux credits). plain = how she'd say what breaks.
 const BALANCE_FLOORS = [
   { key: 'moonshot',   name: 'Moonshot',    floor: parseFloat(process.env.FLOOR_MOONSHOT   || '12'), unit: '$', plain: 'every character on the platform stops answering' },
@@ -4126,6 +4150,20 @@ async function assessBalances() {
     const burn = burnRateFor(p.key);
     const runway = burn ? value / burn : null;
     let low = false, reason = null;
+    // Skipped pots still report their reading; they just cannot raise alarm.
+    if (BALANCE_WATCH_SKIP.has(p.key)) {
+      rows.push({
+        ...p,
+        value: Math.round(value * 100) / 100,
+        dollars: p.unit === 'credits' ? Math.round(value) / 100 : Math.round(value * 100) / 100,
+        burnPerDay: burn ? Math.round(burn * 100) / 100 : null,
+        runwayDays: runway ? Math.floor(runway) : null,
+        low: false,
+        reason: null,
+        note: 'not watched — nothing runs on this pot',
+      });
+      continue;
+    }
     if (value <= p.floor) {
       low = true;
       reason = `down to ${fmtProviderAmount(value, p.unit)}`;
@@ -4171,7 +4209,17 @@ async function balanceWatchTick() {
   balanceWatchState.last = { at: new Date().toISOString(), rows };
 
   const troubled = rows.filter((r) => r.low);
-  const recovered = rows.filter((r) => !r.low && r.value != null && balanceWatchState.alerted[r.key]);
+  /* A pot that was silenced (BALANCE_WATCH_SKIP) is not a pot that RECOVERED.
+   * Moonshot was mid-alert when it was skipped, so without this it would have
+   * pushed "Topped up — Moonshot back above the line" on the next sweep, which
+   * is flatly untrue: it is still at $4.30 and simply no longer matters. Clear
+   * its alert state quietly and say nothing. */
+  const recovered = rows.filter(
+    (r) => !r.low && r.value != null && balanceWatchState.alerted[r.key] && !BALANCE_WATCH_SKIP.has(r.key)
+  );
+  for (const r of rows) {
+    if (BALANCE_WATCH_SKIP.has(r.key)) delete balanceWatchState.alerted[r.key];
+  }
 
   for (const r of recovered) delete balanceWatchState.alerted[r.key];
   const fresh = troubled.filter((r) => balanceWatchState.alerted[r.key] !== today);
