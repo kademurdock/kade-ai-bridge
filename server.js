@@ -4144,6 +4144,40 @@ function saveBalanceWatchState() {
 
 /** Average daily burn for one provider from the snapshot history (null if unknowable). */
 function burnRateFor(key) {
+  const r = burnProfileFor(key);
+  return r ? r.avg : null;
+}
+
+/* ⭐ BURST-AWARE BURN (Aug 20 2026 — Kade: "Why is it burning seventeen creds
+ * a day. I thought flux was just for creating avis for agents and it's not
+ * like people are ever hardly making their own agents yet.")
+ *
+ * She was right and the number was lying. Flux read 17.14 credits/day and
+ * "about 4 days left" while the balance had not moved in two days. The cause
+ * is the statistic, not the spending:
+ *
+ *   - snapshots land ONCE A DAY, so each delta is one day's spend
+ *   - the rate is the MEAN of the last 14 deltas
+ *   - image generation is BURSTY by nature. You generate a batch of avatars
+ *     one afternoon and then nothing for weeks.
+ *
+ * One 240-credit afternoon divided by 14 days = 17.14/day, and that ghost
+ * keeps the alarm lit for a fortnight after the spending stopped. (17.14 x 14
+ * = 240 almost exactly, which is how this was found.) A mean is simply the
+ * wrong summary for a pot that is spent in bursts.
+ *
+ * The fix is NOT to switch to a median — with 12 quiet days out of 14 that
+ * reads 0 and the alarm could never fire at all. Instead: keep the 14-day
+ * mean as the honest "if this pattern continues" figure, compute a RECENT
+ * rate beside it, and let the two disagree out loud.
+ *
+ * Alarm rule now: the absolute floor ALWAYS fires (that one is unambiguous).
+ * The runway projection only fires if something has actually been spent
+ * recently. A pot sitting still above its floor is not an emergency, and
+ * telling her it is on a fixed income is worse than saying nothing. */
+const BURN_RECENT_DAYS = 3;
+
+function burnProfileFor(key) {
   const hist = readBalanceHistory();
   if (hist.length < 3) return null;
   const days = hist.filter((h) => h[key] != null);
@@ -4156,7 +4190,20 @@ function burnRateFor(key) {
   if (!deltas.length) return null;
   const window = deltas.slice(-14);
   const avg = window.reduce((a, b) => a + b, 0) / window.length;
-  return avg > 0.0001 ? avg : null;
+  const recentWindow = deltas.slice(-BURN_RECENT_DAYS);
+  const recent = recentWindow.reduce((a, b) => a + b, 0) / recentWindow.length;
+  const spentRecently = recentWindow.some((d) => d > 0.0001);
+  // A single day carrying most of the fortnight's spend = a burst, not a rate.
+  const peak = Math.max(...window);
+  const total = window.reduce((a, b) => a + b, 0);
+  const bursty = total > 0 && peak / total >= 0.6;
+  return {
+    avg: avg > 0.0001 ? avg : null,
+    recent: recent > 0.0001 ? recent : 0,
+    spentRecently,
+    bursty,
+    days: window.length,
+  };
 }
 
 /** Read every provider and decide, per provider, whether it is in trouble. */
@@ -4173,9 +4220,10 @@ async function assessBalances() {
       rows.push({ ...p, value: null, low: false, reason: null, note: 'no reading' });
       continue;
     }
-    const burn = burnRateFor(p.key);
+    const profile = burnProfileFor(p.key);
+    const burn = profile ? profile.avg : null;
     const runway = burn ? value / burn : null;
-    let low = false, reason = null;
+    let low = false, reason = null, quiet = null;
     // Skipped pots still report their reading; they just cannot raise alarm.
     if (BALANCE_WATCH_SKIP.has(p.key)) {
       rows.push({
@@ -4194,16 +4242,26 @@ async function assessBalances() {
       low = true;
       reason = `down to ${fmtProviderAmount(value, p.unit)}`;
     } else if (runway != null && runway <= BALANCE_RUNWAY_DAYS) {
-      low = true;
-      reason = `about ${Math.floor(runway)} day${Math.floor(runway) === 1 ? '' : 's'} left at the current rate (${fmtProviderAmount(value, p.unit)} left, ${p.unit === 'credits' ? Math.round(burn) + ' credits' : '$' + burn.toFixed(2)} a day)`;
+      if (profile && !profile.spentRecently) {
+        // The projection is a ghost: a burst inside the 14-day window with
+        // nothing spent since. Report it, do not raise an alarm on it.
+        reason = null;
+        quiet = `${fmtProviderAmount(value, p.unit)} left and nothing spent in ${BURN_RECENT_DAYS} days — the ${Math.floor(runway)}-day figure is one busy day still inside the ${profile.days}-day average, not a current rate`;
+      } else {
+        low = true;
+        reason = `about ${Math.floor(runway)} day${Math.floor(runway) === 1 ? '' : 's'} left at the current rate (${fmtProviderAmount(value, p.unit)} left, ${p.unit === 'credits' ? Math.round(burn) + ' credits' : '$' + burn.toFixed(2)} a day)`;
+      }
     }
     rows.push({
       ...p,
       value: Math.round(value * 100) / 100,
       dollars: p.unit === 'credits' ? Math.round(value) / 100 : Math.round(value * 100) / 100,
       burnPerDay: burn ? Math.round(burn * 100) / 100 : null,
+      recentPerDay: profile ? Math.round(profile.recent * 100) / 100 : null,
+      spentRecently: profile ? profile.spentRecently : null,
+      bursty: profile ? profile.bursty : null,
       runwayDays: runway ? Math.floor(runway) : null,
-      low, reason,
+      low, reason, quiet,
     });
   }
   return rows;
@@ -4288,12 +4346,21 @@ function balanceStatusForSpeech() {
   const last = balanceWatchState.last;
   if (!last) return { section: { enabled: true, checkedAt: null, note: 'not swept yet' }, spoken: '' };
   const low = last.rows.filter((r) => r.low);
+  const quietOnes = last.rows.filter((r) => !r.low && r.quiet);
   const known = last.rows.filter((r) => r.value != null);
   return {
     section: { enabled: true, checkedAt: last.at, rows: last.rows, low: low.map((r) => r.name) },
     spoken: low.length
       ? `Money: ${low.map((r) => `${r.name} is ${r.reason}`).join('; ')}.`
       : (known.length ? 'Money: every account is comfortably above its floor.' : ''),
+    /* Aug 20 2026: pots whose runway projection looks alarming but whose
+     * recent spend is zero. She should still HEAR the number -- staying quiet
+     * about it is how a real drain would hide -- but it must not be delivered
+     * as an alarm, because it is a burst still inside the 14-day average
+     * rather than anything happening now. */
+    quiet: quietOnes.length
+      ? `Worth knowing, not urgent: ${quietOnes.map((r) => `${r.name} has ${r.quiet}`).join('; ')}.`
+      : '',
   };
 }
 
@@ -4362,7 +4429,7 @@ app.get('/platform-status', async (req, res) => {
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, balances.spoken, spendSpoken].filter(Boolean).join(' '),
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
       crashes: crash.section,
