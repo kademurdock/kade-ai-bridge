@@ -4157,6 +4157,13 @@ if (CANARY_ENABLED) {
  * NEVER throws: every path returns plain sentences (a thrown tool error feeds
  * the parked graph bug's dead-air failure). Kill: MEDIA_SENSES=0. */
 const MEDIA_MODEL = process.env.MEDIA_MODEL || 'gemini-3.6-flash';
+/* Part 82 addendum (her word: "we probably have more money on open router...
+ * consider using that pot"): PRIMARY is now OpenRouter — probe-receipted that
+ * OR's google/gemini-3.7-flash ingests YouTube URLs via the video_url content
+ * part (8s, correct treadmills AND instrumentation), at HALF the 3.6 sticker,
+ * billing the idle $50 pot. The Google-native path below stays as the
+ * FALLBACK, so the lane sits on two pots. */
+const MEDIA_OR_MODEL = process.env.MEDIA_OR_MODEL || 'google/gemini-3.7-flash';
 const MEDIA_DAILY_CAP = Math.max(1, parseInt(process.env.MEDIA_DAILY_CAP || '20', 10));
 const MEDIA_MAX_SECONDS = Math.max(60, parseInt(process.env.MEDIA_MAX_SECONDS || '600', 10));
 const MEDIA_MAX_FILE_BYTES = 15 * 1024 * 1024;
@@ -4167,14 +4174,32 @@ function mediaSecretOk(req, provided) {
   return (s && h === s) || (BRIDGE_SECRET && h === BRIDGE_SECRET);
 }
 const MEDIA_PROMPT = (focus) =>
-  'You are the eyes and ears for a blind listener. Describe this media accurately and concretely, in plain prose ' +
-  'with no markdown, no headers, no bullet symbols. Cover two things. THE PICTURE (skip if audio-only): what is ' +
-  'physically on screen and what happens, in order — people, movement, setting, camera, text on screen — the way ' +
-  "you'd narrate to someone who will never see it. THE SOUND: the instrumentation and production — name the " +
-  'instruments you actually hear, the rhythm and tempo feel, the vocal style, how the arrangement builds and ' +
-  'changes section by section, with rough timestamps for the big turns. Quote lyrics only sparingly, a line or ' +
-  'two where they matter. Never invent details you did not perceive; when unsure, say unsure. If the media seems ' +
-  'to continue past what you were given, say plainly that you described the first stretch.' +
+  /* Rebuilt on the platform's own researched describer doctrine (Part 82
+   * addendum) — the Scout/Spotter protocol (Aira-style, video-description
+   * manuals) + Describe-It's theatre-describer craft, adapted from live
+   * camera work to recorded media. Her word: "the eyes should know those
+   * things too." */
+  'You are the eyes and ears for a blind listener, describing recorded media the way a trained audio describer ' +
+  'would: present tense, active voice, in the order things happen, precise, no filler. ' +
+  'THE PICTURE (skip entirely if this is audio-only): big picture first — one sentence naming what kind of thing ' +
+  'this is (official music video, live performance, lyric video, home footage) and the overall setting. Then ' +
+  'narrate what happens in order, leading each beat with what a sighted eye lands on first. Be concrete and ' +
+  'functional: always give colors, made useful and comparative; give spatial layout (left, right, foreground, ' +
+  'behind); read on-screen text VERBATIM in quotes; mention camera behavior only when it matters (one unbroken ' +
+  'shot, a sudden cut to black). People: how many, where they are, what they are doing, expressions as observed ' +
+  '("smiling broadly", never "happy"), clothing with color, observable traits described evenly for everyone with ' +
+  'hedged identity language ("appears to be"). Name things consistently — once "the drummer", always "the ' +
+  'drummer". Report what you see and label what you infer ("to my eye..."). Translate purely visual moments into ' +
+  'practical meaning for someone who may never have seen ("the back wall is mirrored foil, so every move doubles ' +
+  'in the reflection"). ' +
+  'THE SOUND: name only the instruments you actually hear. Walk the arrangement section by section — intro, ' +
+  'verse, chorus, bridge, outro — with rough timestamps at the big turns. Describe the production texture ' +
+  '(tight or roomy, clean or distorted, sparse or layered), the rhythm and tempo feel, and the vocal delivery. ' +
+  'Quote lyrics sparingly — a line or two only where they matter. ' +
+  'DISCIPLINE: never invent a sight or a sound; state uncertainty plainly ("I cannot make out the text on his ' +
+  'shirt"); no editorializing and no cheerleading — the listener decides what is beautiful; everyday words; ' +
+  'plain prose only, no markdown, no headers, no bullet symbols. If the media clearly continues past what you ' +
+  'took in, say plainly that you described the first stretch.' +
   (focus ? ` The listener especially wants to know about: ${String(focus).slice(0, 200)}.` : '');
 app.post('/media/describe', async (req, res) => {
   try {
@@ -4221,6 +4246,62 @@ app.post('/media/describe', async (req, res) => {
       parts.push({ inlineData: { mimeType: mime, data: buf.toString('base64') } });
     }
     parts.push({ text: MEDIA_PROMPT(b.focus) });
+
+    /* ── PRIMARY: OpenRouter (her word — burn the idle pot). video_url carries
+     * YouTube links AND direct video-file URLs; downloaded audio rides
+     * input_audio when the format allows. Any failure falls through to the
+     * Google-native path below, so the lane stands on two pots. */
+    const orKey = process.env.OPENROUTER_KEY;
+    if (orKey) {
+      let orMedia = null;
+      if (yt) {
+        orMedia = { type: 'video_url', video_url: { url } };
+      } else {
+        const ext2 = (url.split('?')[0].split('.').pop() || '').toLowerCase();
+        if (['mp4', 'mov', 'webm'].includes(ext2)) {
+          orMedia = { type: 'video_url', video_url: { url } };
+        } else if (['mp3', 'wav'].includes(ext2)) {
+          const b64 = parts[0] && parts[0].inlineData && parts[0].inlineData.data;
+          if (b64) orMedia = { type: 'input_audio', input_audio: { data: b64, format: ext2 === 'mp3' ? 'mp3' : 'wav' } };
+        }
+        /* m4a/ogg/flac/aac: OR's input_audio formats don't cover them — skip
+         * straight to Google inline, which takes any mime. */
+      }
+      if (orMedia) {
+        const tOr = Date.now();
+        try {
+          const g = await axios.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              model: MEDIA_OR_MODEL,
+              messages: [{ role: 'user', content: [orMedia, { type: 'text', text: MEDIA_PROMPT(b.focus) }] }],
+            },
+            {
+              timeout: 120000,
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${orKey}`,
+                'HTTP-Referer': 'https://kademurdock.com',
+                'X-Title': 'Kade-AI media senses',
+              },
+            },
+          );
+          const txt = (((g.data || {}).choices || [])[0] || {}).message && g.data.choices[0].message.content;
+          const clean = typeof txt === 'string' ? txt.trim() : '';
+          if (clean) {
+            mediaDaily.counts.set(userId, used + 1);
+            const secsOr = Math.round((Date.now() - tOr) / 1000);
+            console.log(`[media] described ${yt ? 'youtube' : 'file'} via OPENROUTER (${MEDIA_OR_MODEL}) for user=${userId.slice(0, 8)} in ${secsOr}s (${((g.data || {}).usage || {}).prompt_tokens || '?'} prompt tokens)`);
+            return res.json({ ok: true, description: clean.slice(0, 12000), model: MEDIA_OR_MODEL, pot: 'openrouter', seconds: secsOr });
+          }
+          console.warn('[media] OpenRouter answered empty — falling through to the Google-native path');
+        } catch (e) {
+          const detail = (e.response && e.response.data && JSON.stringify(e.response.data).slice(0, 160)) || e.message;
+          console.warn(`[media] OpenRouter path failed (${detail}) — falling through to Google-native`);
+        }
+      }
+    }
+
     const key = process.env.GOOGLE_LIVE_API_KEY;
     if (!key) return res.json({ ok: false, description: 'The media lane is missing its key — tell Kade.' });
     const t0 = Date.now();
