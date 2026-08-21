@@ -4220,6 +4220,33 @@ app.post('/media/describe', async (req, res) => {
       return res.json({ ok: false, description: `That's the daily limit for media lookups (${MEDIA_DAILY_CAP} a day) — try again tomorrow.` });
     }
     const yt = /^(https?:\/\/)(www\.|m\.|music\.)?(youtube\.com\/(watch\?|shorts\/)|youtu\.be\/)/i.test(url);
+
+    /* METADATA GROUNDING (Part 82 addendum 2 — the first live bug, filed by
+     * KIANA HERSELF via kade_feedback on Amber A's seat, 19:35Z day one: the
+     * description was rich but carried no title/channel, so she couldn't
+     * identify the song and guessed wrong. The title isn't in the pixels —
+     * it comes from YouTube's own keyless oEmbed. Best-effort: a miss never
+     * blocks the describe. The verified line is prepended SERVER-SIDE so no
+     * model can mangle it, and handed to the model so the description aligns
+     * with the real identity instead of guessing. */
+    let meta = null;
+    if (yt) {
+      try {
+        const oe = await axios.get('https://www.youtube.com/oembed', {
+          params: { url, format: 'json' },
+          timeout: 6000,
+          headers: { 'User-Agent': BROWSER_UA },
+        });
+        if (oe.data && oe.data.title) meta = { title: String(oe.data.title).slice(0, 200), channel: String(oe.data.author_name || '').slice(0, 120) };
+      } catch (e) {
+        console.warn(`[media] oEmbed miss for ${url.slice(0, 60)}: ${e.message}`);
+      }
+    }
+    const metaNote = meta
+      ? ` VERIFIED METADATA from YouTube itself — trust this over any guess and never contradict it: the video's title is "${meta.title}"${meta.channel ? ` and the channel is "${meta.channel}"` : ''}. Do not repeat the title back as a discovery; the listener will already have it.`
+      : '';
+    const metaPrefix = meta ? `"${meta.title}"${meta.channel ? ` — ${meta.channel}` : ''} (title and channel verified from YouTube's own metadata)\n\n` : '';
+
     const parts = [];
     if (yt) {
       parts.push({
@@ -4245,7 +4272,7 @@ app.post('/media/describe', async (req, res) => {
       }
       parts.push({ inlineData: { mimeType: mime, data: buf.toString('base64') } });
     }
-    parts.push({ text: MEDIA_PROMPT(b.focus) });
+    parts.push({ text: MEDIA_PROMPT(b.focus) + metaNote });
 
     /* ── PRIMARY: OpenRouter (her word — burn the idle pot). video_url carries
      * YouTube links AND direct video-file URLs; downloaded audio rides
@@ -4274,7 +4301,7 @@ app.post('/media/describe', async (req, res) => {
             'https://openrouter.ai/api/v1/chat/completions',
             {
               model: MEDIA_OR_MODEL,
-              messages: [{ role: 'user', content: [orMedia, { type: 'text', text: MEDIA_PROMPT(b.focus) }] }],
+              messages: [{ role: 'user', content: [orMedia, { type: 'text', text: MEDIA_PROMPT(b.focus) + metaNote }] }],
             },
             {
               timeout: 120000,
@@ -4292,7 +4319,7 @@ app.post('/media/describe', async (req, res) => {
             mediaDaily.counts.set(userId, used + 1);
             const secsOr = Math.round((Date.now() - tOr) / 1000);
             console.log(`[media] described ${yt ? 'youtube' : 'file'} via OPENROUTER (${MEDIA_OR_MODEL}) for user=${userId.slice(0, 8)} in ${secsOr}s (${((g.data || {}).usage || {}).prompt_tokens || '?'} prompt tokens)`);
-            return res.json({ ok: true, description: clean.slice(0, 12000), model: MEDIA_OR_MODEL, pot: 'openrouter', seconds: secsOr });
+            return res.json({ ok: true, description: (metaPrefix + clean).slice(0, 12000), title: meta && meta.title, channel: meta && meta.channel, model: MEDIA_OR_MODEL, pot: 'openrouter', seconds: secsOr });
           }
           console.warn('[media] OpenRouter answered empty — falling through to the Google-native path');
         } catch (e) {
@@ -4345,7 +4372,7 @@ app.post('/media/describe', async (req, res) => {
     mediaDaily.counts.set(userId, used + 1);
     const secs = Math.round((Date.now() - t0) / 1000);
     console.log(`[media] described ${yt ? 'youtube' : 'file'} for user=${userId.slice(0, 8)} in ${secs}s (${(out.usageMetadata || {}).promptTokenCount || '?'} prompt tokens)`);
-    return res.json({ ok: true, description: text.slice(0, 12000), model: MEDIA_MODEL, seconds: secs });
+    return res.json({ ok: true, description: (metaPrefix + text).slice(0, 12000), title: meta && meta.title, channel: meta && meta.channel, model: MEDIA_MODEL, pot: 'google', seconds: secs });
   } catch (e) {
     console.error('[media] route error:', e.message);
     return res.json({ ok: false, description: 'Something went sideways taking that media in — try once more, and if it keeps failing tell Kade.' });
