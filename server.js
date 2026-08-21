@@ -4005,15 +4005,27 @@ const CANARY_URGENT = process.env.CANARY_URGENT === '1';
 const CANARY_ADMIN_USER = process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7';
 const CANARY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'canary-state.json');
 
+/* Aug 21 2026 FALSE-ALARM FIX #2 (same disease as Aug 11's): the health test
+ * was LENGTH (<10 chars = "wordless-turn class"), and the 5.3 fleet is terser
+ * than K3 ever was. At 16:35Z the canary asked "how many days are in a week?
+ * One short sentence." and the model answered in 4 completion tokens, 6 chars
+ * — "Seven." — a CORRECT reply, maximally obedient to "one short sentence",
+ * failed for being short. It ended an 18-green streak.
+ *
+ * The honest test is CORRECTNESS: each probe now carries the fact its answer
+ * must contain. A reply that names the fact is healthy at any length; the
+ * length floor drops to 3 chars, which still catches the real wordless-turn
+ * class (empty/whitespace replies). Probes without a clean expectable fact
+ * keep a 10-char floor instead. */
 const CANARY_PROBES = [
-  'name three things you might find on a porch, in one short sentence.',
-  'what season comes after summer? One short sentence.',
-  'add nine and six, answer in one short sentence.',
-  'name two animals bigger than a cat, one short sentence.',
-  'which is colder, ice or steam? One short sentence.',
-  'name three colors you might see in a sunset, one short sentence.',
-  'how many days are in a week? One short sentence.',
-  'name two things that need batteries, one short sentence.',
+  { q: 'name three things you might find on a porch, in one short sentence.' },
+  { q: 'what season comes after summer? One short sentence.', expect: /fall|autumn/i },
+  { q: 'add nine and six, answer in one short sentence.', expect: /15|fifteen/i },
+  { q: 'name two animals bigger than a cat, one short sentence.' },
+  { q: 'which is colder, ice or steam? One short sentence.', expect: /\bice\b/i },
+  { q: 'name three colors you might see in a sunset, one short sentence.', expect: /red|orange|pink|purple|gold|yellow|crimson|violet/i },
+  { q: 'how many days are in a week? One short sentence.', expect: /seven|\b7\b/i },
+  { q: 'name two things that need batteries, one short sentence.' },
 ];
 
 const canaryState = (() => {
@@ -4026,7 +4038,8 @@ function saveCanaryState() {
 
 async function runCanaryProbe(trigger = 'tick') {
   const nonce = Math.floor(100000 + Math.random() * 900000);
-  const probe = CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
+  const probeEntry = CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
+  const probe = probeEntry.q;
   const question = `Canary check ${nonce}: ${probe}`;
   const t0 = Date.now();
   const result = { at: new Date().toISOString(), trigger, ok: false, ms: 0, len: 0, note: '' };
@@ -4043,8 +4056,11 @@ async function runCanaryProbe(trigger = 'tick') {
     const text = String(r.data && r.data.text || '').trim();
     result.len = text.length;
     const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
-    if (!text || text.length < 10) {
+    const minLen = probeEntry.expect ? 3 : 10;
+    if (!text || text.length < minLen) {
       result.note = `reply too short (${text.length} chars) — the wordless-turn class`;
+    } else if (probeEntry.expect && !probeEntry.expect.test(text)) {
+      result.note = `reply (${text.length} chars) did not contain the expected fact for "${probe.slice(0, 40)}..."`;
     } else if (
       canaryState.lastReplyHash && hash === canaryState.lastReplyHash &&
       canaryState.lastProbe && canaryState.lastProbe !== probe
