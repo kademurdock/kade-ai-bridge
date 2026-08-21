@@ -984,7 +984,11 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
     : (adminAlert === true ? 'admin' : null);
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
-  const message = String(body || '').trim().slice(0, 300);
+  /* Part 83 (her word, shipping the Friday digest: "up the cap to a thousand
+   * chars or so on the notification"): broadcasts get room to actually say
+   * what shipped — iOS shows the first lines and expands on press, VoiceOver
+   * reads it all. Per-user pushes keep the tight lock-screen cap. */
+  const message = String(body || '').trim().slice(0, broadcast === true ? 1000 : 300);
   if (!message) return { ok: false, error: 'body required' };
   title = String(title || agentName).slice(0, 40);
   const { day, hhmm } = centralClock();
