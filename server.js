@@ -4140,6 +4140,118 @@ if (CANARY_ENABLED) {
 }
 
 // Manual probe for smoke tests and "check the canary right now" (admin).
+/* ── MEDIA SENSES (Part 82, Aug 21 2026 — her ask: "users send agents a song
+ * on youtube or anywhere, and they can describe the video, describe the
+ * instrumentation"). The engine: Gemini's generateContent with NATIVE YouTube
+ * URL ingestion — no downloader, no storage, no PO-token wars (the reason
+ * yt-pot exists). Model probe receipts on record: gemini-3.6-flash described
+ * the OK Go treadmill video's choreography AND its guitar/drums/bass build in
+ * 19s from a bare URL; Z.ai's per-token API lists zero vision/audio models,
+ * so the "Google or GLM" question closed on capability, not taste.
+ *
+ * Auth: scoped MEDIA_TOOL_SECRET (x-media-secret header / secret in body) or
+ * admin BRIDGE_SECRET. Caps: MEDIA_DAILY_CAP per user per day (default 20),
+ * YouTube description window capped at MEDIA_MAX_SECONDS (default 600s — the
+ * first ten minutes, which covers songs; the reply says so when a video may
+ * run longer). Direct audio/video file URLs under ~15MB ride inline base64.
+ * NEVER throws: every path returns plain sentences (a thrown tool error feeds
+ * the parked graph bug's dead-air failure). Kill: MEDIA_SENSES=0. */
+const MEDIA_MODEL = process.env.MEDIA_MODEL || 'gemini-3.6-flash';
+const MEDIA_DAILY_CAP = Math.max(1, parseInt(process.env.MEDIA_DAILY_CAP || '20', 10));
+const MEDIA_MAX_SECONDS = Math.max(60, parseInt(process.env.MEDIA_MAX_SECONDS || '600', 10));
+const MEDIA_MAX_FILE_BYTES = 15 * 1024 * 1024;
+const mediaDaily = { day: '', counts: new Map() };
+function mediaSecretOk(req, provided) {
+  const s = process.env.MEDIA_TOOL_SECRET;
+  const h = (req.get && req.get('x-media-secret')) || provided;
+  return (s && h === s) || (BRIDGE_SECRET && h === BRIDGE_SECRET);
+}
+const MEDIA_PROMPT = (focus) =>
+  'You are the eyes and ears for a blind listener. Describe this media accurately and concretely, in plain prose ' +
+  'with no markdown, no headers, no bullet symbols. Cover two things. THE PICTURE (skip if audio-only): what is ' +
+  'physically on screen and what happens, in order — people, movement, setting, camera, text on screen — the way ' +
+  "you'd narrate to someone who will never see it. THE SOUND: the instrumentation and production — name the " +
+  'instruments you actually hear, the rhythm and tempo feel, the vocal style, how the arrangement builds and ' +
+  'changes section by section, with rough timestamps for the big turns. Quote lyrics only sparingly, a line or ' +
+  'two where they matter. Never invent details you did not perceive; when unsure, say unsure. If the media seems ' +
+  'to continue past what you were given, say plainly that you described the first stretch.' +
+  (focus ? ` The listener especially wants to know about: ${String(focus).slice(0, 200)}.` : '');
+app.post('/media/describe', async (req, res) => {
+  try {
+    if (process.env.MEDIA_SENSES === '0') {
+      return res.json({ ok: false, description: 'The media-describe lane is switched off right now.' });
+    }
+    const b = req.body || {};
+    if (!mediaSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+    const url = String(b.url || '').trim();
+    const userId = String(b.userId || 'unknown').slice(0, 40);
+    if (!/^https?:\/\//i.test(url)) {
+      return res.json({ ok: false, description: 'I need a real link — a YouTube URL or a direct audio/video file link.' });
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    if (mediaDaily.day !== today) { mediaDaily.day = today; mediaDaily.counts.clear(); }
+    const used = mediaDaily.counts.get(userId) || 0;
+    if (used >= MEDIA_DAILY_CAP) {
+      return res.json({ ok: false, description: `That's the daily limit for media lookups (${MEDIA_DAILY_CAP} a day) — try again tomorrow.` });
+    }
+    const yt = /^(https?:\/\/)(www\.|m\.|music\.)?(youtube\.com\/(watch\?|shorts\/)|youtu\.be\/)/i.test(url);
+    const parts = [];
+    if (yt) {
+      parts.push({
+        fileData: { fileUri: url },
+        videoMetadata: { startOffset: '0s', endOffset: `${MEDIA_MAX_SECONDS}s` },
+      });
+    } else {
+      const MIME = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg', flac: 'audio/flac', aac: 'audio/aac', mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' };
+      const ext = (url.split('?')[0].split('.').pop() || '').toLowerCase();
+      const mime = MIME[ext];
+      if (!mime) {
+        return res.json({ ok: false, description: 'I can watch YouTube links and direct audio or video files (mp3, m4a, wav, ogg, flac, mp4, mov, webm). That link is neither — if the song is on YouTube, send that link instead.' });
+      }
+      let buf;
+      try {
+        const dl = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: MEDIA_MAX_FILE_BYTES, headers: { 'User-Agent': BROWSER_UA } });
+        buf = Buffer.from(dl.data);
+      } catch (e) {
+        return res.json({ ok: false, description: `I couldn't fetch that file (${String(e.message).slice(0, 80)}). If it's on YouTube, the YouTube link works best.` });
+      }
+      if (buf.length > MEDIA_MAX_FILE_BYTES) {
+        return res.json({ ok: false, description: 'That file is bigger than I can take in one bite (15 MB limit). A YouTube link has no size limit.' });
+      }
+      parts.push({ inlineData: { mimeType: mime, data: buf.toString('base64') } });
+    }
+    parts.push({ text: MEDIA_PROMPT(b.focus) });
+    const key = process.env.GOOGLE_LIVE_API_KEY;
+    if (!key) return res.json({ ok: false, description: 'The media lane is missing its key — tell Kade.' });
+    const t0 = Date.now();
+    let out;
+    try {
+      const g = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MEDIA_MODEL}:generateContent?key=${key}`,
+        { contents: [{ parts }] },
+        { timeout: 120000, headers: { 'Content-Type': 'application/json' } },
+      );
+      out = g.data;
+    } catch (e) {
+      const detail = e.response && e.response.data && e.response.data.error && e.response.data.error.message;
+      console.error(`[media] describe failed for ${url.slice(0, 60)}: ${detail || e.message}`);
+      return res.json({ ok: false, description: `I tried to take that in and the listen failed (${String(detail || e.message).slice(0, 120)}). Private, age-restricted, or region-locked videos do that — a public link usually works.` });
+    }
+    const text = out && out.candidates && out.candidates[0] && out.candidates[0].content &&
+      out.candidates[0].content.parts && out.candidates[0].content.parts.map((p) => p.text || '').join('').trim();
+    if (!text) {
+      return res.json({ ok: false, description: 'The model came back empty on that one — it may be blocked or private. A different link for the same song usually works.' });
+    }
+    mediaDaily.counts.set(userId, used + 1);
+    const secs = Math.round((Date.now() - t0) / 1000);
+    console.log(`[media] described ${yt ? 'youtube' : 'file'} for user=${userId.slice(0, 8)} in ${secs}s (${(out.usageMetadata || {}).promptTokenCount || '?'} prompt tokens)`);
+    return res.json({ ok: true, description: text.slice(0, 12000), model: MEDIA_MODEL, seconds: secs });
+  } catch (e) {
+    console.error('[media] route error:', e.message);
+    return res.json({ ok: false, description: 'Something went sideways taking that media in — try once more, and if it keeps failing tell Kade.' });
+  }
+});
+
 app.post('/canary/run', async (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
   if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
