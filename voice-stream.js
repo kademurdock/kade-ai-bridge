@@ -1896,7 +1896,7 @@ async function streamReply(session, userText) {
   if (session.videoOn) { try { await videoSight.onTurn(session); } catch { /* a blind turn is still a turn */ } }
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + moodLine(session) + (session.outboundSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + moodLine(session) + (session.outboundSuffix || '') + (session.agentCallSuffix || '') + deepSuffix }
       : m
   );
 
@@ -3738,6 +3738,34 @@ function attachWebVoice(server) {
             })
             .catch(() => {});
         }
+        // Part 75 (Aug 21 2026, agent calls): answering a KADE_CALL ring rides
+        // the planId in on the hello. The plan's purpose primes the session so
+        // the character opens KNOWING why it called (memories + relationship
+        // summary ride the existing lanes below), the spoken greeting names
+        // the reason, and marking it answered stops the missed-call sweep.
+        // Ownership is checked — a planId for someone else's plan is ignored.
+        if (typeof msg.callPlanId === 'string' && msg.callPlanId && global._vsConfig && typeof global._vsConfig.getCallPlan === 'function') {
+          try {
+            const plan = global._vsConfig.getCallPlan(msg.callPlanId);
+            if (plan && t.uid && String(plan.userId) === String(t.uid)) {
+              const firstName = (t.name || plan.userName || '').trim().split(/\s+/)[0] || null;
+              const shortPurpose = String(plan.purpose || '').slice(0, 90);
+              session.agentCallSuffix =
+                `\n\n[AGENT CALL — YOU (${plan.agentName}) just called ${firstName || 'the user'} and they ANSWERED. ` +
+                `This call exists because they asked you to call them about: ${plan.purpose}. ` +
+                `You already spoke one greeting line naming the reason — do NOT re-greet or restart. ` +
+                `Get into the purpose naturally and warmly, in your own voice; if it is a reminder-style call, actually deliver the reminder. ` +
+                `If they steer somewhere else, follow them — the purpose is why you called, not a cage.]`;
+              session.agentCallGreeting = firstName
+                ? `Hey ${firstName}! It's ${plan.agentName} — calling about ${shortPurpose}.`
+                : `Hey! It's ${plan.agentName} — calling about ${shortPurpose}.`;
+              if (typeof global._vsConfig.markCallAnswered === 'function') global._vsConfig.markCallAnswered(msg.callPlanId, t.uid);
+              console.log(`[web-voice] agent-call ANSWERED plan=${msg.callPlanId} agent=${plan.agentName}`);
+            } else if (plan) {
+              console.warn(`[web-voice] agent-call plan ${msg.callPlanId} ignored — not this user's plan`);
+            }
+          } catch (e) { console.warn('[web-voice] agent-call prime failed:', e.message); }
+        }
         console.log(`[web-voice] START ${session.streamSid} user=${t.email} agent=${user.agentName} voice=${session.voice} spotter=${session.spotter ? session.spotter.name + '/' + session.spotter.voice : 'none'}${session._spotterDirect ? ' DIRECT' : ''}`);
         // July 13 2026 drift audit: web streaming calls never got the July 12
         // caller-memories fix — the phone had it, the sibling engine surface
@@ -3794,7 +3822,9 @@ function attachWebVoice(server) {
           // typing orientation the phone greeting still carries. Shorter
           // greeting also shrinks the echo window that sometimes let the
           // agent hear its own greeting tail.
-          const line = first
+          const line = session.agentCallGreeting
+            ? session.agentCallGreeting
+            : first
             ? `Hey ${first}! It's ${session.agentName}.`
             : `Hey! It's ${session.agentName}.`;
           speak(session, line, session.voice).catch(() => {});

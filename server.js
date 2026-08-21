@@ -846,9 +846,17 @@ function sendApnsPush(deviceToken, title, body, opts = {}) {
     // Build 193 (Aug 9 2026): an optional APNs CATEGORY rides along — the
     // native app registers KADE_BRIEF with LISTEN/READ action buttons, and a
     // category the app doesn't know is ignored by iOS (safe on old builds).
-    const aps = { alert: { title, body }, sound: process.env.PUSH_SOUND || 'Notify.wav' };
+    const aps = { alert: { title, body }, sound: opts.sound || process.env.PUSH_SOUND || 'Notify.wav' };
     if (opts.category) aps.category = String(opts.category);
-    const payload = JSON.stringify({ aps });
+    // Part 75 (Aug 21 2026, agent calls): a per-send ringtone (bundled in the
+    // app; APNs falls back to the default sound when a build predates the
+    // file — Apple's rule, the same forward-safety Notify.wav rode in on), a
+    // time-sensitive interruption level so a CALL can behave like one (iOS
+    // silently caps it at whatever the app is entitled to, so this is safe
+    // without the entitlement), and optional root-level custom keys (kadeCall)
+    // the app reads to deep-link Answer straight into the streaming call.
+    if (opts.interruptionLevel) aps['interruption-level'] = String(opts.interruptionLevel);
+    const payload = JSON.stringify({ aps, ...(opts.data && typeof opts.data === 'object' ? opts.data : {}) });
     const r = client.request({
       ':method': 'POST',
       ':path': `/3/device/${deviceToken}`,
@@ -889,10 +897,15 @@ app.post('/push-register', (req, res) => {
   const userId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
   const platform = (req.body && req.body.platform ? String(req.body.platform) : 'ios').slice(0, 20);
   const existing = pushTokens.get(token);
+  // Part 75 (Aug 21 2026): the app's Settings ringtone picker rides the same
+  // register call — it becomes the DEFAULT ring for agent calls when a plan
+  // doesn't name one. Unknown ids are dropped, absent keeps the stored pick.
+  const ringtone = (req.body && req.body.ringtone && CALL_RINGTONES[String(req.body.ringtone)]) ? String(req.body.ringtone) : null;
   pushTokens.set(token, {
     userId: userId || (existing && existing.userId) || null,
     platform: platform || (existing && existing.platform) || 'ios',
     registeredAt: (existing && existing.registeredAt) || new Date().toISOString(),
+    ringtone: ringtone || (existing && existing.ringtone) || null,
   });
   savePushTokens();
   const linked = pushTokens.get(token).userId;
@@ -3163,6 +3176,320 @@ setInterval(() => {
 }, 60 * 1000);
 
 
+
+// ═══ AGENT CALLS — "Kiana calls you" (Part 75 §2, Aug 21 2026) ═══════════════
+// A scheduled, CONSENTED ring on the user's phone that answers straight into
+// the existing streaming voice call, with the agent primed on why it called.
+// Delivery is Kade's chosen option (a): a time-sensitive APNs push carrying a
+// bundled ringtone + the KADE_CALL category (Answer / Not now); the app deep-
+// links Answer into web-voice with the planId, and web-voice's hello marks the
+// plan answered (voice-stream.js). CallKit/PushKit stays the upgrade path.
+//
+// Deliberately NOT routed through runNotify: that budget (30-min cooldown,
+// 3/agent/day, 6 global) belongs to agent-initiated chat pushes — a call the
+// USER scheduled must neither be eaten by it nor eat it. Calls carry their own
+// caps below and share the same quiet-hours CLOCK (notifyPrefs.quietStart/End,
+// one admin dial for both lanes), with a per-plan override the user explicitly
+// consented to in chat (Kade's verdict Aug 21: per-call override allowed).
+// Kill switches: POST /call-prefs {"enabled":false} (no redeploy) or env
+// KADE_CALLS_DISABLED=1. Rollback: this whole block + the two voice-stream
+// hooks are additive — reverting the commit restores yesterday's bridge.
+const CALL_RINGTONES = {
+  ring_classic: 'KadeRingClassic.caf',
+  ring_marimba: 'KadeRingMarimba.caf',
+  ring_chimes:  'KadeRingChimes.caf',
+  ring_pulse:   'KadeRingPulse.caf',
+  ring_harp:    'KadeRingHarp.caf',
+};
+const CALLS_FILE      = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'call-plans.json');
+const CALL_PREFS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'call-prefs.json');
+const CALL_NOTICES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'call-notices.json');
+const callPlans = new Map(Object.entries(loadJsonFile(CALLS_FILE, {})));
+function saveCallPlans() { saveJsonFile(CALLS_FILE, Object.fromEntries(callPlans)); }
+let callPrefs = Object.assign(
+  { enabled: true, perUserDailyCap: 6, maxPlansPerUser: 10, maxPlansTotal: 100 },
+  loadJsonFile(CALL_PREFS_FILE, {})
+);
+function saveCallPrefs() { saveJsonFile(CALL_PREFS_FILE, callPrefs); }
+// Deferred notices: "I tried to call you" texts that must wait for quiet hours
+// to end. Volume-backed so a redeploy can't eat one.
+let callNotices = loadJsonFile(CALL_NOTICES_FILE, []);
+function saveCallNotices() { saveJsonFile(CALL_NOTICES_FILE, callNotices); }
+let callCounts = { day: '', perUser: {} }; // ring count per user per Central day
+const CALL_ANSWER_WINDOW_MS = 3 * 60 * 1000; // unanswered after this = missed
+
+function callsEnabled() { return callPrefs.enabled !== false && process.env.KADE_CALLS_DISABLED !== '1'; }
+function ringtoneFileFor(plan) {
+  if (plan.ringtone && CALL_RINGTONES[plan.ringtone]) return CALL_RINGTONES[plan.ringtone];
+  for (const [, meta] of pushTokens) {
+    if (meta && meta.userId === plan.userId && meta.ringtone && CALL_RINGTONES[meta.ringtone]) return CALL_RINGTONES[meta.ringtone];
+  }
+  return CALL_RINGTONES.ring_classic;
+}
+// Central hh:mm a UTC instant reads as (for "was this plan's moment inside
+// quiet hours" checks at creation time).
+function centralHHMM(date) {
+  const s = new Date(date).toLocaleString('en-US', { timeZone: 'America/Chicago', hour12: false, hour: '2-digit', minute: '2-digit' });
+  const m = s.match(/(\d{2}):(\d{2})/);
+  return m ? `${m[1] === '24' ? '00' : m[1]}:${m[2]}` : '12:00';
+}
+// The next moment quiet hours END, as a UTC Date (for deferred notices).
+function nextQuietEndUtc() {
+  const { day, hhmm } = centralClock();
+  const end = notifyPrefs.quietEnd || '08:00';
+  if (hhmm < end) return centralWallTimeToUtc(day, end); // early morning — today's end
+  const [y, mo, d] = day.split('-').map(Number);
+  const tomorrow = new Date(Date.UTC(y, mo - 1, d + 1));
+  const tStr = tomorrow.toISOString().slice(0, 10);
+  return centralWallTimeToUtc(tStr, end);
+}
+// Send a plain (non-ringing) call notice to one user's devices — the missed
+// and quiet-held follow-ups. Own lane on purpose; see the header comment.
+async function sendCallNotice(userId, title, body) {
+  const targets = tokensForUser(userId);
+  if (!targets.length) { console.warn(`[calls] notice ZERO TARGETS user=${String(userId).slice(0, 8)}...`); return { sent: 0 }; }
+  const results = await Promise.all(targets.map((t) => sendApnsPush(t, String(title).slice(0, 40), String(body).slice(0, 300))));
+  let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
+  return { sent: results.filter((r) => r.status === 200).length };
+}
+
+async function fireCallPlan(plan, { test = false } = {}) {
+  const refuse = (why) => { console.warn(`[calls] RING BLOCKED plan=${plan.id} ${plan.agentName}: ${why}`); return { ok: false, blocked: why }; };
+  if (!callsEnabled()) return refuse('calls are disabled (call-prefs / KADE_CALLS_DISABLED)');
+  const { day, hhmm } = centralClock();
+  if (callCounts.day !== day) callCounts = { day, perUser: {} };
+  if (notifyInQuietHours(hhmm) && plan.overrideQuiet !== true && !test) {
+    // No ring. Queue the honest "quiet hours held it" note for after quiet ends.
+    callNotices.push({
+      userId: plan.userId,
+      title: plan.agentName,
+      body: `I had a call for you at ${hhmm} Central about: ${plan.purpose}. Quiet hours held the ring — call me when you're up.`.slice(0, 300),
+      notBefore: (nextQuietEndUtc() || new Date()).toISOString(),
+    });
+    saveCallNotices();
+    if (!plan.recurring) { callPlans.delete(plan.id); } else { plan.lastFiredDay = day; }
+    saveCallPlans();
+    return refuse('quiet hours (no override on this plan) — deferred notice queued');
+  }
+  if (!test && (callCounts.perUser[plan.userId] || 0) >= callPrefs.perUserDailyCap) return refuse('per-user daily call cap reached');
+  const targets = tokensForUser(plan.userId);
+  if (!targets.length) { console.warn(`[calls] RING ZERO TARGETS plan=${plan.id} user=${String(plan.userId).slice(0, 8)}...`); return { ok: true, sent: 0, note: 'no device linked to this user' }; }
+  const sound = ringtoneFileFor(plan);
+  const shortPurpose = String(plan.purpose || '').slice(0, 120);
+  const results = await Promise.all(targets.map((t) => sendApnsPush(
+    t,
+    `${plan.agentName} — ${shortPurpose}`.slice(0, 60),
+    `Incoming call from ${plan.agentName}. Tap Answer to pick up.`,
+    {
+      category: 'KADE_CALL',
+      sound,
+      interruptionLevel: 'time-sensitive',
+      data: { kadeCall: { planId: plan.id, agentId: plan.agentId, agentName: plan.agentName, purpose: String(plan.purpose || '').slice(0, 300) } },
+    }
+  )));
+  let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
+  const sent = results.filter((r) => r.status === 200).length;
+  plan.pendingAnswer = { firedAt: new Date().toISOString() };
+  plan.timesFired = (plan.timesFired || 0) + 1;
+  plan.lastFiredDay = day;
+  if (sent > 0 && !test) callCounts.perUser[plan.userId] = (callCounts.perUser[plan.userId] || 0) + 1;
+  saveCallPlans();
+  console.log(`[calls] RANG plan=${plan.id} ${plan.agentName} -> user ${String(plan.userId).slice(0, 8)}... sent=${sent} tone=${sound}${test ? ' (test)' : ''}`);
+  return { ok: true, sent, ringtone: sound };
+}
+
+// The web-voice hello calls these (via the attachMediaStreams cfg): read the
+// plan to prime the session, then mark it answered. Answering completes a
+// one-shot; a recurring plan just clears its pending state.
+function getCallPlan(planId) { return callPlans.get(String(planId || '')) || null; }
+function markCallAnswered(planId, userId) {
+  const plan = callPlans.get(String(planId || ''));
+  if (!plan || String(plan.userId) !== String(userId || '')) return null;
+  plan.pendingAnswer = null;
+  plan.lastAnswered = new Date().toISOString();
+  if (!plan.recurring) callPlans.delete(plan.id);
+  saveCallPlans();
+  console.log(`[calls] ANSWERED plan=${plan.id} by user ${String(userId).slice(0, 8)}...`);
+  return plan;
+}
+
+// POST /call-plans — create/update. Scoped notify secret (the agent tool) or
+// admin. Body: {secret?, id?, userId, userName, agentId, agentName, purpose,
+// ringtone?, override_quiet?, in_minutes? | fire_date+fire_time? | recurring:{time,days}?}
+app.post('/call-plans', (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret) && !bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = String(b.userId || '').slice(0, 64);
+  const purpose = String(b.purpose || '').trim().slice(0, 300);
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  if (!purpose) return res.status(400).json({ error: 'purpose required — the agent must know why it is calling' });
+  const existing = b.id ? callPlans.get(String(b.id)) : null;
+  if (existing && String(existing.userId) !== userId) return res.status(403).json({ error: 'Not your plan' });
+  let fireAt = null, recurring = null;
+  if (b.recurring && b.recurring.time) {
+    const time = String(b.recurring.time);
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(time)) return res.status(400).json({ error: "recurring.time must be 'HH:mm' 24-hour Central" });
+    let days = b.recurring.days || 'daily';
+    if (Array.isArray(days)) days = days.map((d) => String(d).toLowerCase().slice(0, 3)).filter((d) => ['sun','mon','tue','wed','thu','fri','sat'].includes(d));
+    if (Array.isArray(days) && !days.length) days = 'daily';
+    recurring = { time, days };
+  } else if (b.in_minutes) {
+    const mins = Number(b.in_minutes);
+    if (!Number.isFinite(mins) || mins < 1) return res.status(400).json({ error: 'in_minutes must be a positive number' });
+    fireAt = new Date(Date.now() + mins * 60000);
+  } else if (b.fire_date && b.fire_time) {
+    fireAt = centralWallTimeToUtc(b.fire_date, b.fire_time);
+    if (!fireAt) return res.status(400).json({ error: "fire_date must be 'YYYY-MM-DD' and fire_time 'HH:mm' (24-hour, Central)" });
+    if (fireAt.getTime() < Date.now() - 60000) return res.status(400).json({ error: 'That moment is in the past — call plans store absolute datetimes; compute the real date first' });
+  } else {
+    return res.status(400).json({ error: 'Provide in_minutes, or fire_date+fire_time, or recurring {time, days}' });
+  }
+  if (fireAt && fireAt.getTime() > Date.now() + 90 * 86400000) return res.status(400).json({ error: 'Too far out — up to 90 days ahead' });
+  if (!existing) {
+    const mine = [...callPlans.values()].filter((p) => p.userId === userId).length;
+    if (mine >= callPrefs.maxPlansPerUser) return res.status(429).json({ error: `Limit reached: ${callPrefs.maxPlansPerUser} call plans per person. Cancel one first.` });
+    if (callPlans.size >= callPrefs.maxPlansTotal) return res.status(429).json({ error: 'Platform-wide call plan limit reached.' });
+  }
+  const id = existing ? existing.id : `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  const plan = {
+    id,
+    userId,
+    userName: String(b.userName || (existing && existing.userName) || '').slice(0, 40),
+    agentId: String(b.agentId || (existing && existing.agentId) || 'unknown').slice(0, 64),
+    agentName: String(b.agentName || (existing && existing.agentName) || 'Kade-AI').slice(0, 40),
+    purpose,
+    ringtone: (b.ringtone && CALL_RINGTONES[String(b.ringtone)]) ? String(b.ringtone) : (existing && existing.ringtone) || null,
+    overrideQuiet: b.override_quiet === true,
+    enabled: existing ? existing.enabled !== false : true,
+    fireAt: fireAt ? fireAt.toISOString() : null,
+    recurring,
+    createdAt: (existing && existing.createdAt) || new Date().toISOString(),
+    lastFiredDay: (existing && existing.lastFiredDay) || null,
+    timesFired: (existing && existing.timesFired) || 0,
+    pendingAnswer: null,
+  };
+  callPlans.set(id, plan);
+  saveCallPlans();
+  // Honest quiet-hours warning at creation so the agent can ASK about the
+  // override instead of the ring silently not happening.
+  const momentHHMM = fireAt ? centralHHMM(fireAt) : (recurring ? recurring.time : null);
+  const quietWarning = momentHHMM && notifyInQuietHours(momentHHMM) && plan.overrideQuiet !== true;
+  console.log(`[calls] ${existing ? 'updated' : 'created'} ${id}: ${plan.agentName} -> user ${userId.slice(0, 8)}... ${recurring ? `${Array.isArray(recurring.days) ? recurring.days.join(',') : recurring.days} at ${recurring.time} CT` : `at ${plan.fireAt}`}${quietWarning ? ' (QUIET-HOURS WARNING)' : ''}`);
+  res.json({
+    ok: true,
+    plan: { ...plan, fireAtCentral: fireAt ? formatCentralDisplay(fireAt) : null },
+    ringtoneFile: ringtoneFileFor(plan),
+    quietWarning: quietWarning ? `That time falls inside quiet hours (${notifyPrefs.quietStart}-${notifyPrefs.quietEnd} Central). Without override_quiet:true the phone will NOT ring — the user gets a morning notice instead. Ask them if this call should override quiet hours, and recreate with override_quiet:true if they say yes.` : null,
+  });
+});
+app.get('/call-plans', (req, res) => {
+  if (!notifySecretOk(req, req.query.secret) && !bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  let rows = [...callPlans.values()];
+  if (req.query.userId) rows = rows.filter((p) => p.userId === String(req.query.userId));
+  res.json({ count: rows.length, plans: rows.map((p) => ({ ...p, fireAtCentral: p.fireAt ? formatCentralDisplay(new Date(p.fireAt)) : null })) });
+});
+app.post('/call-plans/toggle', (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret) && !bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const plan = callPlans.get(String(b.id || ''));
+  if (!plan) return res.status(404).json({ error: 'No call plan with that id' });
+  plan.enabled = !plan.enabled;
+  saveCallPlans();
+  res.json({ ok: true, plan });
+});
+app.delete('/call-plans', (req, res) => {
+  if (!notifySecretOk(req, req.query.secret) && !bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const id = String(req.query.id || '');
+  if (!callPlans.has(id)) return res.status(404).json({ error: 'No call plan with that id' });
+  callPlans.delete(id);
+  saveCallPlans();
+  console.log(`[calls] cancelled ${id}`);
+  res.json({ ok: true });
+});
+// Test fire (the agent's test_call / the end-to-end receipt): rings NOW,
+// skipping the due-time and the daily cap, honoring the kill switch.
+app.post('/call-plans/fire', async (req, res) => {
+  const b = req.body || {};
+  if (!notifySecretOk(req, b.secret) && !bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const plan = callPlans.get(String(b.id || ''));
+  if (!plan) return res.status(404).json({ error: 'No call plan with that id' });
+  const out = await fireCallPlan(plan, { test: true });
+  res.json(out.ok ? { ok: true, ...out } : { ok: false, ...out });
+});
+app.get('/call-prefs', (req, res) => {
+  if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  res.json({ prefs: callPrefs, today: callCounts, plans: callPlans.size, ringtones: Object.keys(CALL_RINGTONES) });
+});
+app.post('/call-prefs', (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  ['enabled', 'perUserDailyCap', 'maxPlansPerUser', 'maxPlansTotal'].forEach((k) => { if (b[k] !== undefined) callPrefs[k] = b[k]; });
+  saveCallPrefs();
+  res.json({ ok: true, prefs: callPrefs });
+});
+// Public: the ringtone menu (ids + labels) — the app Settings picker and the
+// help page read this, so the list lives in ONE place.
+app.get('/call-ringtones', (req, res) => {
+  res.json({ ringtones: Object.entries(CALL_RINGTONES).map(([id, file]) => ({ id, file, label: id.replace('ring_', '').replace(/^./, (c) => c.toUpperCase()) })) });
+});
+
+// The calls tick: due one-shots, due recurrings, the missed-answer sweep, and
+// deferred quiet-hours notices. Every branch fails soft and logs loud.
+setInterval(async () => {
+  try {
+    const now = Date.now();
+    const { day } = centralClock();
+    for (const plan of [...callPlans.values()]) {
+      if (plan.enabled === false) continue;
+      // Missed sweep: rang, nobody answered inside the window.
+      if (plan.pendingAnswer && plan.pendingAnswer.firedAt && now - new Date(plan.pendingAnswer.firedAt).getTime() > CALL_ANSWER_WINDOW_MS) {
+        const firedHHMM = centralHHMM(new Date(plan.pendingAnswer.firedAt));
+        plan.pendingAnswer = null;
+        const body = `Tried to call you at ${firedHHMM} about: ${plan.purpose}. Call me back when you're free.`;
+        const { hhmm } = centralClock();
+        if (notifyInQuietHours(hhmm) && plan.overrideQuiet !== true) {
+          callNotices.push({ userId: plan.userId, title: plan.agentName, body, notBefore: (nextQuietEndUtc() || new Date()).toISOString() });
+          saveCallNotices();
+        } else {
+          sendCallNotice(plan.userId, plan.agentName, body).catch(() => {});
+        }
+        if (!plan.recurring) callPlans.delete(plan.id);
+        saveCallPlans();
+        console.log(`[calls] MISSED plan=${plan.id} ${plan.agentName} — follow-up ${notifyInQuietHours(centralClock().hhmm) && plan.overrideQuiet !== true ? 'deferred' : 'sent'}`);
+        continue;
+      }
+      if (plan.pendingAnswer) continue; // ringing — wait for answer or the sweep
+      // Due?
+      let due = false;
+      if (plan.fireAt && !plan.recurring) {
+        due = (plan.timesFired || 0) === 0 && now >= new Date(plan.fireAt).getTime();
+      } else if (plan.recurring && plan.recurring.time) {
+        const days = plan.recurring.days;
+        const dow = new Date().toLocaleDateString('en-US', { timeZone: 'America/Chicago', weekday: 'short' }).toLowerCase().slice(0, 3);
+        const dayMatch = days === 'daily' || (Array.isArray(days) && days.includes(dow));
+        if (dayMatch && plan.lastFiredDay !== day) {
+          const todaysFire = centralWallTimeToUtc(day, plan.recurring.time);
+          due = todaysFire && now >= todaysFire.getTime();
+        }
+      }
+      if (due) await fireCallPlan(plan);
+    }
+    // Deferred notices whose moment has come (and quiet hours are over).
+    if (callNotices.length) {
+      const { hhmm } = centralClock();
+      const still = [];
+      for (const n of callNotices) {
+        if (now >= new Date(n.notBefore).getTime() && !notifyInQuietHours(hhmm)) {
+          sendCallNotice(n.userId, n.title, n.body).catch(() => {});
+        } else { still.push(n); }
+      }
+      if (still.length !== callNotices.length) { callNotices = still; saveCallNotices(); }
+    }
+  } catch (e) {
+    console.error('[calls] tick error:', e.message);
+  }
+}, 60 * 1000);
+
 /** Plain proxy chat call (NO phone-brevity suffix — summaries should be rich). */
 async function askAgentRich(agentId, userMessage) {
   const r = await axios.post(
@@ -3362,6 +3689,8 @@ attachMediaStreams(server, users, {
   seenCallNumbers,
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
   getOutboundCtx,
+  getCallPlan,          // Part 75: agent-call answer priming (web-voice hello)
+  markCallAnswered,     // Part 75: answering completes the plan / clears the missed sweep
   onCallEnd,
   endCall,
   lookupVoicePref,   // July 12 2026: per-caller per-agent voice picks (fork)
