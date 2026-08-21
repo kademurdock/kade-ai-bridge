@@ -4892,6 +4892,17 @@ async function voiceReportForSpeech() {
   bits.push(data.reframePivots === 0 ? 'zero reframe pivots' : `${data.reframePivots} reframe pivot${data.reframePivots === 1 ? '' : 's'}`);
   if (data.heresTheThing) bits.push(`"here's the thing" ${data.heresTheThing}x`);
   if (data.everythingGush) bits.push(`tell-me-everything gush ${data.everythingGush}x`);
+  if (data.nominalizations) bits.push(`nominalizations ${data.nominalizations}x`);
+  if (data.thatPartMeme) bits.push(`"that part" meme ${data.thatPartMeme}x`);
+  if (data.memeCombat) bits.push(`meme-combat ${data.memeCombat}x`);
+  if (data.tagsTotal) {
+    bits.push(
+      data.commaTags
+        ? `${data.commaTags} of ${data.tagsTotal} voice tags still carried commas`
+        : `all ${data.tagsTotal} voice tags clean`,
+    );
+  }
+  if (data.topTagPhrase) bits.push(`favorite tag "${data.topTagPhrase.text}" ${data.topTagPhrase.count}x`);
   if (data.repeatedCloser) bits.push(`one closer repeated ${data.repeatedCloser.count}x`);
   return {
     section: { enabled: true, ...data },
