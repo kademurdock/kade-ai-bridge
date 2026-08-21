@@ -4026,6 +4026,16 @@ const CANARY_PROBES = [
   { q: 'name three colors you might see in a sunset, one short sentence.', expect: /red|orange|pink|purple|gold|yellow|crimson|violet/i },
   { q: 'how many days are in a week? One short sentence.', expect: /seven|\b7\b/i },
   { q: 'name two things that need batteries, one short sentence.' },
+  /* THE TOOL PROBE (Aug 21 2026) — the day every streaming tool call on the
+   * platform died for TEN HOURS (the Z.ai role-shim outage, reframe 78d135c)
+   * while the canary stayed green, because the canary only ever tested chat.
+   * This probe walks the full tool lane: schema delivery -> model tool call ->
+   * LibreChat execution -> second round -> content. The games list is
+   * deterministic, free, and can't be faked from memory convincingly by
+   * accident (the expectation names real engine titles). The Canary agent
+   * carries kade_games for exactly this probe and nothing else. */
+  { q: 'use your games tool to list the games, then name three of them in one short sentence.',
+    expect: /blackjack|wild eights|go fish|\buno\b|\bwar\b|\bpig\b|trivia/i, tool: true },
 ];
 
 const canaryState = (() => {
@@ -4036,9 +4046,11 @@ function saveCanaryState() {
   try { fs.writeFileSync(CANARY_FILE, JSON.stringify(canaryState)); } catch (e) { console.warn('[canary] state save failed:', e.message); }
 }
 
-async function runCanaryProbe(trigger = 'tick') {
+async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
   const nonce = Math.floor(100000 + Math.random() * 900000);
-  const probeEntry = CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
+  const probeEntry = (Number.isInteger(probeIdx) && CANARY_PROBES[probeIdx])
+    ? CANARY_PROBES[probeIdx]
+    : CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
   const probe = probeEntry.q;
   const question = `Canary check ${nonce}: ${probe}`;
   const t0 = Date.now();
@@ -4057,10 +4069,11 @@ async function runCanaryProbe(trigger = 'tick') {
     result.len = text.length;
     const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
     const minLen = probeEntry.expect ? 3 : 10;
+    const cls = probeEntry.tool ? 'TOOL probe: ' : '';
     if (!text || text.length < minLen) {
-      result.note = `reply too short (${text.length} chars) — the wordless-turn class`;
+      result.note = `${cls}reply too short (${text.length} chars) — the wordless-turn class${probeEntry.tool ? ' (tool lane suspect — the Aug-21 role-shim outage looked exactly like this)' : ''}`;
     } else if (probeEntry.expect && !probeEntry.expect.test(text)) {
-      result.note = `reply (${text.length} chars) did not contain the expected fact for "${probe.slice(0, 40)}..."`;
+      result.note = `${cls}reply (${text.length} chars) did not contain the expected fact for "${probe.slice(0, 40)}..."`;
     } else if (
       canaryState.lastReplyHash && hash === canaryState.lastReplyHash &&
       canaryState.lastProbe && canaryState.lastProbe !== probe
@@ -4131,7 +4144,12 @@ app.post('/canary/run', async (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
   if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
   try {
-    res.json(await runCanaryProbe('manual'));
+    // ?probe=N (or body.probe) selects a specific probe by index — receipts
+    // and smoke tests; omit for the normal random draw. The tool probe is
+    // the LAST entry, so ?probe=8 exercises the tool lane on demand.
+    const raw = (req.body && req.body.probe) ?? req.query.probe;
+    const idx = raw === undefined ? null : parseInt(raw, 10);
+    res.json(await runCanaryProbe('manual', Number.isInteger(idx) ? idx : null));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
