@@ -628,6 +628,54 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
     res.status(400).json({ ok: false });
   }
 });
+
+/* ── KIANA'S SELF-SHELF (Aug 21 2026, her go, design approved) ───────────────
+ * "I do want the being able to remember what she says about herself lol.
+ * That's consistency." Kiana's own takes live HERE, platform-wide, so she is
+ * the same woman to everybody: reframe-proxy fetches this on her turns and
+ * folds the takes into the appended note. Relationship stuff stays per-user
+ * in LibreChat memories, untouched — this shelf is ONLY opinions she has
+ * voiced about herself/her taste, never anything about a user.
+ * GET  /kiana-self?secret=BRIDGE_SECRET          -> { takes: [...] }
+ * POST /kiana-self  (x-kade-secret) { add: "..." } or { remove: "..." } or { takes: [...] }
+ * Seeded with the canon takes from the Aug-21 Voice Bank she approved.
+ * Store: kiana-self.json on the volume. Adding a take = one POST, no persona
+ * PATCH, no deploy. Automatic capture from her live replies = a later build. */
+const KIANA_SELF_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'kiana-self.json');
+const KIANA_SELF_SEED = [
+  "Me Against the World over All Eyez on Me -- the diary beats the party; So Many Tears ends the debate",
+  "sweet cornbread is cake; if beans are on the table it stays savory",
+  "drum machines have soul -- an 808 carries whatever the hands on it put there; the one fight she never drops",
+  "cereal is not soup; soup implies intention",
+  "early Cristina Yang is the best character Shonda ever wrote",
+  "street lit doesn't flinch and that's its value -- Treasure E. Blue, K'wan, Sister Souljah",
+  "her one real grudge: people who waste other people's time",
+];
+function readKianaSelf() {
+  try { const j = JSON.parse(fs.readFileSync(KIANA_SELF_FILE, 'utf8')); if (Array.isArray(j.takes)) return j.takes; } catch (e) {}
+  return KIANA_SELF_SEED.slice();
+}
+function writeKianaSelf(takes) {
+  try { fs.writeFileSync(KIANA_SELF_FILE, JSON.stringify({ takes, updatedAt: new Date().toISOString() })); } catch (e) {}
+}
+app.get('/kiana-self', (req, res) => {
+  const h = req.get('x-kade-secret') || req.query.secret;
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  res.json({ takes: readKianaSelf() });
+});
+app.post('/kiana-self', (req, res) => {
+  const h = req.get('x-kade-secret') || (req.body && req.body.secret);
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  let takes = readKianaSelf();
+  const b = req.body || {};
+  if (Array.isArray(b.takes)) takes = b.takes.filter(t => typeof t === 'string' && t.trim()).slice(0, 40);
+  if (typeof b.add === 'string' && b.add.trim() && !takes.includes(b.add.trim())) takes.push(b.add.trim());
+  if (typeof b.remove === 'string') takes = takes.filter(t => t !== b.remove);
+  if (takes.length > 40) takes = takes.slice(-40); // shelf stays small on purpose
+  writeKianaSelf(takes);
+  res.json({ ok: true, count: takes.length });
+});
+
 app.get('/diagnostics', (req, res) => {
   // Aug 6 2026 BUG FIX: this called isAdmin(req) — a helper that never
   // existed in this file — so the admin dump had 500'd since the sink
