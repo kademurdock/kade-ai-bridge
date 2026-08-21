@@ -4224,18 +4224,37 @@ app.post('/media/describe', async (req, res) => {
     const key = process.env.GOOGLE_LIVE_API_KEY;
     if (!key) return res.json({ ok: false, description: 'The media lane is missing its key — tell Kade.' });
     const t0 = Date.now();
-    let out;
-    try {
-      const g = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MEDIA_MODEL}:generateContent?key=${key}`,
-        { contents: [{ parts }] },
-        { timeout: 120000, headers: { 'Content-Type': 'application/json' } },
-      );
-      out = g.data;
-    } catch (e) {
-      const detail = e.response && e.response.data && e.response.data.error && e.response.data.error.message;
-      console.error(`[media] describe failed for ${url.slice(0, 60)}: ${detail || e.message}`);
-      return res.json({ ok: false, description: `I tried to take that in and the listen failed (${String(detail || e.message).slice(0, 120)}). Private, age-restricted, or region-locked videos do that — a public link usually works.` });
+    /* Demand net (added the same hour it first bit): Google's free-tier flash
+     * throttles with "high demand ... temporary" — the FIRST smoke test hit
+     * it two minutes after a clean probe. One retry after a beat, then one
+     * swing on the fallback model (alias tracks whatever flash tier has
+     * capacity). Same shape as the Moonshot/Z.ai nets. */
+    const attempts = [
+      { model: MEDIA_MODEL, waitMs: 0 },
+      { model: MEDIA_MODEL, waitMs: 2500 },
+      { model: process.env.MEDIA_MODEL_FALLBACK || 'gemini-flash-latest', waitMs: 1500 },
+    ];
+    let out; let lastDetail = '';
+    for (const a of attempts) {
+      if (a.waitMs) await new Promise((r2) => setTimeout(r2, a.waitMs));
+      try {
+        const g = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${a.model}:generateContent?key=${key}`,
+          { contents: [{ parts }] },
+          { timeout: 120000, headers: { 'Content-Type': 'application/json' } },
+        );
+        out = g.data;
+        if (a.model !== MEDIA_MODEL) console.warn(`[media] fallback model ${a.model} answered after ${MEDIA_MODEL} failed`);
+        break;
+      } catch (e) {
+        lastDetail = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message);
+        console.error(`[media] ${a.model} failed for ${url.slice(0, 60)}: ${lastDetail.slice(0, 140)}`);
+        const transient = /high demand|overloaded|429|resource has been exhausted|unavailable/i.test(lastDetail);
+        if (!transient) break;
+      }
+    }
+    if (!out) {
+      return res.json({ ok: false, description: `I tried to take that in and the listen failed (${lastDetail.slice(0, 120)}). Private, age-restricted, or region-locked videos do that — and sometimes the listener is just busy for a minute; try once more.` });
     }
     const text = out && out.candidates && out.candidates[0] && out.candidates[0].content &&
       out.candidates[0].content.parts && out.candidates[0].content.parts.map((p) => p.text || '').join('').trim();
