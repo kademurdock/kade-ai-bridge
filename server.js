@@ -4854,6 +4854,51 @@ async function memoryHealthForSpeech() {
   };
 }
 
+/* ── VOICE REPORT (Part 80, Aug 21 2026) — Kade's ear, automated. Same shape
+ * as memory-health above: fork endpoint /api/kade/clock/voice-report, folded
+ * in as a section + one spoken line so the morning report reads Kiana's
+ * style vitals daily ("tuning by ear is really all I can do" — this is the
+ * ear that never sleeps). INFORMATIONAL ONLY: never flips platform ok, and a
+ * failed fetch reports quietly. Cached 30 min (style stats move slowly).
+ * Kill: VOICE_REPORT_STATUS=0. */
+let voiceReportCache = { at: 0, data: null, err: null };
+async function fetchVoiceReport() {
+  if (Date.now() - voiceReportCache.at < 30 * 60 * 1000) return voiceReportCache;
+  try {
+    const r = await axios.get(`${LIBRECHAT_URL}/api/kade/clock/voice-report`, {
+      headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
+      timeout: 20000,
+    });
+    voiceReportCache = { at: Date.now(), data: r.data, err: null };
+  } catch (e) {
+    voiceReportCache = { at: Date.now(), data: null, err: e.message };
+  }
+  return voiceReportCache;
+}
+async function voiceReportForSpeech() {
+  if (process.env.VOICE_REPORT_STATUS === '0' || !BRIDGE_SECRET) {
+    return { section: { enabled: false }, spoken: '' };
+  }
+  const { data, err } = await fetchVoiceReport();
+  if (!data || data.ok !== true) {
+    const why = data && data.disabled ? 'disabled on the fork' : (err || 'no data');
+    return { section: { enabled: true, error: why }, spoken: '' };
+  }
+  if (!data.replies) return { section: { enabled: true, ...data }, spoken: '' };
+  const bits = [];
+  bits.push(`${data.replies} replies, ${data.avgWords} words average`);
+  bits.push(`${data.tagOpenedPct}% opened with a voice tag`);
+  bits.push(`${data.questionCloserPct}% ended on a question`);
+  bits.push(data.reframePivots === 0 ? 'zero reframe pivots' : `${data.reframePivots} reframe pivot${data.reframePivots === 1 ? '' : 's'}`);
+  if (data.heresTheThing) bits.push(`"here's the thing" ${data.heresTheThing}x`);
+  if (data.everythingGush) bits.push(`tell-me-everything gush ${data.everythingGush}x`);
+  if (data.repeatedCloser) bits.push(`one closer repeated ${data.repeatedCloser.count}x`);
+  return {
+    section: { enabled: true, ...data },
+    spoken: `Kiana's voice, last day: ${bits.join(', ')}.`,
+  };
+}
+
 app.get('/platform-status', async (req, res) => {
   const provided = req.get('x-notify-secret') || req.get('x-kade-secret') || req.query.secret;
   const scopedOk = NOTIFY_AGENT_SECRET && provided === NOTIFY_AGENT_SECRET;
@@ -4896,16 +4941,18 @@ app.get('/platform-status', async (req, res) => {
     const balances = balanceStatusForSpeech();
     const crash = crashStatusForSpeech();
     const memoryH = await memoryHealthForSpeech();
+    const voiceR = await voiceReportForSpeech();
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday
         && memoryH.okForStatus,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
       crashes: crash.section,
       backups: backups.section,
       memory: memoryH.section,
+      voice: voiceR.section,
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,
