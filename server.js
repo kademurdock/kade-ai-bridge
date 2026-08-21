@@ -970,7 +970,18 @@ function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhm
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route }) {
+  /* Part 83 (her report: tapping the bug-report push opened a NEW
+   * CONVERSATION — the app's launch default — instead of the bug window):
+   * pushes with a real home now carry one. `route` is a short screen name
+   * the app maps to a destination ("feedback" -> the bug window, "admin" ->
+   * the Admin hub); adminAlert sends default to "admin" so canary, crash,
+   * and balance taps land on the hub with zero per-caller changes. Builds
+   * before 231 ignore the category entirely — Apple's forward safety. An
+   * explicit `category` (KADE_BRIEF, KADE_DOORBELL, KADE_CALL) always wins. */
+  const routeName = (typeof route === 'string' && /^[a-z][a-z0-9_-]{0,30}$/i.test(route.trim()))
+    ? route.trim()
+    : (adminAlert === true ? 'admin' : null);
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   const message = String(body || '').trim().slice(0, 300);
@@ -1026,7 +1037,11 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
     console.warn(`[notify] ZERO TARGETS — ${agentName} (${agentId}): ${note}`);
     return { ok: true, sent: 0, note };
   }
-  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message, { category })));
+  const sendOpts = {
+    category: category || (routeName ? 'KADE_ROUTE' : undefined),
+    data: routeName && !category ? { kadeRoute: routeName } : undefined,
+  };
+  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message, sendOpts)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
   // adminAlert sends don't advance the counters — the outreach budget
@@ -1051,7 +1066,7 @@ app.post('/notify', async (req, res) => {
    * fork already sends — no fork change, no new field, no trust widening;
    * old builds ignore unknown categories, so this is safe ahead of 195. */
   const category = /^front door/i.test(String(b.title || '')) ? 'KADE_DOORBELL' : undefined;
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true, category });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true, category, route: b.route });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
