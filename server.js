@@ -4762,6 +4762,64 @@ async function checkPlatformServices() {
   return checks;
 }
 
+/* ── KADE Aug 21 2026 (Part 76) — memory health in /platform-status ──────────
+ * Forge's report item 9: the estate's memory system fails SILENTLY by nature
+ * (Part 71: the consolidation sweep no-opped for a month returning ok:true).
+ * The fork now exposes GET /api/kade/clock/memory-health (same BRIDGE_SECRET
+ * the clock pokes ride); this folds it in as a section + one spoken line, and
+ * goes LOUD — flips platform ok:false — only on the two objective stalenesses:
+ * nightly dreaming (summaries) older than MEMORY_DREAM_STALE_H (default 48h)
+ * or the weekly consolidation older than MEMORY_SWEEP_STALE_D (default 8 days).
+ * A failed FETCH never pages her (a blip must not read as a memory failure) —
+ * it reports "unavailable" and leaves ok alone. Cached 5 minutes so chatty
+ * status asks don't hammer the fork. Kill: MEMORY_HEALTH_STATUS=0. */
+let memoryHealthCache = { at: 0, data: null, err: null };
+async function fetchMemoryHealth() {
+  if (Date.now() - memoryHealthCache.at < 5 * 60 * 1000) return memoryHealthCache;
+  try {
+    const r = await axios.get(`${LIBRECHAT_URL}/api/kade/clock/memory-health`, {
+      headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
+      timeout: 20000,
+    });
+    memoryHealthCache = { at: Date.now(), data: r.data, err: null };
+  } catch (e) {
+    memoryHealthCache = { at: Date.now(), data: null, err: e.message };
+  }
+  return memoryHealthCache;
+}
+async function memoryHealthForSpeech() {
+  if (process.env.MEMORY_HEALTH_STATUS === '0' || !BRIDGE_SECRET) {
+    return { section: { enabled: false }, spoken: '', okForStatus: true };
+  }
+  const { data, err } = await fetchMemoryHealth();
+  if (!data || data.ok !== true) {
+    const why = data && data.disabled ? 'disabled on the fork' : (err || 'no data');
+    return { section: { enabled: true, error: why }, spoken: '', okForStatus: true };
+  }
+  const staleDreamH = parseInt(process.env.MEMORY_DREAM_STALE_H || '48', 10);
+  const staleSweepD = parseInt(process.env.MEMORY_SWEEP_STALE_D || '8', 10);
+  const dreamH = data.summaries && data.summaries.newestRefreshAgeHours;
+  const sweepH = data.consolidation && data.consolidation.ageHours;
+  const dreamStale = dreamH != null && dreamH > staleDreamH;
+  const sweepStale = sweepH == null || sweepH > staleSweepD * 24;
+  const bits = [];
+  bits.push(`${data.cards.active} active cards${data.cards.wrote24h ? ` (${data.cards.wrote24h} new today)` : ''}`);
+  bits.push(`diary ${data.diary.entries}${data.diary.wrote24h ? ` (+${data.diary.wrote24h})` : ''}`);
+  bits.push(dreamH != null ? `last dream pass ${Math.round(dreamH)}h ago` : 'no dream pass on record');
+  bits.push(sweepH != null ? `weekly sweep ${Math.round(sweepH / 24)}d ago` : 'weekly sweep never recorded');
+  if (data.cards.stalestActiveAgeDays != null) bits.push(`stalest card ${data.cards.stalestActiveAgeDays}d`);
+  const echoCount = Array.isArray(data.echoes) ? data.echoes.length : 0;
+  if (echoCount) bits.push(`${echoCount} memory echo${echoCount === 1 ? '' : 'es'} today`);
+  let spoken = `Memory: ${bits.join(', ')}.`;
+  if (dreamStale) spoken = `MEMORY WARNING: the nightly dream pass has not refreshed a summary in ${Math.round(dreamH)} hours. ` + spoken;
+  if (sweepStale) spoken = `MEMORY WARNING: the weekly consolidation sweep is ${sweepH == null ? 'unrecorded' : `${Math.round(sweepH / 24)} days old`}. ` + spoken;
+  return {
+    section: { enabled: true, ...data, dreamStale, sweepStale },
+    spoken,
+    okForStatus: !(dreamStale || sweepStale),
+  };
+}
+
 app.get('/platform-status', async (req, res) => {
   const provided = req.get('x-notify-secret') || req.get('x-kade-secret') || req.query.secret;
   const scopedOk = NOTIFY_AGENT_SECRET && provided === NOTIFY_AGENT_SECRET;
@@ -4803,14 +4861,17 @@ app.get('/platform-status', async (req, res) => {
     const backups = backupStatusForSpeech();
     const balances = balanceStatusForSpeech();
     const crash = crashStatusForSpeech();
+    const memoryH = await memoryHealthForSpeech();
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
-        && !(balances.section.low && balances.section.low.length) && crash.okToday,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
+        && !(balances.section.low && balances.section.low.length) && crash.okToday
+        && memoryH.okForStatus,
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
       services,
       canary,
       crashes: crash.section,
       backups: backups.section,
+      memory: memoryH.section,
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,
