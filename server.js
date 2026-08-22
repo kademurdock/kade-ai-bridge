@@ -5277,6 +5277,9 @@ async function voiceReportForSpeech() {
   if (data.memeCombat) bits.push(`meme-combat ${data.memeCombat}x`);
   if (data.sitWith) bits.push(`"sit with that" ${data.sitWith}x`);
   if (data.reassuranceVerdicts) bits.push(`unasked "you're not crazy" reassurance ${data.reassuranceVerdicts}x`);
+  if (data.honestlyMarkers) bits.push(`"and honestly" ${data.honestlyMarkers}x`);
+  if (data.partGrading) bits.push(`"that's the part that" ${data.partGrading}x`);
+  if (data.gasUp) bits.push(`gas-up praise ${data.gasUp}x`);
   if (data.tagsTotal) {
     bits.push(
       data.commaTags
