@@ -5084,6 +5084,43 @@ async function balanceWatchTick() {
   } else {
     console.log('[balance-watch] all providers healthy — staying quiet');
   }
+
+  /* Part 85 (§3.3) — THE SPIKE PAGER. The morning line already says
+   * "running hot", but a runaway loop deserves a page the day it starts,
+   * not a mention the morning after next. Once per provider per day, only
+   * when yesterday's spend beat the rolling average by the factor AND
+   * cleared the floor (tiny pots don't page). SPIKE_PAGER=0 kills. */
+  if (process.env.SPIKE_PAGER !== '0') {
+    try {
+      const factor = Math.max(1.1, parseFloat(process.env.SPIKE_FACTOR || '1.4'));
+      const minUsd = Math.max(0, parseFloat(process.env.SPIKE_MIN_USD || '1'));
+      const urgentUsd = Math.max(minUsd, parseFloat(process.env.SPIKE_URGENT_USD || '5'));
+      if (!balanceWatchState.spikeAlerted) balanceWatchState.spikeAlerted = {};
+      const spend = computeSpend();
+      const spikes = [];
+      for (const l of spend.lines) {
+        const yUsd = l.unit === 'credits' ? l.yesterday / 100 : l.yesterday;
+        const avgUsd = l.unit === 'credits' ? l.avg30 / 100 : l.avg30;
+        if (avgUsd > 0.005 && yUsd >= minUsd && yUsd > avgUsd * factor
+            && balanceWatchState.spikeAlerted[l.provider] !== today) {
+          balanceWatchState.spikeAlerted[l.provider] = today;
+          spikes.push({ line: l, yUsd, avgUsd });
+        }
+      }
+      if (spikes.length) {
+        saveBalanceWatchState();
+        const urgent = spikes.some((s) => s.yUsd >= urgentUsd);
+        const body = spikes.map((s) =>
+          `${s.line.provider} spent ${fmtProviderAmount(s.line.yesterday, s.line.unit)} yesterday against a ${s.line.unit === 'credits' ? Math.round(s.line.avg30) + '-credit' : '$' + s.avgUsd.toFixed(2)} average`
+        ).join('; ') + '. That is a spike, not a drift — worth checking what ran before it runs again tonight.';
+        console.warn(`[spike-pager] ${body}`);
+        runNotify({
+          agentId: 'kade-balance-watch', agentName: 'Estate watch', title: 'Spend spike',
+          body, urgent, userId: CANARY_ADMIN_USER, adminAlert: true,
+        }).catch(() => {});
+      }
+    } catch (e) { console.warn('[spike-pager] check failed:', e.message); }
+  }
 }
 
 if (BALANCE_WATCH) {
@@ -5238,6 +5275,8 @@ async function voiceReportForSpeech() {
   if (data.nominalizations) bits.push(`nominalizations ${data.nominalizations}x`);
   if (data.thatPartMeme) bits.push(`"that part" meme ${data.thatPartMeme}x`);
   if (data.memeCombat) bits.push(`meme-combat ${data.memeCombat}x`);
+  if (data.sitWith) bits.push(`"sit with that" ${data.sitWith}x`);
+  if (data.reassuranceVerdicts) bits.push(`unasked "you're not crazy" reassurance ${data.reassuranceVerdicts}x`);
   if (data.tagsTotal) {
     bits.push(
       data.commaTags
@@ -5357,6 +5396,14 @@ try {
   const { attachMemory } = require('./memory');
   attachMemory(app, { bridgeSecretOk });
 } catch (e) { console.warn('[memory] attach failed (bridge unaffected):', e.message); }
+
+// Part 85 (Aug 22 2026) — TWO NEW REFLEXES: the deploy self-verifier (the
+// stale-hash scar turned into a 15-minute check) and the TTS-synth probe
+// (the voice lane's first tripwire). Kill: DEPLOYWATCH=0 / TTS_PROBE=0.
+try {
+  const { attachDeployWatch } = require('./deploywatch');
+  attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER });
+} catch (e) { console.warn('[deploywatch] attach failed (bridge unaffected):', e.message); }
 
 server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
