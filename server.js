@@ -4145,6 +4145,22 @@ const CANARY_PROBES = [
    * carries kade_games for exactly this probe and nothing else. */
   { q: 'use your games tool to list the games, then name three of them in one short sentence.',
     expect: /blackjack|wild eights|go fish|\buno\b|\bwar\b|\bpig\b|trivia/i, tool: true },
+  /* THE REAL-SEAT PROBE (Part 91.5, Aug 23 2026) — and the reason is the same
+   * shape as the tool probe above, one turn of the screw further.
+   *
+   * On Aug 23 Kiana went down for about two and a half hours and NOTHING SAID
+   * SO. Her persona had grown past a maxContextTokens of 40,000 that nobody
+   * had revisited since a much smaller model, the pruner dropped every message
+   * and the turn died before it reached the model. The canary was green
+   * throughout — 24 straight passes — because the canary only ever tested THE
+   * CANARY AGENT, which carries one tool and a short prompt and could not
+   * possibly hit that ceiling.
+   *
+   * The Aug-21 lesson was "the canary only ever tested chat." This one is
+   * "the canary only ever tested the canary." The seat the whole family
+   * actually talks to has to be in the rotation, prompt weight and all,
+   * because a ceiling can only be hit by the agent that is near it. */
+  { q: 'what colour is a ripe banana? One short sentence.', expect: /yellow/i, seat: 'kiana' },
 ];
 
 const canaryState = (() => {
@@ -4162,6 +4178,12 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
     : CANARY_PROBES[Math.floor(Math.random() * CANARY_PROBES.length)];
   const probe = probeEntry.q;
   const question = `Canary check ${nonce}: ${probe}`;
+  /* A seat probe asks the REAL agent, prompt weight and all. Everything else
+   * about the check — nonce, deleteAfter, scoring, alerting — is identical, so
+   * a failure here reads the same as any other red canary. */
+  const targetAgent = probeEntry.seat === 'kiana'
+    ? (process.env.CANARY_KIANA_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb')
+    : CANARY_AGENT_ID;
   const t0 = Date.now();
   const result = { at: new Date().toISOString(), trigger, ok: false, ms: 0, len: 0, note: '' };
   try {
@@ -4170,7 +4192,7 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
       // deleteAfter (Aug 9 2026, her bloat pass): the probe deletes its own
       // conversation after the reply is read — a canary should sing and
       // vanish, not pile 24 corpses a day into the admin logs view.
-      { agentId: CANARY_AGENT_ID, messages: [{ role: 'user', content: question }], deleteAfter: true },
+      { agentId: targetAgent, messages: [{ role: 'user', content: question }], deleteAfter: true },
       { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: CANARY_TIMEOUT_MS }
     );
     result.ms = Date.now() - t0;
@@ -4178,7 +4200,7 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
     result.len = text.length;
     const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
     const minLen = probeEntry.expect ? 3 : 10;
-    const cls = probeEntry.tool ? 'TOOL probe: ' : '';
+    const cls = probeEntry.tool ? 'TOOL probe: ' : probeEntry.seat ? `SEAT probe (${probeEntry.seat}): ` : '';
     if (!text || text.length < minLen) {
       result.note = `${cls}reply too short (${text.length} chars) — the wordless-turn class${probeEntry.tool ? ' (tool lane suspect — the Aug-21 role-shim outage looked exactly like this)' : ''}`;
     } else if (probeEntry.expect && !probeEntry.expect.test(text)) {
