@@ -36,7 +36,54 @@ const WATCH = [
   { key: 'inworld', name: 'inworld proxy',  repo: 'kademurdock/inworld-tts-proxy', branch: 'main', serviceId: 'c5492e31-cd83-47a6-a37c-a6a16fe4ea31', environmentId: 'c3d3d4c9-7428-4cda-bf70-b0ee45a84673' },
   { key: 'reframe', name: 'reframe proxy',  repo: 'kademurdock/reframe-proxy',     branch: 'main', serviceId: 'd528d4ab-d029-44b2-953c-57c36ac0d586', environmentId: 'c3d3d4c9-7428-4cda-bf70-b0ee45a84673' },
   { key: 'bridge',  name: 'bridge',         repo: 'kademurdock/kade-ai-bridge',    branch: 'main', serviceId: '6ff8f959-9156-4ea0-8774-e16f81a5b14f', environmentId: '25adaf26-3f9e-4cf1-a84a-0f827064349c' },
+  /* Part 89: the two services nothing was watching. The harness can commit and
+   * deploy on its own now, and the page checker is what tells her a page is
+   * broken — a stale-hash lie about either is worse than about the rest. */
+  { key: 'harness', name: 'the harness',    repo: 'kademurdock/kade-harness-svc',  branch: 'main', serviceId: '6b680944-421e-4aba-be7b-06220bdfdef9', environmentId: '5a3e1d32-a52f-45ca-ab9d-7f374366b2b1' },
+  { key: 'pages',   name: 'the page checker', repo: 'kademurdock/kade-page-truth', branch: 'main', serviceId: '7ab454b7-c619-4041-b364-cf4494b2f0d8', environmentId: '5a3e1d32-a52f-45ca-ab9d-7f374366b2b1' },
 ];
+
+/** Central-time day key — "today" means her today, not UTC's. */
+function centralDay(d = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/**
+ * The deploy state, said out loud. PART 89 — this is the "what shipped today,
+ * is anything stale" half of her ops question, and every word of it is
+ * MEASURED: the branch tip from GitHub, the running hash from Railway.
+ *
+ * Silent (returns null) when the watcher has never run or has no rows: a
+ * guessed deploy line is exactly the stale-hash lie this watcher exists to
+ * kill.
+ */
+function speakDeploys(last) {
+  const rows = (last && Array.isArray(last.rows)) ? last.rows : [];
+  if (!rows.length) return null;
+  const today = centralDay();
+  const shipped = rows.filter((r) => r.deployedAt && centralDay(new Date(r.deployedAt)) === today);
+  const broken = rows.filter((r) => r.failed);
+  const stale = rows.filter((r) => r.drifted);
+  const unreadable = rows.filter((r) => r.error);
+
+  const bits = [];
+  bits.push(shipped.length
+    ? `Shipped today: ${shipped.map((r) => `${r.name} at ${r.deployed}`).join(', ')}.`
+    : 'Nothing has deployed today.');
+  if (broken.length) bits.push(`Broken deploy: ${broken.map((r) => `${r.name} is ${r.status} at ${r.deployed}`).join('; ')}.`);
+  if (stale.length) bits.push(`Stale: ${stale.map((r) => `${r.name}'s branch tip ${r.tip} never deployed — it is running ${r.deployed}`).join('; ')}.`);
+  if (unreadable.length) bits.push(`I could not read ${unreadable.map((r) => r.name).join(' or ')} this pass.`);
+  if (!broken.length && !stale.length && !unreadable.length) {
+    bits.push(`All ${rows.length} services are running their branch tips.`);
+  }
+  const age = last.at ? Math.round((Date.now() - Date.parse(last.at)) / 60000) : null;
+  if (age != null && age > 45) bits.push(`That deploy check is ${age} minutes old.`);
+  return bits.join(' ');
+}
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return { deploy: {}, tts: { fails: 0 }, last: null }; }
@@ -68,7 +115,7 @@ async function railwayLatest(serviceId, environmentId, token) {
   return { status: n.status, sha: n.meta?.commitHash || null, at: n.createdAt };
 }
 
-function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }) {
+function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader = {}) {
   const ENABLED = process.env.DEPLOYWATCH !== '0';
   const INTERVAL_MIN = Math.max(5, parseInt(process.env.DEPLOYWATCH_INTERVAL_MIN || '15', 10));
   const GRACE_MIN = Math.max(3, parseInt(process.env.DEPLOYWATCH_GRACE_MIN || '10', 10));
@@ -100,6 +147,9 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }) {
         const row = {
           key: w.key, name: w.name, tip: (tip.sha || '').slice(0, 8), deployed: (dep.sha || '').slice(0, 8),
           status: dep.status, drifted: !!drifted && !busy, failed,
+          // Part 89: WHEN it deployed, so "what shipped today" is a fact and
+          // not an inference from a hash that has been sitting there for a week.
+          deployedAt: dep.at || null, tipAt: tip.at || null,
         };
         rows.push(row);
         const condition = failed ? `failed:${dep.sha}` : (row.drifted ? `drift:${tip.sha}:${dep.sha}` : null);
@@ -130,6 +180,13 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }) {
     }
     return { ok: true, rows };
   }
+
+  /* Part 89 — the same state, read instead of alerted on. /platform-status
+   * calls this, so Kiana can answer "what shipped, is anything stale" without
+   * anyone opening Admin or switching characters. */
+  reader.snapshot = () => state.last || null;
+  reader.speak = () => speakDeploys(state.last);
+  reader.refresh = () => tick('platform-status');
 
   app.get('/deploywatch', (req, res) => {
     if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
@@ -220,4 +277,4 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }) {
   return { tick, ttsProbe };
 }
 
-module.exports = { attachDeployWatch };
+module.exports = { attachDeployWatch, speakDeploys };

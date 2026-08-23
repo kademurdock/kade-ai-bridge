@@ -686,6 +686,11 @@ app.get('/diagnostics', (req, res) => {
   res.json({ count: diagRing.length, entries: diagRing });
 });
 
+/* Part 89: the deploy watcher fills this in when it attaches (further down the
+ * file); /platform-status reads it at request time. Two features that were
+ * already in the same process and had never been introduced. */
+const DEPLOY_READER = {};
+
 /* ── Crash-ring visibility in /platform-status (Aug 14 2026) ─────────────────
  * Amber's six watchdog kills sat in the ring on Aug 13 while /platform-status
  * said "everything is up." The push lane was broken that same window (fixed
@@ -5345,6 +5350,11 @@ app.get('/platform-status', async (req, res) => {
     const spendSpoken = spend.lines.length
       ? `Spend: ${spend.lines.map((l) => l.spoken).join('; ')}.`
       : (spend.note || '');
+    /* PART 89 — "what shipped, is anything stale". Deliberately placed AFTER
+     * the spend line: the fork's platform_status splits family answers at
+     * ' Spend:', so family seats keep hearing health while the ops half stays
+     * hers. Silent when the watcher has nothing measured to say. */
+    const deploySpoken = (typeof DEPLOY_READER.speak === 'function' && DEPLOY_READER.speak()) || '';
     const hotFlags = spend.lines.filter((l) => l.hot);
     const backups = backupStatusForSpeech();
     const balances = balanceStatusForSpeech();
@@ -5355,7 +5365,8 @@ app.get('/platform-status', async (req, res) => {
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday
         && memoryH.okForStatus,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken].filter(Boolean).join(' '),
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken].filter(Boolean).join(' '),
+      deploys: (typeof DEPLOY_READER.snapshot === 'function' && DEPLOY_READER.snapshot()) || null,
       services,
       canary,
       crashes: crash.section,
@@ -5418,7 +5429,7 @@ try {
 // (the voice lane's first tripwire). Kill: DEPLOYWATCH=0 / TTS_PROBE=0.
 try {
   const { attachDeployWatch } = require('./deploywatch');
-  attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER });
+  attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER }, DEPLOY_READER);
 } catch (e) { console.warn('[deploywatch] attach failed (bridge unaffected):', e.message); }
 
 server.listen(port, () => {
