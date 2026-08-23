@@ -5280,6 +5280,19 @@ async function voiceReportForSpeech() {
   if (data.honestlyMarkers) bits.push(`"and honestly" ${data.honestlyMarkers}x`);
   if (data.partGrading) bits.push(`"that's the part that" ${data.partGrading}x`);
   if (data.gasUp) bits.push(`gas-up praise ${data.gasUp}x`);
+  /* PART 87.1 — the two numbers that answer "did she loosen up," spoken every
+   * day because the named tics went to zero while she still read like a
+   * textbook, and Kade could only tell by ear. Targets are from the voice bank
+   * she personally approved: speech markers 12.1 per thousand words, fragments
+   * 0.29 of sentences. Baseline the night this shipped: 3.0 and 0.08. Bossy
+   * rides along so it can be watched STAYING near zero rather than assumed. */
+  if (typeof data.loosePer1k === 'number') {
+    bits.push(`speech markers ${data.loosePer1k} per thousand words, against a target of 12`);
+  }
+  if (typeof data.fragRate === 'number') {
+    bits.push(`${Math.round(data.fragRate * 100)}% of sentences short and hard, against a target of 29`);
+  }
+  if (data.bossyPer1k) bits.push(`advice-and-therapy phrasing ${data.bossyPer1k} per thousand words`);
   if (data.tagsTotal) {
     bits.push(
       data.commaTags
