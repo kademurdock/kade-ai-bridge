@@ -870,8 +870,15 @@ function cut(s, n) {
  * the crash alert: a push built from the RUN's userId or a channel id resolves
  * to no linked device, runNotify returns {ok:false,blocked:'no target user'}
  * WITHOUT rejecting, and the caller's catch never fires — a notifier that
- * cannot deliver, saying nothing. Errand pushes target the OWNER's user id and
- * log the delivery result either way. */
+ * cannot deliver, saying nothing. Errand pushes log the delivery result
+ * either way.
+ *
+ * PART 91.2 (adults-only errands, her word): the tap goes to WHOEVER RAN THE
+ * ERRAND, not always to Kade. The old hard-coded OWNER_ID was correct when
+ * only she could start one and became a bug the moment anyone else could — an
+ * adult family member's errand would have finished by ringing HER phone and
+ * telling THEM nothing. Falls back to the owner only when the errand has no
+ * userId of its own (pre-91.2 rows in the store). */
 async function pushOut(errand, deps, title, body) {
   if (!deps || !deps.runNotify) return;
   try {
@@ -879,7 +886,7 @@ async function pushOut(errand, deps, title, body) {
       agentId: errand.agentId || 'kade-errands',
       agentName: errand.agentName || 'Kiana',
       title, body, urgent: false,
-      userId: OWNER_ID,
+      userId: errand.userId || OWNER_ID,
       category: 'KADE_ERRAND',
     });
     console.log(`[errand] ${errand.id} push "${title}": ${r && r.ok ? `sent:${r.sent != null ? r.sent : 1}` : `NOT SENT — ${r && r.blocked ? r.blocked : 'unknown'}`}`);
