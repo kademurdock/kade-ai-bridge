@@ -161,10 +161,19 @@ const users = loadUsers();
       }
       return;
     }
-    const pending = [...users.values()].filter((u) => u && u.lcPass).length;
+    /* ⚠️ ASK THE DISK, NOT THE MAP. The first version counted in-memory rows
+     * carrying `lcPass` — but decodeRow() sets exactly that field on every
+     * successful DECRYPT, which is the whole point of it. So the count was 2
+     * whether the file held plaintext or ciphertext, and the migration re-saved
+     * and re-logged "encrypted 2 stored password(s)" on EVERY boot. Harmless in
+     * effect, actively misleading in the log: it reads as plaintext coming back
+     * from the dead. Caught by watching two boots print the identical line. */
+    const rawOnDisk = fs.existsSync(USERS_FILE) ? fs.readFileSync(USERS_FILE, 'utf8') : '';
+    const pending = Object.values(rawOnDisk ? JSON.parse(rawOnDisk) : {})
+      .filter((u) => u && typeof u === 'object' && u.lcPass).length;
     if (!pending) return;
     saveUsers();
-    console.log(`[credstore] encrypted ${pending} stored password(s) at rest`);
+    console.log(`[credstore] encrypted ${pending} plaintext password(s) at rest`);
   } catch (e) {
     console.error('[credstore] migration skipped:', e.message);
   }
