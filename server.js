@@ -117,22 +117,58 @@ const twilioClient = getTwilioClient();
 // ── Persistent user store ─────────────────────────────────────────────────────
 // users: phone (E.164) → { name, agentId, agentName, lcEmail?, lcPass? }
 // lcEmail/lcPass = real LibreChat account creds. Guests omit these and use admin token.
+const credstore = require('./credstore');
 const USERS_FILE = path.join(
   process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
   'bridge-users.json'
 );
+/* Aug 24 2026 (Part 92.10) — site passwords are encrypted AT REST now.
+ * The registry still carries `lcPass` IN MEMORY, on purpose: getTokenForCall()
+ * needs the real secret to log in as that caller so their phone call lands on
+ * their own seat. Only the disk shape and the /users response change, which is
+ * why none of the six read sites below needed touching. See credstore.js for
+ * why this is encryption and not a hash, and for the fail-safe: with no
+ * KADE_CREDS_KEY set, behaviour is exactly what it was. */
 function loadUsers() {
   try {
     if (fs.existsSync(USERS_FILE))
-      return new Map(Object.entries(JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))));
+      return new Map(Object.entries(
+        credstore.mapRows(JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')), credstore.decodeRow),
+      ));
   } catch {}
   return new Map();
 }
 function saveUsers() {
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(Object.fromEntries(users))); }
-  catch (e) { console.error('[bridge] Could not save users:', e.message); }
+  try {
+    fs.writeFileSync(
+      USERS_FILE,
+      JSON.stringify(credstore.mapRows(Object.fromEntries(users), credstore.encodeRow)),
+    );
+  } catch (e) { console.error('[bridge] Could not save users:', e.message); }
 }
 const users = loadUsers();
+/* Aug 24 2026 — MIGRATE ON BOOT, because saveUsers() only fires when somebody
+ * registers or links an account. Without this the file would sit in plaintext
+ * until the next new signup, which could be months, and the fix would look
+ * done while doing nothing. Runs once, only when there is a key and there is
+ * actually plaintext to convert. */
+(function migratePlaintextCreds() {
+  try {
+    if (!credstore.getKey()) {
+      const exposed = [...users.values()].filter((u) => u && u.lcPass).length;
+      if (exposed) {
+        console.warn(`[credstore] ${exposed} password(s) still in PLAINTEXT on disk — set ${credstore.KEY_ENV} to encrypt them`);
+      }
+      return;
+    }
+    const pending = [...users.values()].filter((u) => u && u.lcPass).length;
+    if (!pending) return;
+    saveUsers();
+    console.log(`[credstore] encrypted ${pending} stored password(s) at rest`);
+  } catch (e) {
+    console.error('[credstore] migration skipped:', e.message);
+  }
+})();
 
 // -- "Seen before" tracking -- separate from the users map on purpose --------
 // Used only to fire the one-time "translating your voice + thinking takes a
@@ -784,7 +820,12 @@ app.post('/register', (req, res) => {
 
 app.get('/users', (req, res) => {
   if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
-  res.json(Object.fromEntries(users));
+  /* Aug 24 2026 — this used to return `lcPass` IN PLAINTEXT for the rows that
+   * carry one. It is behind BRIDGE_SECRET, but that secret lives in a
+   * credentials file which is itself synced into a git repo, so "admin-only"
+   * was doing less work than it looked like. Callers still learn WHETHER a row
+   * has a password (`hasPass`), which is all any caller ever needed. */
+  res.json(credstore.mapRows(Object.fromEntries(users), credstore.redactRow));
 });
 
 // ── Push notifications (APNs) ───────────────────────────────────────────────────
