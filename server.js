@@ -5332,6 +5332,29 @@ async function fetchVoiceReport() {
   }
   return voiceReportCache;
 }
+/* ⭐ AUG 28 2026 — THE CHUNK COUNTER GETS ITS READER. The TTS proxy counts
+ * per-day synth chunk failures on /health (chunksToday) precisely because her
+ * morning error tone could not be convicted after a log rotation — and a
+ * published number with no consumer is the memory-health lesson verbatim:
+ * the endpoint told the truth for three days while nobody read it. This
+ * folds the proxy's own spoken line into /platform-status, where the morning
+ * report and Forge already look. Informational, never flips platform ok,
+ * cached 10 min. Kill: TTS_CHUNKS_STATUS=0. */
+let ttsChunksCache = { at: 0, data: null };
+async function fetchTtsChunks() {
+  if (Date.now() - ttsChunksCache.at < 10 * 60 * 1000) return ttsChunksCache;
+  try {
+    const r = await axios.get('https://inworld-tts-proxy-production.up.railway.app/health', {
+      headers: { 'User-Agent': BROWSER_UA },
+      timeout: 15000,
+    });
+    ttsChunksCache = { at: Date.now(), data: r.data && r.data.chunksToday ? r.data.chunksToday : null };
+  } catch (_e) {
+    ttsChunksCache = { at: Date.now(), data: null };
+  }
+  return ttsChunksCache;
+}
+
 async function voiceReportForSpeech() {
   if (process.env.VOICE_REPORT_STATUS === '0' || !BRIDGE_SECRET) {
     return { section: { enabled: false }, spoken: '' };
@@ -5379,6 +5402,19 @@ async function voiceReportForSpeech() {
   }
   if (data.topTagPhrase) bits.push(`favorite tag "${data.topTagPhrase.text}" ${data.topTagPhrase.count}x`);
   if (data.repeatedCloser) bits.push(`one closer repeated ${data.repeatedCloser.count}x`);
+  /* The synth-chunk health rides the same spoken line — a failure count that
+   * only matters on the day she reports a hole in a voice clip, which is
+   * exactly the day nobody has time to go log-diving. */
+  if (process.env.TTS_CHUNKS_STATUS !== '0') {
+    const { data: chunks } = await fetchTtsChunks();
+    if (chunks && (chunks.ok || chunks.failed)) {
+      bits.push(
+        chunks.failed
+          ? `voice chunks today ${chunks.ok} good and ${chunks.failed} FAILED${chunks.retried ? ` (${chunks.retried} healed by retry)` : ''}`
+          : `all ${chunks.ok} voice chunks today synthesized clean`,
+      );
+    }
+  }
   return {
     section: { enabled: true, ...data },
     spoken: `Kiana's voice, last day: ${bits.join(', ')}.`,

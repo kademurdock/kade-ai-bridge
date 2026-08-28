@@ -38,17 +38,102 @@ const path = require('path');
 // same reply falls back to flat/default delivery. This mirrors the proxy's own
 // non-verbal/direction distinction and re-implements carry-forward at the
 // reply level, tracked across the separate per-sentence synthesize() calls.
-const NONVERBAL_TAGS = new Set(['laugh', 'breathe', 'clear throat', 'sigh', 'cough', 'yawn']);
+/* ⭐ AUG 28 2026 — THE PHONE LANE CATCHES UP WITH THE OTHER TWO, because her
+ * "a single tag carried over the entire message" was fixed twice yesterday
+ * (proxy Aug 18, app Aug 28) and this third copy of the same design still had
+ * ALL THREE of the original faults:
+ *
+ *   1. CARRY-FOREVER. dirState.active never expired, so one opening
+ *      %%%slow and soothing%%% steered an entire phone reply — on the lane
+ *      where replies are spoken end-to-end with nobody able to scroll away.
+ *   2. THE SIX-SOUND LIST. Inworld recognizes ~45 non-verbal sounds
+ *      (docs.inworld.ai/tts/capabilities/steering, re-read Aug 28 2026); the
+ *      proxy's sounds.js has carried the full list since Part 92.14. This
+ *      copy still knew six, so %%%gasp%%% or %%%chuckle%%% was classified a
+ *      DIRECTION and pinned onto every following sentence — a gasp per
+ *      sentence for the rest of the call.
+ *   3. NO RESET. %%%reset%%% is Inworld's own end-the-carry word and the
+ *      persona teaches it; here it fell into dirState.active like any
+ *      direction and was stamped onto every later sentence.
+ *
+ * Same decay numbers as the app's SpeechStreamer (2 carried units / 600
+ * chars, PHONE_TAG_CARRY / PHONE_TAG_CARRY_CHARS to tune) so the three lanes
+ * can be reasoned about as one design. A NEW authored tag re-arms the carry;
+ * a sound never does; reset ends it.
+ *
+ * ⚠️ SHARED-VOCABULARY NOTE: the canonical sound list below is a copy of
+ * sounds.js (inworld-tts-proxy) because the two repos cannot require each
+ * other. If Inworld's list grows, BOTH copies grow — the retry-ladder lesson
+ * says drift between siblings is the bug, so both files name each other. */
+const CANONICAL_SOUNDS = [
+  'breathe', 'sigh', 'gasp', 'pant', 'huff', 'grunt', 'groan', 'moan',
+  'laugh', 'chuckle', 'giggle', 'cackle', 'snort', 'scoff',
+  'cry', 'sob', 'wail', 'whimper', 'whine', 'sniffle', 'sniff', 'shriek', 'squeal', 'howl',
+  'clear throat', 'cough', 'sneeze', 'hiccup', 'yawn', 'burp', 'snore', 'choke', 'gag',
+  'swallow', 'gulp', 'spit',
+  'tongue click', 'mouth click', 'mouth sound', 'lip smack', 'kiss', 'shush', 'raspberry',
+  'whistle', 'bleh',
+  'chew', 'slurp',
+  'babble', 'beatbox', 'growl',
+];
+/* [shout] [scream] [sing] [hum] [mumble] describe HOW words are spoken — the
+ * docs call these out as instructions, and instructions are exactly what the
+ * carry exists for. They stay on the direction side. */
+const NOT_SOUNDS = new Set(['shout', 'scream', 'sing', 'hum', 'mumble']);
+function normalizeTag(inner) {
+  return String(inner == null ? '' : inner).toLowerCase().replace(/[^a-z]+/g, ' ').trim();
+}
+function tagVariants(tag) {
+  const infl = (w) => {
+    const v = [w, w.endsWith('s') ? w : w + 's'];
+    v.push(w.endsWith('e') ? w.slice(0, -1) + 'ing' : w + 'ing');
+    v.push(w.endsWith('e') ? w + 'd' : w + 'ed');
+    return v;
+  };
+  const words = tag.split(' ');
+  const out = new Set();
+  if (words.length === 1) {
+    for (const v of infl(words[0])) out.add(v);
+  } else {
+    const [a, b] = words;
+    for (const v of infl(a)) { out.add(`${v} ${b}`); out.add(`${b} ${v}`); }
+  }
+  return out;
+}
+const NONVERBAL_TAGS = new Set();
+for (const t of CANONICAL_SOUNDS) for (const v of tagVariants(t)) NONVERBAL_TAGS.add(v);
+function isSoundTag(inner) {
+  const n = normalizeTag(inner);
+  return Boolean(n) && !NOT_SOUNDS.has(n) && NONVERBAL_TAGS.has(n);
+}
 const STEERING_LEAD_RE = /^\s*%%%([\s\S]*?)%%%/;
+const PHONE_TAG_CARRY = parseInt(process.env.PHONE_TAG_CARRY || '2', 10);
+const PHONE_TAG_CARRY_CHARS = parseInt(process.env.PHONE_TAG_CARRY_CHARS || '600', 10);
 
 function applyDirectionCarry(sentence, dirState) {
   const m = sentence.match(STEERING_LEAD_RE);
   if (m) {
     const dir = m[1].trim();
-    if (!NONVERBAL_TAGS.has(dir.toLowerCase())) dirState.active = dir;
+    if (normalizeTag(dir) === 'reset') {
+      dirState.active = null;
+      dirState.carried = 0;
+      dirState.chars = 0;
+    } else if (!isSoundTag(dir)) {
+      dirState.active = dir;
+      dirState.carried = 0;
+      dirState.chars = 0;
+    }
     return sentence; // already tagged -- send as-is
   }
-  if (dirState.active) return `%%%${dirState.active}%%% ${sentence}`;
+  if (dirState.active) {
+    if (dirState.carried >= PHONE_TAG_CARRY || dirState.chars >= PHONE_TAG_CARRY_CHARS) {
+      dirState.active = null;
+      return sentence;
+    }
+    dirState.carried = (dirState.carried || 0) + 1;
+    dirState.chars = (dirState.chars || 0) + sentence.length;
+    return `%%%${dirState.active}%%% ${sentence}`;
+  }
   return sentence;
 }
 
