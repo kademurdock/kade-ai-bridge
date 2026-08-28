@@ -262,7 +262,39 @@ function buildSetupMessage(session) {
   };
 }
 
+/* ⭐ AUG 28 2026 — THE LIVE-SILENCE WATCHDOG, written the evening a real
+ * spotter call went: "Hey. Can you see how much is left in this?" …
+ * "Are you there?" … "Hello?" — three turns, thirty-one seconds, and not one
+ * word back. Google completed setup and then generated NOTHING for the whole
+ * call. An hour later the identical session shape (same key, same model,
+ * same setup, big persona, video frames, audio VAD) answered perfectly from
+ * a cold client — a transient Live brownout, the kind a preview endpoint is
+ * allowed to have and this lane silently absorbed.
+ *
+ * The brownout is Google's; the DEAD AIR was ours. Same law as today's
+ * sensitive-block notice on the reframe: an upstream that goes quiet must
+ * never reach her as unexplained silence. The watchdog arms when the session
+ * comes up, and if NO model audio has arrived N seconds later (default 12 —
+ * the greet is requested at setup, so a healthy session speaks well inside
+ * that), it says so once, out loud, through the normal synth voice the call
+ * already has, and logs LOUDLY so the next log-diver finds a verdict instead
+ * of a gap. One warning per call, never nagging. LIVE_SILENCE_MS=0 disables. */
+const LIVE_SILENCE_MS = () => {
+  const v = parseInt(process.env.LIVE_SILENCE_MS || '12000', 10);
+  return Number.isFinite(v) ? v : 12000;
+};
+const LIVE_SILENT_LINE =
+  "Hey, it's not you — the live eyes aren't answering me right now. Google's end has gone quiet. Give it a few seconds, or hang up and call back; it usually comes right back.";
+/** Pure verdict so the test can hold it still: warn exactly once, only while
+ * live, only if the deadline passed with zero model audio ever heard. */
+function shouldWarnLiveSilence({ liveOn, armedAt, firstAudioAt, warned, now, ms }) {
+  if (!liveOn || warned || !armedAt || !ms || ms <= 0) return false;
+  if (firstAudioAt) return false;
+  return now - armedAt >= ms;
+}
+
 function startLive(session, speak) {
+  session._liveSpeak = speak || null;
   if (!enabled()) {
     try { session.jsonSend({ type: 'live-state', on: false, reason: 'disabled', message: "Live mode isn't switched on for this site yet — regular video works as always." }); } catch {}
     return;
@@ -326,6 +358,33 @@ function handleGoogleMessage(session, raw) {
       } catch { /* fail-soft */ }
     }
     console.log(`[video-live] LIVE session up user=${session.userId} model=${liveModel()}`);
+    /* Arm the silence watchdog. Cleared by the first model audio; fires at
+     * most once per call. */
+    session._liveArmedAt = Date.now();
+    session._liveFirstAudioAt = 0;
+    session._liveSilenceWarned = false;
+    if (session._liveWatch) clearTimeout(session._liveWatch);
+    if (LIVE_SILENCE_MS() > 0) {
+      session._liveWatch = setTimeout(() => {
+        try {
+          if (shouldWarnLiveSilence({
+            liveOn: session.liveOn,
+            armedAt: session._liveArmedAt,
+            firstAudioAt: session._liveFirstAudioAt,
+            warned: session._liveSilenceWarned,
+            now: Date.now(),
+            ms: LIVE_SILENCE_MS(),
+          })) {
+            session._liveSilenceWarned = true;
+            console.warn(`[video-live] WATCHDOG: no model audio ${LIVE_SILENCE_MS()}ms after setup (user=${session.userId}) — speaking the silence notice`);
+            try { session.history.push({ role: 'assistant', content: LIVE_SILENT_LINE }); } catch {}
+            const sp = session._liveSpeak;
+            if (sp) sp(session, LIVE_SILENT_LINE, session.voice).catch(() => {});
+          }
+        } catch { /* the watchdog must never hurt the call */ }
+      }, LIVE_SILENCE_MS() + 50);
+      if (session._liveWatch.unref) session._liveWatch.unref();
+    }
     return;
   }
   // Spoken audio back from Google: 24kHz PCM16 chunks (verified live:
@@ -337,6 +396,7 @@ function handleGoogleMessage(session, raw) {
   if (Array.isArray(parts)) {
     for (const p of parts) {
       if (p.inlineData && p.inlineData.data) {
+        if (!session._liveFirstAudioAt) session._liveFirstAudioAt = Date.now();
         try {
           const pcm = Buffer.from(p.inlineData.data, 'base64');
           if (pcm.length && session.ws && session.ws.readyState === 1) {
@@ -416,6 +476,7 @@ function forwardFrame(session, b64jpeg) {
 
 function stopLive(session, reason) {
   if (session._liveTick) { clearInterval(session._liveTick); session._liveTick = null; }
+  if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
   // Commit any half-finished model turn so a hangup mid-sentence still lands
   // the Spotter's last words in the post-call transcript. Fail-soft.
   if (session._liveModelText && session._liveModelText.trim()) {
@@ -494,6 +555,8 @@ function handleLiveMsg(session, msg, speak) {
   }
 }
 
-module.exports = { enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
+module.exports = {
+  shouldWarnLiveSilence,
+  LIVE_SILENT_LINE, enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
 // Exported for the pre-push test harness only — not called across modules.
 module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl };
