@@ -5499,6 +5499,22 @@ try {
 // Part 85 (Aug 22 2026) — TWO NEW REFLEXES: the deploy self-verifier (the
 // stale-hash scar turned into a 15-minute check) and the TTS-synth probe
 // (the voice lane's first tripwire). Kill: DEPLOYWATCH=0 / TTS_PROBE=0.
+// Part 93 (Aug 28 2026) — SPONTANEOUS FRIEND-TEXTS: when somebody's been
+// quiet a few days, Kiana texts first — composed on THEIR seat so her memory
+// of them writes the text, delivered through runNotify so every guardrail
+// holds. Adults only, per-user toggle (self-serve via KadeNotify's
+// spontaneous_on/off), volume-persisted gaps. Kill: SPONTANEOUS=0.
+// Full story atop spontaneous.js.
+try {
+  const { attachSpontaneous } = require('./spontaneous');
+  attachSpontaneous(app, {
+    bridgeSecretOk, notifySecretOk, runNotify,
+    proxyUrl: PROXY_URL, proxySecret: PROXY_SECRET,
+    browserUA: BROWSER_UA, siteBase: LIBRECHAT_URL,
+    kianaAgentId: DEFAULT_AGENT, kianaName: DEFAULT_AGENT_NAME,
+  });
+} catch (e) { console.warn('[spontaneous] attach failed (bridge unaffected):', e.message); }
+
 try {
   const { attachDeployWatch } = require('./deploywatch');
   attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER }, DEPLOY_READER);
