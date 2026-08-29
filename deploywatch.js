@@ -43,6 +43,68 @@ const WATCH = [
   { key: 'pages',   name: 'the page checker', repo: 'kademurdock/kade-page-truth', branch: 'main', serviceId: '7ab454b7-c619-4041-b364-cf4494b2f0d8', environmentId: '5a3e1d32-a52f-45ca-ab9d-7f374366b2b1' },
 ];
 
+/* ── Part 97 (Aug 29 2026): THE PROBE GROWS EARS. The old §3.1 probe asserted
+ * "is audio, bigger than 4KB" about one short sentence on one voice — it could
+ * hear a dead lane, but not a missing middle chunk (her actual Aug-28 morning
+ * bug), never touched the fish lane, and had no sense of how long a clip
+ * SHOULD be. These two pure functions are the ears; the lane runner below
+ * feeds them. Not listening, but counting — the smallest honest start the
+ * white-whale note kept asking for. */
+
+/** Parse a 16-bit PCM WAV: duration + the longest run of near-silence.
+ *  Returns null for anything it cannot honestly measure (not RIFF, not
+ *  16-bit) — callers fall back to the old byte check rather than guess. */
+function inspectWav(buf) {
+  if (!buf || buf.length < 44) return null;
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+  let off = 12, fmt = null, data = null;
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4);
+    const size = buf.readUInt32LE(off + 4);
+    if (id === 'fmt ' && off + 24 <= buf.length) {
+      fmt = { channels: buf.readUInt16LE(off + 10), rate: buf.readUInt32LE(off + 12), bits: buf.readUInt16LE(off + 22) };
+    }
+    if (id === 'data') data = { start: off + 8, size: Math.min(size, buf.length - off - 8) };
+    off += 8 + size + (size % 2);
+    if (fmt && data) break;
+  }
+  if (!fmt || !data || fmt.bits !== 16 || !fmt.rate || !fmt.channels) return null;
+  const bytesPerSec = fmt.rate * fmt.channels * 2;
+  const durationMs = Math.round((data.size / bytesPerSec) * 1000);
+  /* Silence scan: 20ms windows, peak under ~-38 dBFS counts as dead air.
+   * Stitched seams are digital near-zero; clone room tone sits above 400. */
+  const win = Math.max(1, Math.round(fmt.rate * fmt.channels * 0.02));
+  let longest = 0, run = 0;
+  const end = data.start + data.size;
+  for (let i = data.start; i + 2 * win <= end; i += 2 * win) {
+    let peak = 0;
+    for (let j = 0; j < win; j++) {
+      const v = Math.abs(buf.readInt16LE(i + 2 * j));
+      if (v > peak) peak = v;
+    }
+    if (peak < 400) { run += 20; if (run > longest) longest = run; } else { run = 0; }
+  }
+  return { durationMs, longestSilenceMs: longest };
+}
+
+/** The verdict, separated from the plumbing so it can be tested bare.
+ *  floorMsPerChar is the bootstrap check (before a lane has a baseline);
+ *  baselineMs, once a lane has one, is the sharper judge: a clip under
+ *  baselineFrac of the lane's own running average means a piece went missing. */
+function judgeTts(wav, textLen, baselineMs, { floorMsPerChar = 25, baselineFrac = 0.6, maxSilenceMs = 3000 } = {}) {
+  const floorMs = Math.round(textLen * floorMsPerChar);
+  if (wav.durationMs < floorMs) {
+    return { ok: false, note: `audio too short for the text (${wav.durationMs}ms < ${floorMs}ms floor) — a chunk may be missing` };
+  }
+  if (baselineMs && wav.durationMs < baselineMs * baselineFrac) {
+    return { ok: false, note: `audio far under this lane's own baseline (${wav.durationMs}ms vs ~${Math.round(baselineMs)}ms) — a chunk may be missing` };
+  }
+  if (wav.longestSilenceMs > maxSilenceMs) {
+    return { ok: false, note: `a ${wav.longestSilenceMs}ms dead-air gap inside the clip` };
+  }
+  return { ok: true, note: '' };
+}
+
 /** Central-time day key — "today" means her today, not UTC's. */
 function centralDay(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -205,56 +267,106 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
     console.log('[deploywatch] off (DEPLOYWATCH=0)');
   }
 
-  // ── The TTS-synth probe (§3.1) ──────────────────────────────────────────
+  // ── The TTS-synth probe (§3.1, ears grown Part 97) ──────────────────────
   const TTS_ENABLED = process.env.TTS_PROBE !== '0';
   const TTS_HOURS = Math.max(1, parseInt(process.env.TTS_PROBE_HOURS || '6', 10));
   const TTS_URL = (process.env.TTS_PROBE_URL || 'https://inworld-tts-proxy-production.up.railway.app/v1/audio/speech').trim();
   const TTS_VOICE = (process.env.TTS_PROBE_VOICE || 'alloy').trim();
+  /* Part 97: the fish lane gets probed too — the whole clone library rode on
+   * "it worked in July" until now. '' disables. Cost per probe: ~200 UTF-8
+   * bytes at $15/M = three ten-thousandths of a cent. */
+  const TTS_FISH_VOICE = (process.env.TTS_PROBE_FISH_VOICE || 'Voice 327').trim();
   const TTS_MIN_BYTES = Math.max(1000, parseInt(process.env.TTS_PROBE_MIN_BYTES || '4000', 10));
+  /* Three sentences on purpose: the proxy chunks and stitches them, so a
+   * dropped middle chunk shortens the clip in a way duration can hear. */
+  const TTS_PROBE_TEXT = (process.env.TTS_PROBE_TEXT
+    || 'Voice check, sentence one is short. This is the second sentence, a touch longer, sitting in the middle of the message. And a third sentence closes it out so the whole shape can be measured.').trim();
+  const TTS_MS_PER_CHAR = Math.max(5, parseInt(process.env.TTS_PROBE_MS_PER_CHAR || '25', 10));
+  const TTS_BASELINE_FRAC = Math.min(0.95, Math.max(0.1, parseFloat(process.env.TTS_PROBE_BASELINE_FRAC || '0.6')));
+  const TTS_MAX_SILENCE_MS = Math.max(500, parseInt(process.env.TTS_PROBE_MAX_SILENCE_MS || '3000', 10));
 
-  async function ttsProbe(trigger = 'tick') {
+  if (!state.tts || typeof state.tts.fails === 'number') state.tts = { fails: {} }; // migrate the old single-lane shape
+  if (!state.ttsBase) state.ttsBase = {};
+
+  async function probeLane(lane, voice, trigger) {
     const t0 = Date.now();
-    const result = { at: new Date().toISOString(), trigger, ok: false, ms: 0, bytes: 0, note: '' };
+    const result = { lane, voice, at: new Date().toISOString(), trigger, ok: false, ms: 0, bytes: 0, durationMs: null, longestSilenceMs: null, note: '' };
     try {
       const r = await fetch(TTS_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
-        body: JSON.stringify({ input: 'Voice check. All good.', voice: TTS_VOICE, model: 'tts-1' }),
+        body: JSON.stringify({ input: TTS_PROBE_TEXT, voice, model: 'tts-1', response_format: 'wav' }),
       });
       const buf = Buffer.from(await r.arrayBuffer());
-      result.ms = Date.now() - t0; result.bytes = buf.length;
+      result.bytes = buf.length;
       const ctype = String(r.headers.get('content-type') || '');
       if (!r.ok) result.note = `HTTP ${r.status}`;
       else if (/json|text\/html/.test(ctype)) result.note = `non-audio content-type ${ctype}`;
       else if (buf.length < TTS_MIN_BYTES) result.note = `audio too small (${buf.length}B < ${TTS_MIN_BYTES})`;
-      else result.ok = true;
+      else {
+        const wav = inspectWav(buf);
+        if (!wav) {
+          /* Unparseable (format change, future codec): the old byte check
+           * already passed, so stay green rather than false-alarm — but say so. */
+          result.ok = true;
+          result.note = 'unparsed audio format — size check only';
+        } else {
+          result.durationMs = wav.durationMs;
+          result.longestSilenceMs = wav.longestSilenceMs;
+          const base = state.ttsBase[lane];
+          const baselineMs = base && base.text === TTS_PROBE_TEXT ? base.ms : null;
+          const verdict = judgeTts(wav, TTS_PROBE_TEXT.length, baselineMs, {
+            floorMsPerChar: TTS_MS_PER_CHAR, baselineFrac: TTS_BASELINE_FRAC, maxSilenceMs: TTS_MAX_SILENCE_MS,
+          });
+          result.ok = verdict.ok;
+          result.note = verdict.note;
+          if (verdict.ok) {
+            /* The lane's own baseline, EMA over GREEN runs only, keyed to the
+             * exact probe text so a text change restarts calibration. */
+            state.ttsBase[lane] = {
+              text: TTS_PROBE_TEXT,
+              ms: baselineMs ? Math.round(baselineMs * 0.7 + wav.durationMs * 0.3) : wav.durationMs,
+              runs: ((base && base.runs) || 0) + 1,
+            };
+          }
+        }
+      }
     } catch (e) {
-      result.ms = Date.now() - t0; result.note = e.message;
+      result.note = e.message;
     }
-    state.ttsLast = result;
+    result.ms = Date.now() - t0;
+    const fails = state.tts.fails;
     if (result.ok) {
-      const wasFailing = state.tts.fails >= 2;
-      state.tts.fails = 0;
+      const wasFailing = (fails[lane] || 0) >= 2;
+      fails[lane] = 0;
       if (wasFailing) {
         runNotify({
           agentId: 'kade-tts-probe', agentName: 'Estate watch', title: 'Voices',
-          body: 'The voice lane is answering again — TTS synth probe back to green.',
+          body: `The ${lane} voice lane is answering again — synth probe back to green.`,
           urgent: false, userId: adminUser, adminAlert: true,
         }).catch(() => {});
       }
     } else {
-      state.tts.fails += 1;
-      console.warn(`[tts-probe] FAIL #${state.tts.fails}: ${result.note} (${result.ms}ms, ${result.bytes}B)`);
-      if (state.tts.fails === 2) {
+      fails[lane] = (fails[lane] || 0) + 1;
+      console.warn(`[tts-probe] ${lane} FAIL #${fails[lane]}: ${result.note} (${result.ms}ms, ${result.bytes}B)`);
+      if (fails[lane] === 2) {
         runNotify({
           agentId: 'kade-tts-probe', agentName: 'Estate watch', title: 'Voices',
-          body: `The voice lane failed its synth check twice running (${result.note}). Characters may be answering in silence — the inworld proxy is the place to look.`,
+          body: `The ${lane} voice lane failed its synth check twice running (${result.note}). ${lane === 'fish' ? 'Clone voices' : 'Characters'} may be answering wrong or in silence — the inworld proxy is the place to look.`,
           urgent: false, userId: adminUser, adminAlert: true,
         }).catch(() => {});
       }
     }
-    saveState(state);
     return result;
+  }
+
+  async function ttsProbe(trigger = 'tick') {
+    const results = [await probeLane('default', TTS_VOICE, trigger)];
+    if (TTS_FISH_VOICE) results.push(await probeLane('fish', TTS_FISH_VOICE, trigger));
+    const combined = { at: new Date().toISOString(), trigger, ok: results.every((r) => r.ok), results };
+    state.ttsLast = combined;
+    saveState(state);
+    return combined;
   }
 
   app.post('/tts-probe/run', async (req, res) => {
@@ -263,13 +375,14 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   });
   app.get('/tts-probe', (req, res) => {
     if (!bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'forbidden' });
-    res.json({ enabled: TTS_ENABLED, everyHours: TTS_HOURS, last: state.ttsLast || null, consecutiveFails: state.tts.fails });
+    const failMax = Math.max(0, ...Object.values(state.tts.fails || {}));
+    res.json({ enabled: TTS_ENABLED, everyHours: TTS_HOURS, last: state.ttsLast || null, consecutiveFails: failMax, perLaneFails: state.tts.fails || {}, baselines: state.ttsBase || {} });
   });
 
   if (TTS_ENABLED) {
     setTimeout(() => { ttsProbe('boot').catch(() => {}); }, 7 * 60 * 1000);
     setInterval(() => { ttsProbe('tick').catch(() => {}); }, TTS_HOURS * 60 * 60 * 1000);
-    console.log(`[tts-probe] armed: every ${TTS_HOURS}h via ${TTS_URL.split('/')[2]}`);
+    console.log(`[tts-probe] armed: every ${TTS_HOURS}h via ${TTS_URL.split('/')[2]} (lanes: default${TTS_FISH_VOICE ? '+fish' : ''})`);
   } else {
     console.log('[tts-probe] off (TTS_PROBE=0)');
   }
@@ -277,4 +390,4 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   return { tick, ttsProbe };
 }
 
-module.exports = { attachDeployWatch, speakDeploys };
+module.exports = { attachDeployWatch, speakDeploys, inspectWav, judgeTts };

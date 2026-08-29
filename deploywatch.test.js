@@ -54,3 +54,61 @@ test('with nothing measured it says NOTHING — a guessed deploy line is the lie
   assert.strictEqual(speakDeploys({}), null);
   assert.strictEqual(speakDeploys({ at: NOW, rows: [] }), null);
 });
+
+/* ── Part 97: the probe's ears, tested on synthetic WAVs ──────────────────
+ * Red-proof: remove the duration floor, the baseline check, or the silence
+ * scan from judgeTts/inspectWav and the matching test below fails. */
+const { inspectWav, judgeTts } = require('./deploywatch.js');
+
+function makeWav({ seconds, silentFrom = null, silentTo = null, rate = 24000 }) {
+  const n = Math.round(seconds * rate);
+  const data = Buffer.alloc(n * 2);
+  for (let i = 0; i < n; i++) {
+    const t = i / rate;
+    const silent = silentFrom !== null && t >= silentFrom && t < silentTo;
+    // speech-ish: loud enough to clear the 400 peak threshold in every 20ms window
+    const v = silent ? 0 : Math.round(6000 * Math.sin(2 * Math.PI * 180 * t) + 1500 * Math.sin(2 * Math.PI * 47 * t));
+    data.writeInt16LE(Math.max(-32768, Math.min(32767, v)), i * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii'); header.writeUInt32LE(36 + data.length, 4);
+  header.write('WAVE', 8, 'ascii'); header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * 2, 28);
+  header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii'); header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+}
+
+test('inspectWav measures duration and finds a dead-air gap', () => {
+  const wav = inspectWav(makeWav({ seconds: 8, silentFrom: 3, silentTo: 7 }));
+  assert.ok(Math.abs(wav.durationMs - 8000) < 60, `duration ${wav.durationMs}`);
+  assert.ok(wav.longestSilenceMs > 3500 && wav.longestSilenceMs < 4500, `gap ${wav.longestSilenceMs}`);
+});
+
+test('inspectWav refuses what it cannot measure', () => {
+  assert.strictEqual(inspectWav(Buffer.from('ID3 not a wav at all, some mp3-shaped bytes')), null);
+});
+
+test('THE MISSING-MIDDLE EAR: a clip too short for its text fails the floor', () => {
+  const v = judgeTts({ durationMs: 2000, longestSilenceMs: 0 }, 180, null);
+  assert.strictEqual(v.ok, false);
+  assert.match(v.note, /too short for the text/);
+});
+
+test('a clip far under its own lane baseline fails even past the floor', () => {
+  const v = judgeTts({ durationMs: 5000, longestSilenceMs: 0 }, 180, 10000);
+  assert.strictEqual(v.ok, false);
+  assert.match(v.note, /under this lane's own baseline/);
+});
+
+test('a long dead-air gap fails on its own', () => {
+  const v = judgeTts({ durationMs: 12000, longestSilenceMs: 4200 }, 180, 11500);
+  assert.strictEqual(v.ok, false);
+  assert.match(v.note, /dead-air gap/);
+});
+
+test('a healthy clip passes all three ears', () => {
+  const v = judgeTts({ durationMs: 11000, longestSilenceMs: 900 }, 180, 11500);
+  assert.strictEqual(v.ok, true);
+});
