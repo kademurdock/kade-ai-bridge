@@ -107,6 +107,38 @@ function isSoundTag(inner) {
   return Boolean(n) && !NOT_SOUNDS.has(n) && NONVERBAL_TAGS.has(n);
 }
 const STEERING_LEAD_RE = /^\s*%%%([\s\S]*?)%%%/;
+
+/* ⭐ AUG 28 2026 — SUBTITLES SHOWED THE STAGE DIRECTIONS. Her report: "it
+ * prints the tags on the subtitles when she's talking, even if it doesn't
+ * say them reading out in her voice."
+ *
+ * Exactly right, and the split is visible one screen up: the text handed to
+ * the SYNTH goes through applyDirectionCarry (and the proxy strips the tags
+ * before Inworld ever sees them), while `session._currentSpokenText` — the
+ * string the caption ships — is the RAW sentence, tags and all. So the ear
+ * got a clean performance and the eye got "%%%warm and a little amused%%%".
+ * For a screen-reader user that is worse than cosmetic: VoiceOver reads the
+ * caption aloud, so she hears the direction spoken over the top of the
+ * delivery it was describing.
+ *
+ * Captions only. The synth input, the history, the transcript and the memory
+ * writer all keep the authored text — a tag is real authorship and the record
+ * should hold it; it just is not something to SHOW or SPEAK.
+ *
+ * Also drops [sound:] cues and bracket stage business for the same reason,
+ * and collapses the whitespace the removal leaves behind. Fail-soft: if
+ * stripping would empty the line, the original rides rather than shipping a
+ * blank subtitle. */
+function captionSafe(text) {
+  const raw = String(text == null ? '' : text);
+  const out = raw
+    .replace(/%%%[\s\S]*?%%%/g, ' ')
+    .replace(/%{2,}/g, ' ')
+    .replace(/\[sound:[^\]]*\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return out || raw.trim();
+}
 const PHONE_TAG_CARRY = parseInt(process.env.PHONE_TAG_CARRY || '2', 10);
 const PHONE_TAG_CARRY_CHARS = parseInt(process.env.PHONE_TAG_CARRY_CHARS || '600', 10);
 
@@ -2480,7 +2512,7 @@ async function playBufferWav(session, wavBuf, opts = {}) {
   session.isSpeaking     = true;
   session.speakStartedAt = Date.now();
   session.bargedIn       = false;
-  if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', session._currentSpokenText);
+  if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', captionSafe(session._currentSpokenText));
   if (session.sendState) session.sendState('speaking');
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
@@ -3548,7 +3580,10 @@ class WebCallSession extends CallSession {
     this.jsonSend({ type: 'clear' });
     this.jsonSend({ type: 'state', state: 'listening' });
   }
-  sendCaption(role, text) { this.jsonSend({ type: 'caption', role, text }); }
+  /* captionSafe at the door as well as at the call site: a future caller
+   * that forgets is the shape that keeps costing here (three copies of a
+   * sound list this week). Idempotent — stripping clean text is a no-op. */
+  sendCaption(role, text) { this.jsonSend({ type: 'caption', role, text: captionSafe(text) }); }
   sendState(state)        { this.jsonSend({ type: 'state', state }); }
   sendCue(name)           { this.jsonSend({ type: 'cue', name }); }
   sendTable(id)           { this.jsonSend({ type: 'table', id }); }
