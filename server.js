@@ -1169,7 +1169,21 @@ app.post('/notify', async (req, res) => {
    * fork already sends — no fork change, no new field, no trust widening;
    * old builds ignore unknown categories, so this is safe ahead of 195. */
   const category = /^front door/i.test(String(b.title || '')) ? 'KADE_DOORBELL' : undefined;
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId, broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: bridgeSecretOk(req, b.secret) && b.adminAlert === true, category, route: b.route });
+  /* Part 101 — an admin alert with no userId now targets the OWNER instead of
+   * refusing. Every internal caller (canary, deploy watch, crash ring, low
+   * balance, feedback) already passes `userId: CANARY_ADMIN_USER` by hand; the
+   * only thing that fact-in-nine-places bought was that a NEW admin caller — the
+   * harness's run-landed push, in another service — would have to carry a copy
+   * of her user id in its own environment to say anything at all.
+   *
+   * Safe by construction: adminAlert is already gated on the ADMIN secret
+   * (bridgeSecretOk), so this widens nothing an agent can reach. And it cannot
+   * become an accidental broadcast — the July-21 fix means a send with no
+   * userId and no explicit broadcast targets NOBODY and refuses, rather than
+   * falling back to every registered phone. An admin caller that means someone
+   * else still passes userId and still wins. */
+  const isAdminAlert = bridgeSecretOk(req, b.secret) && b.adminAlert === true;
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, category, route: b.route });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
