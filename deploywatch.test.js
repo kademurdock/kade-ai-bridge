@@ -112,3 +112,46 @@ test('a healthy clip passes all three ears', () => {
   const v = judgeTts({ durationMs: 11000, longestSilenceMs: 900 }, 180, 11500);
   assert.strictEqual(v.ok, true);
 });
+
+/* ── Part 99 (Aug 30 2026): the streamed lane's own ear ──────────────────────
+ * The three judges above read audio. This one reads whether the audio came
+ * off the lane we asked for — the failure that looks exactly like success. */
+const { judgeStreamMarker } = require('./deploywatch.js');
+
+test('THE FALLBACK TRAP: perfect audio off the WRONG lane is a failure', () => {
+  const v = judgeStreamMarker({ requested: true, marker: false });
+  assert.strictEqual(v.ok, false);
+  assert.match(v.note, /did NOT stream/);
+  assert.match(v.note, /x-kade-tts-streamed/, 'the note must name the marker so the next person can grep for it');
+  assert.match(v.note, /buffered/, 'and must say where it went instead');
+});
+
+test('a genuinely streamed response passes', () => {
+  assert.deepStrictEqual(judgeStreamMarker({ requested: true, marker: true }), { ok: true, note: '' });
+});
+
+test('the buffered lanes are never judged by a marker they do not send', () => {
+  assert.strictEqual(judgeStreamMarker({ requested: false, marker: false }).ok, true,
+    'default and fish must not fail for lacking a header they never asked for');
+  assert.strictEqual(judgeStreamMarker({ requested: false, marker: true }).ok, true);
+});
+
+test('the three audio judges are unchanged by the new lane', () => {
+  // The streamed lane reuses them verbatim; a regression here breaks all three lanes.
+  assert.strictEqual(judgeTts({ durationMs: 11000, longestSilenceMs: 900 }, 180, 11500).ok, true);
+  assert.strictEqual(judgeTts({ durationMs: 2000, longestSilenceMs: 0 }, 180, null).ok, false);
+  assert.strictEqual(judgeTts({ durationMs: 12000, longestSilenceMs: 4200 }, 180, 11500).ok, false);
+});
+
+test('inspectWav survives the streaming sentinel sizes', () => {
+  // A streamed WAV declares 0xFFFFFFFF for both RIFF and data length because a
+  // stream cannot know its own total. inspectWav must measure what ARRIVED.
+  const real = makeWav({ seconds: 4, silentFrom: 0, silentTo: 0 });
+  const sentinel = Buffer.from(real);
+  sentinel.writeUInt32LE(0xffffffff, 4);
+  sentinel.writeUInt32LE(0xffffffff, 40);
+  const wav = inspectWav(sentinel);
+  assert.ok(wav, 'a sentinel header must still parse');
+  assert.ok(Math.abs(wav.durationMs - 4000) < 60,
+    `duration must come from the bytes received, got ${wav && wav.durationMs}`);
+});

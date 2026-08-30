@@ -105,6 +105,25 @@ function judgeTts(wav, textLen, baselineMs, { floorMsPerChar = 25, baselineFrac 
   return { ok: true, note: '' };
 }
 
+/** Part 99 (Aug 30 2026) — DID THE STREAMED LANE ACTUALLY STREAM?
+ *
+ * Pure, and exported, because this is the one judge on that lane whose
+ * failure looks like success. The proxy streams a single-chunk Inworld
+ * request and quietly falls through to the buffered path for everything else
+ * (fish, telephony, scenes, multi-chunk). The audio that comes back from a
+ * fallback is PERFECT — it passes the duration floor, the baseline and the
+ * silence scan — so without this the probe reports the streamed lane healthy
+ * on a run where the streamed lane never executed. `x-kade-tts-streamed` is
+ * the proxy's own marker; its absence on a flagged request is a failure and
+ * says so in those words. */
+function judgeStreamMarker({ requested, marker }) {
+  if (!requested || marker) return { ok: true, note: '' };
+  return {
+    ok: false,
+    note: 'the request did NOT stream — no x-kade-tts-streamed marker, so the proxy fell back to the buffered lane (single-chunk Inworld only)',
+  };
+}
+
 /** Central-time day key — "today" means her today, not UTC's. */
 function centralDay(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -284,24 +303,56 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   const TTS_MS_PER_CHAR = Math.max(5, parseInt(process.env.TTS_PROBE_MS_PER_CHAR || '25', 10));
   const TTS_BASELINE_FRAC = Math.min(0.95, Math.max(0.1, parseFloat(process.env.TTS_PROBE_BASELINE_FRAC || '0.6')));
   const TTS_MAX_SILENCE_MS = Math.max(500, parseInt(process.env.TTS_PROBE_MAX_SILENCE_MS || '3000', 10));
+  /* ── Part 99 (Aug 30 2026): THE STREAMED LANE GETS THE SAME EARS ─────────
+   * The three judges above have only ever tested the BUFFERED lane, because
+   * this probe sends no stream flag. Part 98 measured 235ms to first word on
+   * her own phone and the default flip is next — which would leave the ONE
+   * thing watching for dead air and missing middles pointed at the lane
+   * nobody is listening to any more. So the same request goes out a second
+   * time with the flag on, and the same three judges read the result.
+   *
+   * THE JUDGE THIS LANE NEEDS THAT THE OTHERS DO NOT, and it is the whole
+   * reason this is not two lines: the proxy streams ONLY a single-chunk
+   * Inworld request — fish, telephony, scenes and any multi-chunk text fall
+   * through to the buffered path, deliberately and silently. A probe that
+   * accepts that fallback is a probe that reports the streamed lane green
+   * while testing the old one, which is the same disease as the canary that
+   * only ever tested the Canary agent. The proxy sets `x-kade-tts-streamed`
+   * on a response it actually streamed, so ITS ABSENCE IS A FAILURE HERE,
+   * stated in those words, even when the audio that came back is perfect.
+   *
+   * Its own baseline key, never shared with `default`: the streamed lane
+   * rides the voice's REMEMBERED gain and has no tail fade, so its duration
+   * and silence profile are its own and folding them into one EMA would
+   * blunt both. TTS_PROBE_STREAM='' disables the lane. */
+  const TTS_STREAM_VOICE = (process.env.TTS_PROBE_STREAM_VOICE || TTS_VOICE).trim();
+  const TTS_STREAM_ON = process.env.TTS_PROBE_STREAM !== '0' && TTS_STREAM_VOICE !== '';
 
   if (!state.tts || typeof state.tts.fails === 'number') state.tts = { fails: {} }; // migrate the old single-lane shape
   if (!state.ttsBase) state.ttsBase = {};
 
-  async function probeLane(lane, voice, trigger) {
+  async function probeLane(lane, voice, trigger, opts = {}) {
     const t0 = Date.now();
     const result = { lane, voice, at: new Date().toISOString(), trigger, ok: false, ms: 0, bytes: 0, durationMs: null, longestSilenceMs: null, note: '' };
     try {
+      const headers = { 'Content-Type': 'application/json', 'User-Agent': UA };
+      if (opts.stream) headers['x-kade-tts-stream'] = '1';
       const r = await fetch(TTS_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
+        headers,
         body: JSON.stringify({ input: TTS_PROBE_TEXT, voice, model: 'tts-1', response_format: 'wav' }),
       });
       const buf = Buffer.from(await r.arrayBuffer());
       result.bytes = buf.length;
       const ctype = String(r.headers.get('content-type') || '');
+      const streamed = String(r.headers.get('x-kade-tts-streamed') || '') === '1';
+      if (opts.stream) result.streamed = streamed;
       if (!r.ok) result.note = `HTTP ${r.status}`;
       else if (/json|text\/html/.test(ctype)) result.note = `non-audio content-type ${ctype}`;
+      /* Checked BEFORE the audio judges on purpose: good audio off the wrong
+       * lane is the failure this exists to catch, and letting the judges pass
+       * first would bury it under a green note. */
+      else if (!judgeStreamMarker({ requested: Boolean(opts.stream), marker: streamed }).ok) result.note = judgeStreamMarker({ requested: true, marker: false }).note;
       else if (buf.length < TTS_MIN_BYTES) result.note = `audio too small (${buf.length}B < ${TTS_MIN_BYTES})`;
       else {
         const wav = inspectWav(buf);
@@ -352,7 +403,9 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
       if (fails[lane] === 2) {
         runNotify({
           agentId: 'kade-tts-probe', agentName: 'Estate watch', title: 'Voices',
-          body: `The ${lane} voice lane failed its synth check twice running (${result.note}). ${lane === 'fish' ? 'Clone voices' : 'Characters'} may be answering wrong or in silence — the inworld proxy is the place to look.`,
+          body: lane === 'stream'
+            ? `The STREAMED voice lane failed its synth check twice running (${result.note}). The buffered lane is the fallback, so nobody should be hearing silence — but "Faster voice (streaming)" is the lane to leave off until this clears, and the inworld proxy is the place to look.`
+            : `The ${lane} voice lane failed its synth check twice running (${result.note}). ${lane === 'fish' ? 'Clone voices' : 'Characters'} may be answering wrong or in silence — the inworld proxy is the place to look.`,
           urgent: false, userId: adminUser, adminAlert: true,
         }).catch(() => {});
       }
@@ -363,6 +416,7 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   async function ttsProbe(trigger = 'tick') {
     const results = [await probeLane('default', TTS_VOICE, trigger)];
     if (TTS_FISH_VOICE) results.push(await probeLane('fish', TTS_FISH_VOICE, trigger));
+    if (TTS_STREAM_ON) results.push(await probeLane('stream', TTS_STREAM_VOICE, trigger, { stream: true }));
     const combined = { at: new Date().toISOString(), trigger, ok: results.every((r) => r.ok), results };
     state.ttsLast = combined;
     saveState(state);
@@ -382,7 +436,7 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   if (TTS_ENABLED) {
     setTimeout(() => { ttsProbe('boot').catch(() => {}); }, 7 * 60 * 1000);
     setInterval(() => { ttsProbe('tick').catch(() => {}); }, TTS_HOURS * 60 * 60 * 1000);
-    console.log(`[tts-probe] armed: every ${TTS_HOURS}h via ${TTS_URL.split('/')[2]} (lanes: default${TTS_FISH_VOICE ? '+fish' : ''})`);
+    console.log(`[tts-probe] armed: every ${TTS_HOURS}h via ${TTS_URL.split('/')[2]} (lanes: default${TTS_FISH_VOICE ? '+fish' : ''}${TTS_STREAM_ON ? '+stream' : ''})`);
   } else {
     console.log('[tts-probe] off (TTS_PROBE=0)');
   }
@@ -390,4 +444,4 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
   return { tick, ttsProbe };
 }
 
-module.exports = { attachDeployWatch, speakDeploys, inspectWav, judgeTts };
+module.exports = { attachDeployWatch, speakDeploys, inspectWav, judgeTts, judgeStreamMarker };
