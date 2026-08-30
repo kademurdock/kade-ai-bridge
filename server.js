@@ -1023,6 +1023,43 @@ function centralClock() {
 }
 function notifyInQuietHours(hhmm) { return hhmm >= notifyPrefs.quietStart || hhmm < notifyPrefs.quietEnd; }
 
+/* Part 100 (Aug 30 2026) — quiet hours DEFER admin alerts, never eat them.
+ * Receipt that forced this: Kiana filed feedback 6a93cb8654790676583f7b8e at
+ * 06:19:50Z (1:19 a.m. Central) and the push came back
+ * `blocked=quiet hours (Central)` — and that was the end of it. The comment
+ * above runNotify says "a 2 a.m. report waits for morning" but nothing
+ * carried it there; the in-chat nudge only lands if she opens a persona
+ * chat, and she heard about the bug from Amber instead. Now an adminAlert
+ * refused for quiet hours goes into a volume-backed queue and a tick fires
+ * it once quiet hours end. Only adminAlert sends defer — agent outreach
+ * staying droppable in quiet hours is the intended anti-spam shape. */
+const DEFERRED_NOTIFY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'bridge-deferred-notifies.json');
+let deferredNotifies = (() => {
+  try { if (fs.existsSync(DEFERRED_NOTIFY_FILE)) return JSON.parse(fs.readFileSync(DEFERRED_NOTIFY_FILE, 'utf8')); } catch {}
+  return [];
+})();
+function saveDeferredNotifies() { try { fs.writeFileSync(DEFERRED_NOTIFY_FILE, JSON.stringify(deferredNotifies)); } catch (e) { console.error('[notify] deferred save:', e.message); } }
+function queueDeferredNotify(payload) {
+  deferredNotifies.push({ ...payload, queuedAt: Date.now() });
+  if (deferredNotifies.length > 20) deferredNotifies = deferredNotifies.slice(-20); // bound the queue
+  saveDeferredNotifies();
+}
+setInterval(async () => {
+  try {
+    if (!deferredNotifies.length) return;
+    const { hhmm } = centralClock();
+    if (notifyInQuietHours(hhmm)) return;
+    const batch = deferredNotifies.filter((d) => Date.now() - d.queuedAt < 24 * 3600 * 1000);
+    deferredNotifies = [];
+    saveDeferredNotifies();
+    for (const d of batch) {
+      const { queuedAt, ...payload } = d;
+      const out = await runNotify(payload);
+      console.log(`[notify] DEFERRED delivery — ${payload.agentName} (${payload.agentId}), queued ${Math.round((Date.now() - queuedAt) / 60000)}m ago: ${out.ok ? `sent=${out.sent}` : out.blocked || out.error}`);
+    }
+  } catch (e) { console.error('[notify] deferred tick:', e.message); }
+}, 5 * 60 * 1000);
+
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
 async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route }) {
@@ -1075,7 +1112,14 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   };
   if (!notifyPrefs.enabled) return refuse('notifications are globally muted');
   if (notifyPrefs.mutedAgents.includes(agentId)) return refuse('this agent is muted');
-  if (!urgent && notifyInQuietHours(hhmm)) return refuse('quiet hours (Central)');
+  if (!urgent && notifyInQuietHours(hhmm)) {
+    if (adminAlert === true) {
+      queueDeferredNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route });
+      console.warn(`[notify] DEFERRED — ${agentName} (${agentId}): quiet hours (Central), queued for morning (${deferredNotifies.length} waiting)`);
+      return { ok: true, sent: 0, deferred: true, blocked: 'quiet hours (Central) — queued for morning' };
+    }
+    return refuse('quiet hours (Central)');
+  }
   if (!skipBudget && Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000) return refuse('cooldown active');
   if (!skipBudget && notifyCounts.global >= notifyPrefs.globalDailyCap) return refuse('daily total cap reached');
   if (!skipBudget && (notifyCounts.perAgent[agentId] || 0) >= notifyPrefs.perAgentDailyCap) return refuse('per-agent daily cap reached');
