@@ -1060,6 +1060,26 @@ setInterval(async () => {
   } catch (e) { console.error('[notify] deferred tick:', e.message); }
 }, 5 * 60 * 1000);
 
+/* Part 112 (Aug 31 2026) — BROADCASTS GET A HISTORY. Her report, the night the
+ * 914-char digest fired: the banner truncated, the tap opened a fresh
+ * conversation, and once the banner was gone the text existed nowhere any
+ * person could reach — APNs is fire-and-forget and the bridge kept no record.
+ * Every broadcast that reaches the send step now lands in a volume-backed
+ * ring (last 50). GET /broadcasts serves it (notify-scoped or admin secret);
+ * the fork's JWT-gated /api/kade/announcements passthrough is the family's
+ * door, and the native Announcements screen (build 258+) reads it there. */
+const BROADCASTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'bridge-broadcasts.json');
+let broadcastLog = (() => {
+  try { if (fs.existsSync(BROADCASTS_FILE)) return JSON.parse(fs.readFileSync(BROADCASTS_FILE, 'utf8')); } catch {}
+  return [];
+})();
+function saveBroadcastLog() { try { fs.writeFileSync(BROADCASTS_FILE, JSON.stringify(broadcastLog)); } catch (e) { console.error('[notify] broadcast log save:', e.message); } }
+function recordBroadcast(entry) {
+  broadcastLog.push(entry);
+  if (broadcastLog.length > 50) broadcastLog = broadcastLog.slice(-50);
+  saveBroadcastLog();
+}
+
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
 async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route }) {
@@ -1070,10 +1090,14 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
    * the Admin hub); adminAlert sends default to "admin" so canary, crash,
    * and balance taps land on the hub with zero per-caller changes. Builds
    * before 231 ignore the category entirely — Apple's forward safety. An
-   * explicit `category` (KADE_BRIEF, KADE_DOORBELL, KADE_CALL) always wins. */
+   * explicit `category` (KADE_BRIEF, KADE_DOORBELL, KADE_CALL) always wins.
+   * Part 112 (Aug 31 2026, her call after the digest tap landed in a fresh
+   * conversation): broadcasts default to 'announcements' — the native
+   * Announcements screen (build 258+). Older builds don't know the name and
+   * fall through to the plain open, exactly as before. */
   const routeName = (typeof route === 'string' && /^[a-z][a-z0-9_-]{0,30}$/i.test(route.trim()))
     ? route.trim()
-    : (adminAlert === true ? 'admin' : null);
+    : (adminAlert === true ? 'admin' : (broadcast === true ? 'announcements' : null));
   agentId = String(agentId || 'unknown');
   agentName = String(agentName || 'Kade-AI').slice(0, 40);
   /* Part 83 (her word, shipping the Friday digest: "up the cap to a thousand
@@ -1151,6 +1175,11 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   // belongs to the agents, and owner alerts must not spend it.
   if (sent > 0 && !skipBudget) { notifyCounts.global++; notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1; notifyCounts.lastSentMs = Date.now(); }
   console.log(`[notify] ${agentName} (${agentId}) sent=${sent} global=${notifyCounts.global}/${notifyPrefs.globalDailyCap}`);
+  /* Part 112: the history write. Records even a sent=0 broadcast — an
+   * announcement made to an empty room is still an announcement made. */
+  if (broadcast === true) {
+    recordBroadcast({ id: `bc-${Date.now().toString(36)}`, ts: new Date().toISOString(), title, body: message, agentId, agentName, sent });
+  }
   return { ok: true, sent, from: agentName, remainingToday: Math.max(0, notifyPrefs.globalDailyCap - notifyCounts.global) };
 }
 
@@ -1186,6 +1215,34 @@ app.post('/notify', async (req, res) => {
   const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, category, route: b.route });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
+});
+
+// Announcements history (Part 112). Read-only; newest first.
+app.get('/broadcasts', (req, res) => {
+  const s = req.query.secret;
+  if (!bridgeSecretOk(req, s) && !notifySecretOk(req, s) && !broadcastSecretOk(req, s)) return res.status(403).json({ error: 'Unauthorized' });
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  res.json({ broadcasts: [...broadcastLog].reverse().slice(0, limit) });
+});
+// ADMIN-only backfill/insert (Part 112): lets a digest that fired BEFORE the
+// store existed be given a row, so the history does not start with a hole.
+app.post('/broadcasts', (req, res) => {
+  const b = req.body || {};
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
+  const body = String(b.body || '').trim().slice(0, 1000);
+  if (!body) return res.status(400).json({ error: 'body required' });
+  const entry = {
+    id: `bc-${Date.now().toString(36)}`,
+    ts: (typeof b.ts === 'string' && !Number.isNaN(Date.parse(b.ts))) ? new Date(b.ts).toISOString() : new Date().toISOString(),
+    title: String(b.title || 'Kade-AI').slice(0, 40),
+    body,
+    agentId: String(b.agentId || 'admin-backfill').slice(0, 60),
+    agentName: String(b.agentName || 'Kade-AI').slice(0, 40),
+    sent: Number.isInteger(b.sent) ? b.sent : null,
+    backfilled: true,
+  };
+  recordBroadcast(entry);
+  res.json({ ok: true, entry });
 });
 
 // View / change notification preferences (admin). Body/query: secret; POST body may set
