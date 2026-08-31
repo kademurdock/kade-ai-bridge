@@ -292,6 +292,34 @@ function callerLine(session) {
   );
 }
 
+/* WHICH KIND OF VOICE CALL THIS IS (Aug 31 2026, Part 110) ─────────────────────
+ * PHONE_SUFFIX opens "[PHONE CALL — you are literally on the phone with this
+ * person right now", and it is appended to app/web calls too, because the whole
+ * engine is shared. On a real telephone that sentence is true. In the app it is
+ * a lie of detail: there is no phone line, the caller is very likely holding the
+ * phone in front of her with VoiceOver running and a live transcript on screen,
+ * and she may be somewhere she would never take a phone call.
+ *
+ * ⚠️ AND THE MARKER ITSELF IS LOAD-BEARING — DO NOT "FIX" IT BY RENAMING IT.
+ * reframe-proxy's isPhoneTurn() greps the literal string '[PHONE CALL' across
+ * every user message, and TWO behaviours hang off that grep: the effort:'none'
+ * override that makes voice answers instant, and `isDeep = isPhoneTurn(body) &&
+ * deepThinkRequested(body)` — which is what makes the new Deep Think BUTTON work
+ * at all. Rename the marker to something more honest like '[APP CALL' and both
+ * silently stop, with nothing failing loudly enough to notice. So the marker
+ * stays exactly as it is and the correction rides alongside it. */
+function surfaceLine(session) {
+  if (session.surface !== 'web') return '';
+  return (
+    '\n[SURFACE: this is a live voice call inside the Kade-AI app, not a telephone ' +
+    'call — same live voice, different room. They are probably holding the phone in ' +
+    'front of them rather than to their ear, VoiceOver may be reading the screen ' +
+    'aloud beside your voice, and a written transcript of this call is on screen as ' +
+    'you speak. Never call it a phone call or ask them to hang up and text you — ' +
+    'the same app they are calling from is where the typing happens.]'
+  );
+}
+
 // ── MOOD ECHO v1 (Aug 9 2026 — northstar presence play, the Sesame gap) ──────
 // The mic already tells us HOW someone is talking: how fast, how long their
 // turns run, whether they keep jumping in, how quickly they answer, what hour
@@ -589,12 +617,165 @@ function isPlausibleBargeIn(heard) {
   return BARGE_IN_SINGLE_WORDS.has(words[0]);
 }
 
+// ── THE ROOM GATE — auto barge-in for the APP/WEB surface ─────────────────────
+// (Aug 31 2026, Part 110. Kade: "on iOS native, barge in isn't working on voice
+// conversations within the app. I don't want the stop talking button, I want
+// automatic like the phone line... It would need to be a similar barge in to the
+// phone line though, where it tries to ignore noise and only interrupt upon
+// hearing the first word or whatever.")
+//
+// WHY THIS EXISTS rather than just flipping bargeMode to 'auto' on
+// WebCallSession: auto barge-in WAS on for app/web until July 24 2026 and was
+// turned off because it killed whole turns — her report that day was "the agent
+// says a couple words then quits... maybe people have an interrupt button
+// instead." The ROOM is the difference. A phone call is a handset at your ear in
+// a mostly-quiet moment. An app call is a SPEAKERPHONE in a living room — a TV,
+// music, the Clubhouse PA, other people — and on this platform above all others
+// VOICEOVER, which is speech, out of the same speaker, that the caller never
+// meant as speech. Flipping the flag alone re-ships the July 24 bug.
+//
+// So the phone's three guards still run (echo overlap, the 1s grace window, the
+// single-word allow-list) and this adds two the app surface alone pays for:
+//
+//   1. CONFIDENCE. Deepgram hands back per-word confidence; noise mis-heard as
+//      words scores low, a person leaning in and talking scores high. A LONE word
+//      must clear a higher bar than a phrase — a lone word off a TV is the
+//      classic false positive, and a lone word from the caller is nearly always
+//      on the allow-list anyway ("wait", "stop", "hey").
+//      ⚠️ When confidence is ABSENT this passes rather than blocks. A gate that
+//      fails closed on missing data is a gate that silently turns barge-in back
+//      off — which is the exact bug being fixed here. Law 2: a log can only show
+//      you what it can see, and so can a gate.
+//
+//   2. SCREEN-READER CHROME. VoiceOver says "Mute microphone, button" out the
+//      same speaker the mic is listening to. Acoustic echo cancellation on the
+//      native side (setVoiceProcessingEnabled, build 116's fix) should swallow
+//      most of it — but looksLikeEcho CANNOT catch what gets through: that gate
+//      compares against what KIANA is currently saying, and "double tap to hang
+//      up" overlaps none of it. So the UI's own vocabulary is named here and
+//      refused. Every entry is a phrase nobody says to a friend mid-sentence.
+//
+// All of it is env-tunable with no deploy: WEB_BARGE_MIN_CONF=0 disables the
+// confidence half, WEB_BARGE_CHROME=0 disables the chrome half, and a client can
+// still ask for bargeMode 'push' in its hello, which skips the lot.
+const WEB_BARGE_MIN_CONF        = parseFloat(process.env.WEB_BARGE_MIN_CONF || '0.55');
+const WEB_BARGE_SINGLE_MIN_CONF = parseFloat(process.env.WEB_BARGE_SINGLE_MIN_CONF || '0.75');
+const WEB_BARGE_CHROME_ON       = process.env.WEB_BARGE_CHROME !== '0';
+
+// VoiceOver / system-UI vocabulary. Matched against the WHOLE heard fragment,
+// never word-by-word: "stop" alone is a real interruption and keeps its place on
+// the allow-list above, but "stop talking button" is the screen reader reading
+// our own button back at us.
+const SCREEN_READER_CHROME = [
+  'button', 'double tap', 'double-tap', 'selected', 'dimmed', 'heading',
+  'text field', 'switch button', 'back button', 'tab bar', 'navigation bar',
+  'mute microphone', 'hang up', 'stop talking', 'deep think',
+  'voiceover', 'voice over',
+];
+function looksLikeScreenReader(heard) {
+  if (!WEB_BARGE_CHROME_ON) return false;
+  const t = String(heard || '').toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  // Only SHORT fragments are judged. A long sentence that happens to contain
+  // "button" is a person talking about a button, not a screen reader.
+  if (t.split(' ').length > 5) return false;
+  return SCREEN_READER_CHROME.some((ph) =>
+    t === ph || t.startsWith(ph + ' ') || t.endsWith(' ' + ph) || t.includes(' ' + ph + ' '));
+}
+
+// Mean confidence over whatever word objects the STT actually handed us. Returns
+// null when there is nothing to measure — callers read null as "no opinion",
+// never as "fail".
+function meanWordConfidence(words) {
+  if (!Array.isArray(words) || !words.length) return null;
+  let sum = 0, n = 0;
+  for (const w of words) {
+    const c = (w && typeof w.confidence === 'number') ? w.confidence : null;
+    if (c === null || !(c >= 0 && c <= 1)) continue;
+    sum += c; n++;
+  }
+  return n ? sum / n : null;
+}
+
+/** The extra gate an app/web call runs on top of the phone's guards.
+ *  true = worth interrupting her for. */
+function passesRoomGate(heard, words) {
+  if (looksLikeScreenReader(heard)) return false;
+  if (!(WEB_BARGE_MIN_CONF > 0)) return true;      // confidence half disabled
+  const conf = meanWordConfidence(words);
+  if (conf === null) return true;                  // no data — never fail closed
+  const lone = normalizeWords(heard).length === 1;
+  return conf >= (lone ? WEB_BARGE_SINGLE_MIN_CONF : WEB_BARGE_MIN_CONF);
+}
+
+/** ONE door for both STT engines. The flux path and the nova path had two
+ *  hand-copied copies of the first three checks; every guard lives here now so
+ *  they cannot drift apart again. */
+function shouldBargeIn(session, heard, words) {
+  if (session.bargeMode === 'push') return false;
+  if (!session.isSpeaking || session.bargedIn) return false;
+  if (Date.now() - session.speakStartedAt <= 1000) return false;   // grace window
+  if (looksLikeEcho(heard, session._currentSpokenText)) return false;
+  if (!isPlausibleBargeIn(heard)) return false;
+  if (session.surface === 'web' && !passesRoomGate(heard, words)) return false;
+  return true;
+}
+
 // ── SentenceStreamer ──────────────────────────────────────────────────────────
+/* ⭐ PART 110 (Aug 31 2026) — THE PHONE LANE FINALLY GETS THE FLOOR THE APP GOT
+ * IN PART 92.12. Her report tonight: "there are still speech pause gaps in the
+ * phone voice conversation as well. I think you fixed it with the regular
+ * messaging."
+ *
+ * She is right, and the reason is that the fix landed in the WRONG BUILDING.
+ * Part 92.12 measured the Inworld endpoint directly and found the economics:
+ *
+ *     normal    ~1.31s fixed per request + ~12.6 ms/char
+ *     degraded  ~5.9s  fixed per request + ~7.1  ms/char   (a ~30min spike,
+ *                                                           same voice, no deploy)
+ *     audio itself runs ~62 ms/char
+ *
+ * A piece's audio has to cover the NEXT piece's synthesis or the listener eats
+ * the difference as silence. Margin = 0.062c − (fixed + rate·c). At 1.31s fixed
+ * every size clears, which is why this never showed in a good hour. At 5.9s
+ * fixed a 60-char piece is ~3.7s of audio against ~6.3s of synthesis — a
+ * DEFICIT, and consecutive short sentences stack those deficits until the buffer
+ * is dry. That is "five or more seconds, every few sentences."
+ *
+ * SpeechStreamer.swift took a 160-char floor for every piece after the opener
+ * and kept a small 60-char floor for the opener, because raising the OPENER
+ * would be paid for in time-to-first-word — the exact thing 91.6 was built to
+ * fix. This lane kept a single 24-char merge threshold from July 4, which is
+ * below break-even even in a GOOD hour. Same fix, same two numbers, same
+ * reasoning; only the transport differs.
+ *
+ * ⚠️ WHAT IS DELIBERATELY NOT CHANGED HERE, and this is the discipline that
+ * keeps the change revertible: the abbreviation table, the numbered-list-marker
+ * rule (July 4: "\n 1." must not split), the decimal rule, and the 1400-char
+ * runaway break are all byte-identical. Only the FLOOR moved. Every choppiness
+ * bug this class has ever been taught about is still taught.
+ *
+ * ⚠️ AND WHAT THIS TEST CANNOT PROVE (law 24, written last night after a tempo
+ * fix passed 58/58 and moved the live audio by five points): the unit tests
+ * below prove what this class EMITS. They do not prove what the ear hears —
+ * that depends on Inworld's fixed overhead in the hour she calls, and on
+ * Twilio's playout buffer downstream. Her ear is the instrument. Both floors
+ * are env-tunable so the next tuning pass costs no deploy:
+ *   PHONE_FIRST_PIECE_CHARS (default 60)   time-to-first-word ⟷ opener gap
+ *   PHONE_MIN_PIECE_CHARS   (default 160)  smoothness ⟷ responsiveness
+ * Setting PHONE_MIN_PIECE_CHARS=24 restores the exact pre-Part-110 behaviour. */
+const PHONE_FIRST_PIECE_CHARS = parseInt(process.env.PHONE_FIRST_PIECE_CHARS || '60', 10);
+const PHONE_MIN_PIECE_CHARS   = parseInt(process.env.PHONE_MIN_PIECE_CHARS || '160', 10);
+
 class SentenceStreamer extends EventEmitter {
   constructor() {
     super();
     this._buf = '';
     this._held = '';
+    /* Pieces actually handed out this reply. Only the opener (0) gets the small
+     * floor — counted on EMIT, so a piece that never reaches the synthesiser
+     * cannot spend the fast-start allowance. */
+    this._piecesEmitted = 0;
     this._abbrevs = new Set([
       'dr','mr','mrs','ms','prof','vs','etc','e.g','i.e','a.m','p.m','st','ave',
       'jr','sr','no','vol','fig','dept','inc','ltd','corp',
@@ -607,7 +788,9 @@ class SentenceStreamer extends EventEmitter {
     this._flush(true);
     let rem = this._buf.trim();
     if (this._held) { rem = rem ? `${this._held} ${rem}` : this._held; this._held = ''; }
-    if (rem.length > 2) this.emit('sentence', rem);
+    /* Part 110: `> 2` alone would now also let pure punctuation through, since
+     * short fragments always reach _held. Require something sayable. */
+    if (rem.length > 2 && /[a-z0-9]/i.test(rem)) { this.emit('sentence', rem); this._piecesEmitted++; }
     this._buf = '';
   }
 
@@ -639,19 +822,35 @@ class SentenceStreamer extends EventEmitter {
         let end = abs;
         while (end < this._buf.length && /[.!?]/.test(this._buf[end])) end++;
         let sentence = this._buf.slice(0, end).trim();
-        // Short-fragment merging (same report): "Round one." as its own
-        // synth = a stop-to-think pause mid-speech. Hold anything under
-        // 24 chars and let it ride in the same breath as what follows.
+        /* Short-fragment merging, now ABSORB-FORWARD against a two-level
+         * floor (Part 110; the July 4 report "Round one." as its own synth =
+         * a stop-to-think pause is still the thing being prevented, the floor
+         * is just at the measured height now). A piece under the floor holds
+         * and rides in the same breath as what follows. */
         if (this._held) { sentence = `${this._held} ${sentence}`; this._held = ''; }
+        const floor = this._piecesEmitted === 0 ? PHONE_FIRST_PIECE_CHARS : PHONE_MIN_PIECE_CHARS;
         if (sentence.length > 4) {
-          if (sentence.length < 24 && !isFinal) this._held = sentence;
-          else this.emit('sentence', sentence);
-        } else if (sentence.length > 0 && !isFinal) {
+          if (sentence.length < floor && !isFinal) this._held = sentence;
+          else { this.emit('sentence', sentence); this._piecesEmitted++; }
+        } else if (sentence.length > 0) {
+          /* ⚠️ THE GOODBYE BUG (found Aug 31 2026, Part 110, by a test written
+           * for something else — and it was live on the phone line, not
+           * introduced tonight). This branch used to carry `&& !isFinal`, which
+           * meant a trailing sentence of FOUR CHARACTERS OR FEWER was held by
+           * nobody and then sliced off the buffer: on the FINAL flush it matched
+           * neither arm and vanished. Proven against the shipped file before
+           * this edit — "…easily. Bye." emitted only "…easily." and "…for real.
+           * Yes." only "…for real." "Nice." (five) survived, which is why nobody
+           * ever caught it: the boundary is exactly length > 4, so it eats
+           * "Bye.", "Yes.", "Yep.", "OK!" and spares everything longer.
+           * She said goodbye and the caller heard silence.
+           * Holding unconditionally hands it to end(), which merges _held and
+           * emits — the fragment is spoken instead of dropped. */
           this._held = this._held ? `${this._held} ${sentence}` : sentence;
         }
         this._buf = this._buf.slice(end).trimStart();
         pos = 0;
-        if (this._buf.length > 1400) { this.emit('sentence', this._buf.trim()); this._buf = ''; break; }
+        if (this._buf.length > 1400) { this.emit('sentence', this._buf.trim()); this._piecesEmitted++; this._buf = ''; break; }
         continue;
       }
       pos = abs + 1;
@@ -802,6 +1001,10 @@ class CallSession {
     //           stray interim was killing whole turns.
     // Completed utterances still take their normal turn either way.
     this.bargeMode = 'auto';
+    // Part 110: one-turn deep think, armed by the app's call-screen button
+    // ({type:'deepthink'}) and spent by the next streamReply. Distinct from
+    // `deepThink`, the per-call mode the spoken commands drive.
+    this.deepThinkOnce = false;
   }
 
   twSend(obj) {
@@ -1018,16 +1221,15 @@ function openDeepgramFlux(session, key) {
       // new EndOfTurn instead of firing the held one.
       if (text && session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
       if (!text) return;
-      // Barge-in: identical guards to the nova path (grace window + echo gate
-      // + once-per-reply flag). All the July 1-4 lessons live in these checks.
-      const graceOk = Date.now() - session.speakStartedAt > 1000;
-      if (session.bargeMode !== 'push' && session.isSpeaking && !session.bargedIn && graceOk) {
-        if (!looksLikeEcho(text, session._currentSpokenText) && isPlausibleBargeIn(text)) {
-          session.bargedIn = true;
-          noteMoodBarge(session);
-          console.log(`[voice-stream] barge-in trigger (flux): "${text.slice(0, 50)}"`);
-          bargeIn(session);
-        }
+      // Barge-in: every guard now lives in shouldBargeIn() — the grace window,
+      // the echo gate, the single-word allow-list, and (app/web only) the room
+      // gate. This path and the nova path below used to carry hand-copied
+      // copies of the first three; they share one door now.
+      if (shouldBargeIn(session, text, msg.words)) {
+        session.bargedIn = true;
+        noteMoodBarge(session);
+        console.log(`[voice-stream] barge-in trigger (flux, ${session.surface}): "${text.slice(0, 50)}"`);
+        bargeIn(session);
       }
       return;
     }
@@ -1192,21 +1394,15 @@ function openDeepgram(session) {
       const alt  = msg.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (!text) return;
-      const graceOk = Date.now() - session.speakStartedAt > 1000;
-      if (session.bargeMode !== 'push' && session.isSpeaking && !session.bargedIn && graceOk) {
-        if (looksLikeEcho(text, session._currentSpokenText)) {
-          // Almost certainly her own voice coming back through the mic --
-          // ignore this check, keep listening for a real interruption.
-        } else if (!isPlausibleBargeIn(text)) {
-          // Single recognized word that isn't a real interruption word -- most
-          // likely mic-bump/scratch noise Deepgram mis-transcribed as one short
-          // word, not an actual attempt to talk. Keep listening.
-        } else {
-          session.bargedIn = true;
-          noteMoodBarge(session);
-          console.log(`[voice-stream] barge-in trigger: "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
-          bargeIn(session);
-        }
+      // Same single door as the flux path — grace window, echo gate, single-word
+      // allow-list, and on app/web the room gate (confidence + screen-reader
+      // chrome). nova hands back its word list on the alternative, not the
+      // envelope; a missing list is "no opinion", never a refusal.
+      if (shouldBargeIn(session, text, alt && alt.words)) {
+        session.bargedIn = true;
+        noteMoodBarge(session);
+        console.log(`[voice-stream] barge-in trigger (${session.surface}): "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
+        bargeIn(session);
       }
       if (msg.is_final) {
         // KADE July 22 2026 (speed-bug instrumentation): stamp the FIRST
@@ -2005,7 +2201,20 @@ async function streamReply(session, userText) {
   // reframe-proxy only honors a fresh one (≤10 min), and it strips every
   // copy before the model sees it. Suffix-only, like PHONE_SUFFIX: the clean
   // text stays in session.history.
-  const deepSuffix = session.deepThink ? ` [DEEP THINK ${Date.now()}]` : '';
+  // Part 110: `deepThinkOnce` is the call screen's button — armed by a tap,
+  // spent by THIS turn and cleared, so the answer after it is quick again. The
+  // per-call `deepThink` mode (the spoken command) is untouched by it and
+  // survives; either one arms the marker.
+  const deepNow = session.deepThink || session.deepThinkOnce;
+  const deepSuffix = deepNow ? ` [DEEP THINK ${Date.now()}]` : '';
+  if (session.deepThinkOnce) {
+    session.deepThinkOnce = false;
+    // Tell the client the button spent itself, so its own state and VoiceOver
+    // label cannot drift from the server's. A phone session has no jsonSend.
+    if (typeof session.jsonSend === 'function') {
+      session.jsonSend({ type: 'deepthink', armed: false, mode: !!session.deepThink, spent: true });
+    }
+  }
   const gameSuffix = (typeof session.lastGameTokenAt === 'number'
     && Date.now() - session.lastGameTokenAt < GAME_ACTIVE_MS) ? GAME_SUFFIX : '';
   // LIVE CAMERA (web video calls): take a fresh look if the camera has a
@@ -2013,7 +2222,7 @@ async function streamReply(session, userText) {
   if (session.videoOn) { try { await videoSight.onTurn(session); } catch { /* a blind turn is still a turn */ } }
   const outgoing = session.history.map((m, i) =>
     (i === session.history.length - 1 && m.role === 'user')
-      ? { ...m, content: m.content + PHONE_SUFFIX + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + moodLine(session) + (session.outboundSuffix || '') + (session.agentCallSuffix || '') + deepSuffix }
+      ? { ...m, content: m.content + PHONE_SUFFIX + surfaceLine(session) + gameSuffix + callerLine(session) + childLine(session) + memoryLine(session) + videoSight.visionLine(session) + moodLine(session) + (session.outboundSuffix || '') + (session.agentCallSuffix || '') + deepSuffix }
       : m
   );
 
@@ -3565,7 +3774,23 @@ class WebCallSession extends CallSession {
     this.surface  = 'web';
     this.userId   = user?.userId || null; // LibreChat user id, for usage events
     this._webPlayheadEnd = 0;
-    this.bargeMode = 'push'; // the app/web Stop button is the interrupter
+    /* Aug 31 2026 (Part 110) — BACK TO 'auto', WITH THE GATE THAT WAS MISSING
+     * THE FIRST TIME. This line read 'push' from July 24 2026 to tonight, and
+     * that is the whole reason barge-in "wasn't working" in the native app:
+     * nothing was broken, the lane was deliberately Stop-button-only. Her ask
+     * tonight is explicit — "I don't want the stop talking button, I want
+     * automatic like the phone line."
+     *
+     * What makes this different from the July 24 config that had to be turned
+     * off: shouldBargeIn()'s room gate now runs on this surface (confidence
+     * floor + screen-reader chrome refusal), AND armBargeRecovery grew its 20s
+     * hard deadline in that same July 24 session — so even a false barge that
+     * slips through ends in "Sorry, go ahead, I'm listening" instead of the
+     * dead air that made this mode unusable. Both halves matter.
+     *
+     * A client can still ask for 'push' in its hello and get exactly the old
+     * behaviour, which is the revert if her ear says this is wrong. */
+    this.bargeMode = 'auto';
   }
   jsonSend(obj) {
     if (this.ws.readyState === WebSocket.OPEN) { try { this.ws.send(JSON.stringify(obj)); } catch {} }
@@ -3962,6 +4187,30 @@ function attachWebVoice(server) {
           bargeIn(session);
           if (session.busy && !session.isSpeaking) { session.sendClear(); session.llmAbort = true; }
         }
+        return;
+      }
+      /* DEEP THINK BUTTON on the call screen (Aug 31 2026, Part 110). Her ask:
+       * "I'd like to have a deep think button or something in case you don't
+       * want an instant answer in the middle of a conversation."
+       *
+       * ONE-SHOT, not a mode, and that is a deliberate match rather than a
+       * coin flip: the web composer's toggle disarms after one send, the
+       * native composer's does too, and Kiana has already TOLD a user in her
+       * own words what the brain icon does — "it turns itself off after one
+       * message, so it ain't a mode you get stuck in" (Crystal, Aug 31
+       * 13:27:58Z). A call button that latched would make her description of
+       * her own product wrong.
+       *
+       * The per-call MODE still exists and still answers to the spoken
+       * commands ("deep think on" / "back to quick answers") — this arms one
+       * turn on top of it, and a spoken mode already running is not disturbed
+       * by a tap. The ack carries `armed` so the client can announce the true
+       * state rather than assuming its own tap landed. */
+      if (msg.type === 'deepthink') {
+        const want = msg.on === undefined ? !session.deepThinkOnce : msg.on === true;
+        session.deepThinkOnce = want;
+        session.jsonSend({ type: 'deepthink', armed: !!want, mode: !!session.deepThink });
+        console.log(`[web-voice] deep think ${want ? 'armed for next turn' : 'disarmed'} ${session.streamSid}`);
         return;
       }
       if (msg.type === 'video') { videoSight.handleVideoMsg(session, msg, speak); return; }
