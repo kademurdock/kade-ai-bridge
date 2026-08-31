@@ -5393,6 +5393,40 @@ async function fetchMemoryHealth() {
   }
   return memoryHealthCache;
 }
+/* ── MEMORY-LANE DEAD-AIR ALARM (Part 112, Aug 31 2026 — her explicit yes:
+ * "wire it", asked once per the standing rule on re-offers) ─────────────────
+ * The logbook died silently Aug 24-28 while the card half kept working, and
+ * nobody was paged. This is the alert-only, server-side cron she approved:
+ * every 6 hours, read the same memory-health the status line reads; if the
+ * LIVE KEEPER's newest logbook entry is older than MEMORY_KEEPER_DEAD_H
+ * (default 30h — a quiet day is not an outage, a day and a night is), send
+ * ONE admin push and go quiet for 24h so a dead lane pages once a day, not
+ * four times. Rides runNotify's adminAlert path: quiet hours defer it to
+ * morning, and it never spends the agents' outreach budget.
+ * A failed FETCH never fires it (a blip must not read as a memory failure).
+ * Kill: MEMORY_KEEPER_ALARM=0. */
+const MEMORY_KEEPER_DEAD_H = parseFloat(process.env.MEMORY_KEEPER_DEAD_H || '30');
+let memoryKeeperAlarmLastFiredMs = 0;
+async function memoryKeeperAlarmTick() {
+  if (process.env.MEMORY_KEEPER_ALARM === '0' || !BRIDGE_SECRET) return;
+  if (Date.now() - memoryKeeperAlarmLastFiredMs < 24 * 3600 * 1000) return;
+  const { data } = await fetchMemoryHealth();
+  const age = data && data.diary && data.diary.keeperNewestAgeHours;
+  if (typeof age !== 'number' || age < MEMORY_KEEPER_DEAD_H) return;
+  memoryKeeperAlarmLastFiredMs = Date.now();
+  console.warn(`[memory-alarm] live keeper silent ${age}h (floor ${MEMORY_KEEPER_DEAD_H}h) — paging admin`);
+  try {
+    await runNotify({
+      agentId: 'kade-memory-alarm', agentName: 'Kade-AI',
+      title: 'Memory lane check',
+      body: `The live memory keeper hasn't written a logbook entry in about ${Math.round(age)} hours. Last time this happened it was the Aug-24 outage shape — worth a look when you get a minute.`,
+      adminAlert: true, userId: CANARY_ADMIN_USER, route: 'admin',
+    });
+  } catch (e) { console.warn('[memory-alarm] page failed:', e.message); }
+}
+setInterval(() => { memoryKeeperAlarmTick().catch(() => {}); }, 6 * 3600 * 1000);
+setTimeout(() => { memoryKeeperAlarmTick().catch(() => {}); }, 5 * 60 * 1000);
+
 async function memoryHealthForSpeech() {
   if (process.env.MEMORY_HEALTH_STATUS === '0' || !BRIDGE_SECRET) {
     return { section: { enabled: false }, spoken: '', okForStatus: true };
