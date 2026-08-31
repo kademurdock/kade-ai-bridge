@@ -160,7 +160,43 @@ function applyDirectionCarry(sentence, dirState) {
   if (dirState.active) {
     if (dirState.carried >= PHONE_TAG_CARRY || dirState.chars >= PHONE_TAG_CARRY_CHARS) {
       dirState.active = null;
-      return sentence;
+      dirState.carried = 0;
+      dirState.chars = 0;
+      /* ⭐ PART 110 ADDENDUM — THE CAP HAS TO SAY STOP OUT LOUD HERE TOO, AND
+       * THIS LANE IS WHERE HER "make sure that's gonna carry across any place
+       * she speaks, including phone and voice conversations" LANDS.
+       *
+       * Part 109 fixed exactly this in the TTS proxy (`475268db`) after
+       * measuring it: ending a carry by merely ceasing to STAMP is a no-op on
+       * Inworld, whose documented rule is that a tag applies UNTIL YOU CHANGE
+       * IT. Only the literal reset token ends it — measured, two paragraphs,
+       * n=3: bare 11.88s · [unhurried] then untouched 16.42s (+38.2%) ·
+       * [unhurried] then [reset] 14.11s (+18.8%) · [unhurried] then a DIFFERENT
+       * direction 16.57s (+39.5%).
+       *
+       * ⚠️ AND THE PROXY'S FIX CANNOT REACH THIS LANE, WHICH IS WHY IT IS STILL
+       * BROKEN HERE. `applySteeringTags` skips its own cap for any paragraph
+       * that opens with a direction — a paragraph tagged by the author is the
+       * author's business. This function RE-STAMPS the carried direction onto
+       * the front of every carried sentence, so from the proxy's side every
+       * chunk it sees was tagged by the author. The cap has been handed a
+       * forgery every time. SpeechStreamer.swift hit this identically in Part
+       * 94 and the fix was the same: the brake belongs where the carry is
+       * CREATED.
+       *
+       * ⚠️ AND IT MATTERS HERE PRECISELY BECAUSE THIS LANE BATCHES. Sentences
+       * accumulate to ~PHONE_TTS_CHUNK (320) characters and synthesise as ONE
+       * passage, so an untagged sentence whose carry just expired rides in the
+       * SAME REQUEST as the tagged sentence ahead of it and inherits its tempo.
+       * Per-sentence requests would have hidden this; batching is what exposes
+       * it, and batching is deliberate (July 4: bigger units, better prosody).
+       *
+       * Pass 1 of applySteeringTags converts %%%tag%%% to [tag] EVERYWHERE in
+       * the text, not only in lead position, so an inline reset arrives at
+       * Inworld as a real inline [reset]. The fish lane strips it by design
+       * (it re-seeds per sentence and has no reset concept) — checked, not
+       * assumed, before writing this. */
+      return `%%%reset%%% ${sentence}`;
     }
     dirState.carried = (dirState.carried || 0) + 1;
     dirState.chars = (dirState.chars || 0) + sentence.length;
@@ -4148,31 +4184,57 @@ function attachWebVoice(server) {
         session.dgWs = openDeepgram(session);
         session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice });
         session.sendState('listening');
-        // Short spoken greeting: a blind caller needs to HEAR the line is
-        // live. One line, invitation LAST (the July 1 greeting lesson), and
-        // it doubles as the interrupt orientation.
+        /* NO SPOKEN GREETING ON THIS LANE any more (Part 110) — the `ready`
+         * and `listening` states sent just above are what tells the caller the
+         * line is open, through the app's own screen and VoiceOver. The two
+         * silent cases below are silent for different reasons; only an
+         * agent-initiated call still speaks first. */
         if (session._spotterDirect) {
           // July 18 2026 (Kade: "do we have to have Ki answer and transfer?"):
           // on a direct Spotter call the character stays SILENT — the client
           // fires the live ask the moment the line opens and the Spotter says
           // hello themselves. If live can't start (cap/disabled), those
           // notices still speak in the character's voice, so no dead air.
-        } else {
-          const first = (t.name || '').trim().split(/\s+/)[0] || null;
-          // KADE July 22 2026 ("too long and wordy... the go ahead I'm
-          // listening thing is a bit much since the screen and vo says the
-          // same thing"): app greeting is now JUST the name line. The app's
-          // own screen + VoiceOver announce the listening state, and the
-          // NEW client-side thinking sound (this same session) covers the
-          // typing orientation the phone greeting still carries. Shorter
-          // greeting also shrinks the echo window that sometimes let the
-          // agent hear its own greeting tail.
-          const line = session.agentCallGreeting
-            ? session.agentCallGreeting
-            : first
-            ? `Hey ${first}! It's ${session.agentName}.`
-            : `Hey! It's ${session.agentName}.`;
-          speak(session, line, session.voice).catch(() => {});
+        } else if (session.agentCallGreeting) {
+          /* ⭐ PART 110 ADDENDUM (Aug 31 2026) — THE APP NO LONGER SAYS HELLO,
+           * AND THE ONLY GREETING LEFT ON THIS LANE IS ONE WITH SOMETHING TO SAY.
+           *
+           * Her report, minutes after auto barge-in went live: "barge in is
+           * working, but Kiana still hears her own greeting. She says, Hey Kade,
+           * it's Kiana, and she hears herself." Deepgram transcribes it back —
+           * her words: the last word if she says it fast, most of the phrase if
+           * she says it slow — and the agent barges herself before the caller
+           * has said anything.
+           *
+           * ⚠️ THIS FILE PREDICTED IT AND ONLY MITIGATED IT. The July 22 comment
+           * that used to live here ended "shorter greeting also shrinks the echo
+           * window that sometimes let the agent hear its own greeting tail."
+           * Shrinking an echo window is a fix while barge-in is OFF. Tonight it
+           * came on, and a shrunken window is just a smaller target.
+           *
+           * HER CALL, AND IT IS THE RIGHT ONE: "That line is never recorded in
+           * the conversation anyway, so probably Kiana should just not say
+           * anything, and the rest of the app will let you know when she's
+           * listening like usual. She really only needs a greeting when she's
+           * answering the actual twillio line because they don't have an app
+           * telling them she's connected." Exactly so — the `ready` + `listening`
+           * states above already drive the screen and VoiceOver, and the PSTN
+           * greeting is a different code path entirely and is untouched.
+           *
+           * WHAT SURVIVES, deliberately: an AGENT-INITIATED call (a KADE_CALL
+           * ring the caller answered). She rang THEM, and a call that opens in
+           * silence when you did not place it is a wrong number. That greeting
+           * carries a reason, not a connection announcement — so it is content,
+           * not chrome.
+           *
+           * And it takes the greeting lock, which the generic line never did:
+           * barge-in is refused while the lock is held and anything the caller
+           * says is HELD and replayed the instant it lifts (releaseGreetingLock).
+           * So she cannot barge herself on the one line she still speaks. */
+          session._greetingLock = true;
+          speak(session, session.agentCallGreeting, session.voice)
+            .catch(() => {})
+            .finally(() => releaseGreetingLock(session));
         }
         return;
       }

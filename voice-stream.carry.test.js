@@ -29,6 +29,24 @@ vm.runInContext(
 );
 const { applyDirectionCarry, isSoundTag } = ctx;
 
+/* ⚠️ PART 110 (Aug 31 2026) — THREE ASSERTIONS IN THIS FILE WERE SHARPENED, NOT
+ * LOOSENED, AND THE DISTINCTION IS THE WHOLE POINT.
+ *
+ * They asked "does the tail start with %%%?" as a proxy for "has the direction
+ * stopped carrying?" That proxy was exact until tonight. Part 110 made an
+ * expired carry emit `%%%reset%%%` — because Part 109 measured that on Inworld
+ * a tag applies UNTIL YOU CHANGE IT, so merely ceasing to stamp does not stop
+ * anything when sentences ride batched in one request. The tail now starts with
+ * %%% and IS unstamped: `%%%reset%%%` is the direction ending, out loud.
+ *
+ * So the old assertions began failing on the correct behaviour — HOW_TO_VERIFY
+ * law 21 in miniature: a ruler with no category for the right answer. They now
+ * ask the question they always meant: is THE DIRECTION still riding this
+ * sentence? Every original intent is preserved and each is strictly stricter,
+ * because "no direction" alone would pass on a bare tail and these also demand
+ * the reset that makes it true at the synthesiser. */
+const carriesDirection = (line, dir) => line.startsWith(`%%%${dir}%%%`);
+
 function runReply(sentences) {
   const dirState = { active: null };
   return sentences.map((s) => applyDirectionCarry(s, dirState));
@@ -42,9 +60,13 @@ test('HER BUG ON THE PHONE: one opening tag no longer steers the whole call', ()
     'Fourth sentence of the reply.',
     'Fifth sentence of the reply.',
   ]);
-  const stamped = out.filter((s) => s.startsWith('%%%')).length;
+  const dir = 'slow and soothing like you are talking somebody down';
+  const stamped = out.filter((s) => carriesDirection(s, dir)).length;
   assert.strictEqual(stamped, 3, `authored + 2 carried expected, got ${stamped} of ${out.length}`);
-  assert.ok(!out[4].startsWith('%%%'), 'the tail of the reply must return to her own voice');
+  assert.ok(!out[4].includes(dir), 'the tail of the reply must return to her own voice');
+  assert.ok(!out[3].includes(dir), 'the direction rode past its cap');
+  // Part 110: and the tail must SAY so, or Inworld carries the tempo anyway.
+  assert.match(out[3], /^%%%reset%%% /, 'the cap went quiet instead of saying stop');
 });
 
 test('a sound is a one-shot: gasp does not haunt the call', () => {
@@ -79,11 +101,15 @@ test('a new authored tag re-arms the carry (the decay cannot flatten the back ha
     '%%%warmer now%%% Five.', 'Six.',
   ]);
   assert.ok(out[5].startsWith('%%%warmer now%%%'), 'the second direction must carry');
-  assert.ok(!out[3].startsWith('%%%'), 'the first direction must have expired before it');
+  assert.ok(!out[3].includes('dry as hell'), 'the first direction must have expired before it');
+  assert.match(out[3], /^%%%reset%%% /, 'the expiry must be spoken, not silent');
+  // And the fresh authored tag supersedes cleanly — no reset stacked in front.
+  assert.ok(!out[4].includes('reset'), 'a new direction should not need a reset first');
 });
 
 test('a whole business-length reply under one direction stops at ~600 chars', () => {
   const long = 'This sentence is deliberately padded out to be quite long indeed for the character budget test. ';
   const out = runReply(['%%%measured and calm%%% Opening.', long.repeat(4), long.repeat(4), 'Tail.']);
-  assert.ok(!out[3].startsWith('%%%'), 'the char bound did not fire');
+  assert.ok(!out[3].includes('measured and calm'), 'the char bound did not fire');
+  assert.match(out[3], /^%%%reset%%% /, 'the char bound fired silently');
 });

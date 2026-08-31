@@ -249,3 +249,80 @@ test('but pure punctuation is still never handed to the synthesiser', () => {
   assert.deepEqual(pieces('...'), []);
   assert.deepEqual(pieces('?!'), []);
 });
+
+// ═══ 5. THE CARRY SAYS STOP OUT LOUD ON THE PHONE LANE TOO (Part 110 addendum) ═
+
+const carryCtx = { String, Set, Boolean, parseInt, parseFloat, Array, process: { env: {} } };
+vm.createContext(carryCtx);
+vm.runInContext(
+  grab('const CANONICAL_SOUNDS = [', 'return sentence;\n}') +
+    '\nthis.applyDirectionCarry = applyDirectionCarry;',
+  carryCtx,
+);
+const { applyDirectionCarry } = carryCtx;
+
+/** Run a reply's sentences through the carry the way streamReply does. */
+function carried(sentences) {
+  const dirState = { active: null };
+  return sentences.map((s) => applyDirectionCarry(s, dirState));
+}
+
+test('THE BUG: an expired carry now emits reset instead of going quietly', () => {
+  // Watched fail against the shipped file: the fourth sentence came back BARE.
+  // Bare is not neutral on Inworld — the sentence rides in the same ~320-char
+  // batched request as the tagged one ahead of it and inherits its tempo,
+  // which is the "holds the fast a long time" she reported.
+  const out = carried([
+    '%%%unhurried and low%%% First one, tagged by the author.',
+    'Second one, carried.',
+    'Third one, carried.',
+    'Fourth one, past the cap.',
+  ]);
+  assert.match(out[0], /^%%%unhurried and low%%%/);
+  assert.match(out[1], /^%%%unhurried and low%%%/);
+  assert.match(out[2], /^%%%unhurried and low%%%/);
+  assert.match(out[3], /^%%%reset%%% /, `the cap went quiet instead of saying stop: ${out[3]}`);
+});
+
+test('reset fires once, not on every sentence after the cap', () => {
+  // The Aug-29 fish scar in reverse: "[reset] Anyway. [reset] Text me…" is a
+  // cue repeated, and on Inworld it would be a stutter of stops.
+  const out = carried([
+    '%%%bright and quick%%% One.',
+    'Two.', 'Three.', 'Four.', 'Five.',
+  ]);
+  assert.equal(out.filter((p) => p.startsWith('%%%reset%%%')).length, 1);
+});
+
+test('a reply with no direction at all never emits a reset', () => {
+  const out = carried(['Plain one.', 'Plain two.', 'Plain three.', 'Plain four.']);
+  assert.deepEqual(out, ['Plain one.', 'Plain two.', 'Plain three.', 'Plain four.']);
+});
+
+test("the author's own reset still ends the carry, and is not doubled", () => {
+  const out = carried([
+    '%%%warm and slow%%% One.',
+    '%%%reset%%% Two.',
+    'Three.',
+  ]);
+  assert.equal(out[1], '%%%reset%%% Two.');
+  assert.ok(!out[2].startsWith('%%%reset%%%'), 'reset re-fired with nothing active');
+  assert.equal(out[2], 'Three.');
+});
+
+test('a fresh authored direction supersedes without a stray reset', () => {
+  const out = carried([
+    '%%%unhurried%%% One.',
+    'Two.', 'Three.',
+    '%%%bright and quick%%% Four.',
+    'Five.',
+  ]);
+  assert.equal(out[3], '%%%bright and quick%%% Four.');
+  assert.match(out[4], /^%%%bright and quick%%%/, 'the new direction did not start carrying');
+});
+
+test('a sound tag never becomes a carried direction', () => {
+  const out = carried(['%%%laugh%%% One.', 'Two.', 'Three.', 'Four.']);
+  assert.equal(out[1], 'Two.');
+  assert.ok(!out.some((p) => p.startsWith('%%%reset%%%')), 'reset fired for a sound tag');
+});
