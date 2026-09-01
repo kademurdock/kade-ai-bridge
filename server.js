@@ -5606,6 +5606,32 @@ async function voiceReportForSpeech() {
   };
 }
 
+/* PART 116 (Sep 1 2026, proposal 3) -- the slop filter's daily trip counts,
+ * read off reframe's GET /slop-stats and spoken in the ops half of the
+ * summary (after ' Spend:', so family seats never hear it). Env
+ * REFRAME_PROXY_SECRET is reframe's own bearer; without it this says nothing.
+ * The counter lives in reframe's memory and resets on its deploy -- the
+ * sentence it hands back says so itself when the window is short. */
+let slopStatsCache = { at: 0, data: null };
+async function slopStatsForSpeech() {
+  const sec = process.env.REFRAME_PROXY_SECRET;
+  if (!sec || process.env.SLOP_STATS_STATUS === '0') return { section: { enabled: false }, spoken: '' };
+  if (Date.now() - slopStatsCache.at < 5 * 60e3 && slopStatsCache.data) {
+    return { section: slopStatsCache.data, spoken: slopStatsCache.data.spoken || '' };
+  }
+  try {
+    const r = await axios.get('https://reframe-proxy-production.up.railway.app/slop-stats', {
+      headers: { Authorization: `Bearer ${sec}`, 'User-Agent': BROWSER_UA },
+      timeout: 15000,
+    });
+    const data = r.data || {};
+    slopStatsCache = { at: Date.now(), data };
+    return { section: data, spoken: data.spoken ? `Slop filter: ${data.spoken}` : '' };
+  } catch (e) {
+    return { section: { enabled: true, error: e.message }, spoken: '' };
+  }
+}
+
 app.get('/platform-status', async (req, res) => {
   const provided = req.get('x-notify-secret') || req.get('x-kade-secret') || req.query.secret;
   const scopedOk = NOTIFY_AGENT_SECRET && provided === NOTIFY_AGENT_SECRET;
@@ -5654,11 +5680,12 @@ app.get('/platform-status', async (req, res) => {
     const crash = crashStatusForSpeech();
     const memoryH = await memoryHealthForSpeech();
     const voiceR = await voiceReportForSpeech();
+    const slopS = await slopStatsForSpeech();
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday
         && memoryH.okForStatus,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken].filter(Boolean).join(' '),
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken, slopS.spoken].filter(Boolean).join(' '),
       deploys: (typeof DEPLOY_READER.snapshot === 'function' && DEPLOY_READER.snapshot()) || null,
       services,
       canary,
@@ -5666,6 +5693,7 @@ app.get('/platform-status', async (req, res) => {
       backups: backups.section,
       memory: memoryH.section,
       voice: voiceR.section,
+      slop: slopS.section,
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,
