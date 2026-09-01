@@ -5567,6 +5567,17 @@ async function voiceReportForSpeech() {
     bits.push(`${Math.round(data.fragRate * 100)}% of sentences short and hard, against a target of 29`);
   }
   if (data.bossyPer1k) bits.push(`advice-and-therapy phrasing ${data.bossyPer1k} per thousand words`);
+  /* PART 116 (Sep 1 2026) -- the reading-level gauge, proposal 2. Her point:
+   * a high-school reader should never need a dictionary for Kiana. The shape
+   * numbers above cannot see vocabulary; this one can. Target: grade 7 or
+   * under, big words under 8 percent. Baseline is measured, not guessed --
+   * see PROJECT_STATUS Part 116 for the day-before-v260 number. */
+  if (typeof data.fkGrade === 'number') {
+    bits.push(`reading level grade ${data.fkGrade}, against a target of 7 or under`);
+  }
+  if (typeof data.bigWordPct === 'number') {
+    bits.push(`${data.bigWordPct}% big words, against a target of 8`);
+  }
   if (data.tagsTotal) {
     bits.push(
       data.commaTags
