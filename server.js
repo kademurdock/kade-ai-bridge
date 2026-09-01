@@ -5682,11 +5682,16 @@ app.get('/platform-status', async (req, res) => {
     const memoryH = await memoryHealthForSpeech();
     const voiceR = await voiceReportForSpeech();
     const slopS = await slopStatsForSpeech();
+    /* Part 116 — the battery's one line. Ops half (after Spend), like slop. */
+    let batteryS = { section: null, spoken: '' };
+    try {
+      if (BATTERY) { const b = BATTERY.summarize(); batteryS = { section: { enabled: b.enabled, latest: b.latest, weekMean: b.weekMean, running: b.running, lastError: b.lastError }, spoken: b.latest ? b.spoken : '' }; }
+    } catch (_e) { /* a broken summary never breaks the status */ }
     res.json({
       ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday
         && memoryH.okForStatus,
-      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken, slopS.spoken].filter(Boolean).join(' '),
+      spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken, slopS.spoken, batteryS.spoken].filter(Boolean).join(' '),
       deploys: (typeof DEPLOY_READER.snapshot === 'function' && DEPLOY_READER.snapshot()) || null,
       services,
       canary,
@@ -5695,6 +5700,7 @@ app.get('/platform-status', async (req, res) => {
       memory: memoryH.section,
       voice: voiceR.section,
       slop: slopS.section,
+      battery: batteryS.section,
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,
@@ -5745,6 +5751,21 @@ try {
   const { attachMemory } = require('./memory');
   attachMemory(app, { bridgeSecretOk });
 } catch (e) { console.warn('[memory] attach failed (bridge unaffected):', e.message); }
+
+// Part 116 (Sep 1 2026) — THE NIGHTLY PERSONA BATTERY: twelve fixed probes
+// against Kiana and a control, two flash judges, one score line a night. Her
+// yes at ~5–10¢/night. Rides the vischeck seat and sweeps its cards after.
+// Kill switch BATTERY_ENABLED=0. Full story atop battery.js.
+let BATTERY = null;
+try {
+  const { attachBattery } = require('./battery');
+  BATTERY = attachBattery(app, {
+    bridgeSecretOk,
+    proxyUrl: PROXY_URL,
+    proxySecret: PROXY_SECRET,
+    openrouterKey: process.env.OPENROUTER_KEY,
+  });
+} catch (e) { console.warn('[battery] attach failed (bridge unaffected):', e.message); }
 
 // Part 85 (Aug 22 2026) — TWO NEW REFLEXES: the deploy self-verifier (the
 // stale-hash scar turned into a 15-minute check) and the TTS-synth probe
