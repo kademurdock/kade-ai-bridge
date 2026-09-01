@@ -5616,8 +5616,9 @@ let slopStatsCache = { at: 0, data: null };
 async function slopStatsForSpeech() {
   const sec = process.env.REFRAME_PROXY_SECRET;
   if (!sec || process.env.SLOP_STATS_STATUS === '0') return { section: { enabled: false }, spoken: '' };
+  const say = (data) => (data && data.spoken ? `Slop filter: ${data.spoken}` : '');
   if (Date.now() - slopStatsCache.at < 5 * 60e3 && slopStatsCache.data) {
-    return { section: slopStatsCache.data, spoken: slopStatsCache.data.spoken || '' };
+    return { section: slopStatsCache.data, spoken: say(slopStatsCache.data) };
   }
   try {
     const r = await axios.get('https://reframe-proxy-production.up.railway.app/slop-stats', {
@@ -5626,7 +5627,7 @@ async function slopStatsForSpeech() {
     });
     const data = r.data || {};
     slopStatsCache = { at: Date.now(), data };
-    return { section: data, spoken: data.spoken ? `Slop filter: ${data.spoken}` : '' };
+    return { section: data, spoken: say(data) };
   } catch (e) {
     return { section: { enabled: true, error: e.message }, spoken: '' };
   }
