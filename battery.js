@@ -64,9 +64,13 @@ const UA =
   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 const KIANA_ID = process.env.BATTERY_AGENT_ID || 'agent_6llV0eMu4fmIaj8f2x1Sb';
-// Control: the Canary agent — private, kimi lane, no persona work ever lands
-// on it, which is exactly what a control is for. Override with BATTERY_CONTROL_ID.
-const CONTROL_ID = process.env.BATTERY_CONTROL_ID || process.env.CANARY_AGENT_ID || 'agent_BsyesQ07Iku6NozcthFvV';
+// Control: Earl, a public marketplace companion no persona session touches.
+// The first run (Sep 1 23:50Z) used the private Canary agent and the vischeck
+// seat got 403 "Insufficient permissions to access this agent" twelve times
+// in a row -- a control the probing seat cannot SEE is no control at all, and
+// twelve 403s is eleven more than the standing rule allows. The control must
+// be PUBLIC. Override with BATTERY_CONTROL_ID.
+const CONTROL_ID = process.env.BATTERY_CONTROL_ID || 'agent_XFTHtHSfGHciEw0OTPA0k';
 const VISCHECK_USER_ID = process.env.BATTERY_SEAT_USER_ID || '6a6125d73939d20b95251078';
 const JUDGES = String(process.env.BATTERY_JUDGES || 'z-ai/glm-5.3-flash,deepseek/deepseek-v4-flash')
   .split(',').map((s) => s.trim()).filter(Boolean);
@@ -260,7 +264,15 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
           try { reply = await ask(agentId, probe.text); }
           catch (e) {
             if (/refusing to probe on the admin seat/.test(e.message)) throw e;
-            per.push({ id: probe.id, error: e.message }); continue;
+            per.push({ id: probe.id, error: e.message });
+            // Standing rule: stop DEAD on the first 403. Whether it is the
+            // ACL (this seat cannot see the agent) or the anti-abuse gate,
+            // eleven more of them buy nothing and can buy a ban.
+            if (/403|forbidden/i.test(e.message)) {
+              log.warn(`[battery] ${name}: 403 on first probe -- skipping the rest of this agent (${e.message.slice(0, 120)})`);
+              break;
+            }
+            continue;
           }
           const scores = []; const flags = {}; const quotes = [];
           for (const model of JUDGES) {
