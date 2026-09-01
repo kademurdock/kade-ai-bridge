@@ -4132,6 +4132,31 @@ const CLOCK_JOBS = [
 ];
 let clockState = {};
 try { clockState = JSON.parse(fs.readFileSync(CLOCK_FILE, 'utf8')); } catch { /* first run */ }
+/* ⭐ PART 112 (Sep 1 2026) — THE CLOCK SAYS ITS SCHEDULE OUT LOUD AT BOOT.
+ *
+ * Bought tonight: her ask was "move the consolidation hour", and the obvious
+ * dial — the FORK's MEMORY_CONSOLIDATION_SWEEP_HOUR — is INERT under
+ * KADE_CLOCK_EXTERNAL=1. It was set, redeployed and would have been reported
+ * as done; the fork's in-process scheduler never runs, so the only thing that
+ * actually governs the hour is CLOCK_CONSOLIDATE_HOUR right here. The tell was
+ * an ABSENCE: the fork's "scheduler started ... at hour N UTC" line was
+ * missing from a 297-line boot log.
+ *
+ * That near-miss is the standing rule ("confirm a config change from the
+ * service's own startup dump, never from the yaml") meeting a service that had
+ * no startup dump to confirm anything from. Now it has one. Cheap, and it makes
+ * the next session's verification possible instead of aspirational. */
+console.log(
+  '[clock] schedule (UTC): ' +
+    (process.env.CLOCK_ENABLED === 'true' ? 'ENABLED' : 'DISABLED (CLOCK_ENABLED != true)') +
+    ' | ' +
+    CLOCK_JOBS.map(
+      (j) =>
+        `${j.name}@${parseInt(process.env[j.hourEnv] || String(j.defHour), 10)}h` +
+        (j.weeklyDowUTC !== undefined ? ` (weekly dow ${j.weeklyDowUTC})` : ' daily'),
+    ).join(' · ') +
+    ' | nudges every 60s',
+);
 const clockLastPoke = { nudges: null, ok: null };
 
 async function clockPoke(job) {
