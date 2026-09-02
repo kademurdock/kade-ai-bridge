@@ -218,7 +218,9 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
        * returned content: null -- six of twelve probes came back unjudged
        * and the rest with one judge. effort:low + 1200 tokens: glm ~160
        * tokens ($0.00007), deepseek ~1100 ($0.0005). ~1.5 cents a night. */
-      max_tokens: 1200,
+      /* Run 2 (00:04Z): deepseek still hit finish=length at 1200 on 5 of 24
+       * calls (glm once). 2500 is the budget; a thin score still says so. */
+      max_tokens: 2500,
       reasoning: { effort: 'low' },
     }, {
       headers: { Authorization: `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'User-Agent': UA,
@@ -350,8 +352,12 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
   function summarize() {
     const runs = readRuns(14).filter((r) => r.ok);
     const latest = runs[runs.length - 1] || null;
-    const prev = runs[runs.length - 2] || null;
-    const week = runs.slice(-7);
+    // Compare only against a run that actually scored (>=10 of 12 probes).
+    // Run 1 scored 6 of 12 and the second run read as "UP 16, a real move"
+    // against it -- a half-run is not a baseline.
+    const full = (r) => r && r.agents && r.agents.kiana && (r.agents.kiana.scored || 0) >= 10;
+    const prev = runs.slice(0, -1).reverse().find(full) || null;
+    const week = runs.filter(full).slice(-7);
     const mean = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null);
     const kWeek = mean(week.map((r) => r.agents.kiana && r.agents.kiana.score).filter((x) => x != null));
     const cWeek = mean(week.map((r) => r.agents.control && r.agents.control.score).filter((x) => x != null));
