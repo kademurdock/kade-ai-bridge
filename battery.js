@@ -184,12 +184,21 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
 
   async function ask(agentId, text) {
     const t0 = Date.now();
-    const r = await axios.post(`${proxyUrl}/librechat/ask`, {
-      agentId,
-      seat: 'vischeck',
-      deleteAfter: true,
-      messages: [{ role: 'user', content: text }],
-    }, { headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA }, timeout: ASK_TIMEOUT_MS });
+    let r;
+    try {
+      r = await axios.post(`${proxyUrl}/librechat/ask`, {
+        agentId,
+        seat: 'vischeck',
+        deleteAfter: true,
+        messages: [{ role: 'user', content: text }],
+      }, { headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA }, timeout: ASK_TIMEOUT_MS });
+    } catch (e) {
+      // The proxy wraps a site 403 as its own 502 with the site's words in
+      // the body; surface them so "stop on the first 403" can see a 403.
+      const body = e.response && e.response.data;
+      const detail = body && (body.error || body.message) ? String(body.error || body.message) : '';
+      throw new Error(detail ? `${e.message}: ${detail.slice(0, 160)}` : e.message);
+    }
     if (r.data && r.data.seat !== 'vischeck') {
       // The proxy predates the seat option or ignored it: STOP. A battery
       // that runs on her seat is the exact bug this was built not to be.
@@ -203,7 +212,14 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
       model,
       messages: [{ role: 'user', content: judgePrompt(probe, reply) }],
       temperature: 0,
-      max_tokens: 220,
+      /* Measured Sep 1 2026 before the second run: BOTH flash judges are
+       * reasoning models on OpenRouter and reasoning "is mandatory for this
+       * endpoint". At max_tokens 220 they spent every token thinking and
+       * returned content: null -- six of twelve probes came back unjudged
+       * and the rest with one judge. effort:low + 1200 tokens: glm ~160
+       * tokens ($0.00007), deepseek ~1100 ($0.0005). ~1.5 cents a night. */
+      max_tokens: 1200,
+      reasoning: { effort: 'low' },
     }, {
       headers: { Authorization: `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'User-Agent': UA,
         'HTTP-Referer': 'https://kademurdock.com', 'X-Title': 'kade-ai persona battery' },
@@ -211,6 +227,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
     });
     const content = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
     const usage = (r.data && r.data.usage) || {};
+    if (!content) log.warn(`[battery] judge ${model} returned no content (finish=${r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].finish_reason}, completion_tokens=${usage.completion_tokens})`);
     // OpenRouter reports cost when usage accounting is on; otherwise estimate flash-class ($0.10/M in, $0.40/M out).
     const cost = Number.isFinite(Number(usage.cost)) ? Number(usage.cost)
       : ((usage.prompt_tokens || 600) * 0.10 + (usage.completion_tokens || 80) * 0.40) / 1e6;
@@ -274,12 +291,16 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
             }
             continue;
           }
-          const scores = []; const flags = {}; const quotes = [];
+          // %%%tag%%% is voice steering for the synthesiser, not text a person
+          // reads; the first run's judges docked a reply to 10/100 for it.
+          const readable = reply.text.replace(/%%%[^%]*%%%/g, ' ').replace(/\s+/g, ' ').trim();
+          const scores = []; const flags = {}; const quotes = []; let unparsed = 0;
           for (const model of JUDGES) {
             if (state.spentTodayUsd >= DAILY_CAP_USD) throw new Error(`daily judge cap $${DAILY_CAP_USD} reached — run stopped`);
             try {
-              const j = await judge(model, probe, reply.text);
+              const j = await judge(model, probe, readable);
               row.judgeCostUsd += j.cost; spend(j.cost); if (j.estimated) row.judgeCostEstimated = true;
+              if (!j.parsed) unparsed += 1;
               if (j.parsed) {
                 scores.push(j.parsed.score);
                 for (const k of FLAG_KEYS) if (j.parsed.flags[k]) flags[k] = (flags[k] || 0) + 1;
@@ -288,7 +309,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
             } catch (e) { log.warn(`[battery] judge ${model} failed on ${probe.id}:`, e.message); }
           }
           const agreement = scores.length === 2 ? 100 - Math.abs(scores[0] - scores[1]) : null;
-          per.push({ id: probe.id, ms: reply.ms, chars: reply.text.length, scores, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' });
+          per.push({ id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' });
         }
         const scored = per.filter((p) => p.mean != null);
         const flagTotals = {};
@@ -298,6 +319,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
           agentId,
           score: scored.length ? Math.round(scored.reduce((a, p) => a + p.mean, 0) / scored.length) : null,
           scored: scored.length,
+          unparsed: per.reduce((a, p) => a + (p.unparsed || 0), 0),
           errors: per.filter((p) => p.error).length,
           agreement: agreements.length ? Math.round(agreements.reduce((a, b) => a + b, 0) / agreements.length) : null,
           flags: flagTotals,
@@ -349,13 +371,15 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
         .map(([f, n]) => `${f.replace(/_/g, ' ')} ${n}`);
       bits.push(flagged.length ? `flags: ${flagged.join(', ')}` : 'no flags');
       if (k.agreement != null && k.agreement < 75) bits.push(`judges only agree ${k.agreement}% so read the rubric before the number`);
+      if (k.unparsed) bits.push(`${k.unparsed} judge answers could not be read, so the score is thinner than it looks`);
+      if (k.scored != null && k.scored < 12) bits.push(`only ${k.scored} of 12 probes scored`);
       bits.push(`judges cost ${latest.judgeCostUsd < 0.01 ? 'under a cent' : `$${latest.judgeCostUsd.toFixed(2)}`}${latest.judgeCostEstimated ? ' estimated' : ''}`);
       spoken = bits.join('; ') + '.';
     }
     return {
       enabled: enabled(), running: state.running, lastError: state.lastError, hourUtc: HOUR_UTC, judges: JUDGES,
       probes: PROBES.map((p) => ({ id: p.id, rule: p.rule, since: p.since })),
-      latest: latest && { at: latest.at, finishedAt: latest.finishedAt, kiana: latest.agents.kiana && { score: latest.agents.kiana.score, agreement: latest.agents.kiana.agreement, flags: latest.agents.kiana.flags, errors: latest.agents.kiana.errors }, control: latest.agents.control && { score: latest.agents.control.score, agreement: latest.agents.control.agreement, flags: latest.agents.control.flags }, judgeCostUsd: latest.judgeCostUsd, swept: latest.swept },
+      latest: latest && { at: latest.at, finishedAt: latest.finishedAt, kiana: latest.agents.kiana && { score: latest.agents.kiana.score, scored: latest.agents.kiana.scored, unparsed: latest.agents.kiana.unparsed, agreement: latest.agents.kiana.agreement, flags: latest.agents.kiana.flags, errors: latest.agents.kiana.errors }, control: latest.agents.control && { score: latest.agents.control.score, agreement: latest.agents.control.agreement, flags: latest.agents.control.flags }, judgeCostUsd: latest.judgeCostUsd, swept: latest.swept },
       trend: runs.slice(-14).map((r) => ({ at: r.at.slice(0, 10), kiana: r.agents.kiana && r.agents.kiana.score, control: r.agents.control && r.agents.control.score })),
       weekMean: { kiana: kWeek, control: cWeek },
       spoken,
