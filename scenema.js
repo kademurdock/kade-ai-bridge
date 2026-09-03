@@ -219,6 +219,12 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     userId, agentId: String(agentId || ''), agentName: String(agentName || 'Kade-AI').slice(0, 40),
     prompt, promptChars: prompt.length, hasReference: !!input.reference_voice_url,
     state: 'queued', createdAt: new Date().toISOString(), runpodId: null, result: null, error: null, costUSD: null,
+    /* Part 122. A long script is rendered in PARTS and joined by the fork into
+     * one recording. A part is not a thing she made -- it is a slice of one --
+     * so it must not land in My Creations on its own, or a four-part story
+     * fills her gallery with five files and only one of them is the story.
+     * Spend is still logged; only the gallery row is skipped. */
+    suppressAsset: options.suppressAsset === true,
   };
   jobs.push(job); saveJobs();
   // words → a rough length estimate for the caller: ~2.6 words/s spoken, render ≈ 1.4× that at bf16
@@ -310,8 +316,14 @@ async function pump() {
         receipt({ jobId: job.id, userId: job.userId, state: 'done', durationS: out.duration_s, executionS: execS, delayS, cold, costUSD, words: job.estimate?.words });
         console.log(`[scenema] ${job.id} done: ${out.duration_s}s audio in ${execS.toFixed(0)}s (${cold ? 'cold' : 'warm'}), $${costUSD}`);
         await postUsage({ userId: job.userId, seconds: out.duration_s || execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, words: job.estimate?.words, agent: job.agentName } });
-        await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, agent: job.agentName, engine: 'scenema-audio' } });
+        if (!job.suppressAsset) {
+          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, agent: job.agentName, engine: 'scenema-audio' } });
+        }
+        /* A part does not buzz her phone -- the fork does that once, after the
+         * parts are joined. Five pushes for one story is not five times the
+         * good news. */
         try {
+          if (job.suppressAsset) { continue; }
           const mins = Math.floor((out.duration_s || 0) / 60), secs = Math.round((out.duration_s || 0) % 60);
           const len = mins ? `${mins} minute${mins === 1 ? '' : 's'} ${secs} seconds` : `${secs} seconds`;
           await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title: 'Your narration is ready', body: `${len} of audio is in My Creations. Ask ${job.agentName} to play it, or open the gallery.`, urgent: false, userId: job.userId, category: 'KADE_RESEARCH' });
