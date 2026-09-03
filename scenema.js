@@ -57,6 +57,20 @@ const MONTHLY_CAP = parseFloat(process.env.SCENEMA_MONTHLY_CAP_USD || '20');
 const MAX_PROMPT = 4000;
 const POLL_MS = 20 * 1000;
 const RING = 200;
+/* THE FLOOR (Part 122, Sep 3 2026). A job whose worker never gets placed used
+ * to sit IN_QUEUE forever: RunPod does not fail it, and executionTimeoutMs only
+ * starts counting once a card PICKS THE JOB UP, so on a job nothing picks up it
+ * never fires. Her render on Sep 3 sat 98 minutes and said nothing -- the whole
+ * time the endpoint read `throttled: 1`, meaning no GPU was free in US-KS-2,
+ * where the weights volume pins every worker. Nothing anywhere in this system
+ * ever gave up. This is that missing floor. Her number: ten minutes. */
+const QUEUE_TIMEOUT_MS = parseInt(process.env.SCENEMA_QUEUE_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+/* Measured Sep 3: cold wake 6-6.5 min, and re-measured the same night at 406 s
+ * (image pull + load; weights already on the volume). The old estimate allowed
+ * a flat 90 s for it and so quoted three minutes against a real eight and a
+ * half -- which is what made a working render look broken to someone
+ * listening. 420 is an UPPER bound and the line that speaks it says "up to". */
+const COLD_WAKE_S = parseInt(process.env.SCENEMA_COLD_WAKE_S || '420', 10);
 const FORK_URL = (process.env.FORK_USAGE_URL || process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
 const USAGE_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -102,6 +116,58 @@ async function status(id) {
 }
 async function cancel(id) {
   try { await rp.post(`/cancel/${id}`); } catch (_) {}
+}
+
+/* ---------- what the endpoint is actually doing ----------
+ * The difference between "the card is waking up" and "there is no card" is the
+ * whole difference between waiting and wasting your evening, and until now
+ * nothing asked. RunPod answers it on /health: `throttled` means it wants a
+ * worker and cannot place one. Cached 15 s so a poll loop cannot hammer it. */
+let capacity = { at: 0, ok: false, throttled: 0, idle: 0, initializing: 0, ready: 0, running: 0, unhealthy: 0, inQueue: 0 };
+async function readCapacity() {
+  if (Date.now() - capacity.at < 15000) return capacity;
+  try {
+    const r = await rp.get('/health');
+    const w = r.data?.workers || {};
+    const j = r.data?.jobs || {};
+    capacity = {
+      at: Date.now(), ok: true,
+      throttled: w.throttled | 0, idle: w.idle | 0, initializing: w.initializing | 0,
+      ready: w.ready | 0, running: w.running | 0, unhealthy: w.unhealthy | 0, inQueue: j.inQueue | 0,
+    };
+  } catch (e) {
+    capacity = { ...capacity, at: Date.now(), ok: false };
+  }
+  return capacity;
+}
+
+function saySeconds(n) {
+  n = Math.max(0, Math.round(n));
+  const m = Math.floor(n / 60), s = n % 60;
+  if (!m) return `${s} second${s === 1 ? '' : 's'}`;
+  if (!s) return `${m} minute${m === 1 ? '' : 's'}`;
+  return `${m} minute${m === 1 ? '' : 's'} ${s} seconds`;
+}
+
+/* The spoken line for a job that has not finished. Said on every poll, because
+ * silence is what a screen reader turns into "this app is broken". */
+function waitInfo(job, cap) {
+  const submitted = Date.parse(job.submittedAt || job.createdAt) || Date.now();
+  const waitedS = Math.max(0, Math.round((Date.now() - submitted) / 1000));
+  const leftS = Math.max(0, Math.round(QUEUE_TIMEOUT_MS / 1000 - waitedS));
+  if (job.state === 'running' || job.startedAt) {
+    return { phase: 'rendering', waitedS, spoken: `Rendering now. ${saySeconds(waitedS)} in.` };
+  }
+  const giveUp = leftS > 0
+    ? ` I give up in ${saySeconds(leftS)} if nothing comes free.`
+    : ' Giving up now.';
+  if (cap.ok && cap.throttled > 0 && !cap.initializing && !cap.ready && !cap.idle && !cap.running) {
+    return { phase: 'no-card', waitedS, spoken: `Still waiting for a graphics card. None are free right now, so nothing has started. ${saySeconds(waitedS)} so far.${giveUp}` };
+  }
+  if (cap.ok && cap.initializing > 0) {
+    return { phase: 'waking', waitedS, spoken: `Got a card. It is waking up, which takes about six minutes. ${saySeconds(waitedS)} so far.${giveUp}` };
+  }
+  return { phase: 'queued', waitedS, spoken: `Queued, waiting for a card. ${saySeconds(waitedS)} so far.${giveUp}` };
 }
 
 /* ---------- fork lanes ---------- */
@@ -158,8 +224,18 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   // words → a rough length estimate for the caller: ~2.6 words/s spoken, render ≈ 1.4× that at bf16
   const words = prompt.replace(/<[^>]+>/g, ' ').split(/\s+/).filter(Boolean).length;
   const estAudioS = Math.round(words / 2.6);
-  const estRenderS = Math.round(estAudioS * 1.4) + 90;
-  job.estimate = { words, audioSeconds: estAudioS, renderSeconds: estRenderS, costUSD: Math.round((estRenderS / 3600 * RATE_PER_HR + WAKE_USD) * 1000) / 1000 };
+  /* TWO numbers, not one. The old single figure buried a 6-minute cold wake in
+   * a flat 90-second allowance, so a warm render came back early and a cold one
+   * ran three times past its own promise with nothing said. Quote both and let
+   * the caller say which is which. */
+  const estWarmS = Math.round(estAudioS * 1.4) + 15;
+  const estColdS = estWarmS + COLD_WAKE_S;
+  job.estimate = {
+    words, audioSeconds: estAudioS,
+    renderSeconds: estWarmS, renderSecondsWarm: estWarmS, renderSecondsCold: estColdS,
+    costUSD: Math.round((estWarmS / 3600 * RATE_PER_HR + WAKE_USD) * 1000) / 1000,
+    spokenWait: `About ${saySeconds(estWarmS)} if a card is already awake, or up to ${saySeconds(estColdS)} if one has to wake up first.`,
+  };
   saveJobs();
   submit(input).then((r) => {
     job.runpodId = r.id; job.state = r.status === 'IN_PROGRESS' ? 'running' : 'queued'; job.submittedAt = new Date().toISOString(); saveJobs();
@@ -182,6 +258,41 @@ async function pump() {
       let s;
       try { s = await status(job.runpodId); } catch (e) { console.warn(`[scenema] status ${job.id}:`, e.message); continue; }
       if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date().toISOString(); saveJobs(); }
+      /* THE FLOOR. Still queued, no card has picked it up, and the clock has
+       * run out: stop waiting and SAY SO. Nothing was charged, because RunPod
+       * bills worker seconds and this job never got a worker. Giving up also
+       * releases the one-render-at-a-time lock, which a stuck job used to hold
+       * for as long as it sat there — so a dead queue used to lock her out of
+       * starting a fresh one, on top of saying nothing. */
+      if (!job.startedAt && (job.state === 'queued' || s.status === 'IN_QUEUE')) {
+        const submitted = Date.parse(job.submittedAt || job.createdAt) || Date.now();
+        const waitedMs = Date.now() - submitted;
+        /* A card that is BOOTING is not a dead queue. Measured Sep 3: submit to
+         * first byte of work was 6 m 52 s on a cold wake, which leaves barely
+         * three minutes under a ten-minute timer — so the floor would sometimes
+         * shoot a render that was about to work. While the endpoint reports a
+         * worker initializing, ready or running, the wait is EARNED and the
+         * grace doubles; the timer only bites when nothing is coming. */
+        const capNow = await readCapacity();
+        const cardComing = capNow.ok && (capNow.initializing > 0 || capNow.ready > 0 || capNow.running > 0 || capNow.idle > 0);
+        const limitMs = cardComing ? QUEUE_TIMEOUT_MS * 2 : QUEUE_TIMEOUT_MS;
+        if (waitedMs > limitMs) {
+          const cap = capNow;
+          await cancel(job.runpodId);
+          const mins = Math.round(waitedMs / 60000);
+          job.state = 'failed';
+          job.gaveUp = true;
+          job.error = cap.ok && cap.throttled > 0
+            ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. Nothing was charged. Try again in a few minutes.`
+            : `This render waited ${mins} minutes and no graphics card picked it up. Nothing was charged. Try again.`;
+          job.finishedAt = new Date().toISOString();
+          saveJobs();
+          receipt({ jobId: job.id, userId: job.userId, state: 'gave-up', error: job.error, waitedS: Math.round(waitedMs / 1000), throttled: cap.throttled, costUSD: 0 });
+          console.warn(`[scenema] ${job.id} gave up after ${mins}m unplaced (throttled=${cap.throttled})`);
+          await notifyFail(job);
+          continue;
+        }
+      }
       if (s.status === 'COMPLETED') {
         const out = s.output || {};
         if (out.error || !out.url) {
@@ -233,14 +344,24 @@ function attachScenema(app, d = {}) {
   });
 
   /* GET /audio/scenema/status?jobId=… (or ?userId=… for that user's latest) */
-  app.get('/audio/scenema/status', (req, res) => {
+  app.get('/audio/scenema/status', async (req, res) => {
     if (!authOk(req, req.query?.secret)) return res.status(403).json({ error: 'Unauthorized' });
     const { jobId, userId } = req.query || {};
     let job = jobId ? jobs.find((j) => j.id === String(jobId)) : null;
     if (!job && userId) job = [...jobs].reverse().find((j) => j.userId === String(userId));
     if (!job) return res.status(404).json({ error: 'no such job' });
     const { prompt, ...rest } = job;
-    return res.json({ ...rest, promptPreview: prompt.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) });
+    /* An unfinished job now carries WHY it is unfinished and how long it has
+     * been that way, so the caller has a true sentence to speak on every poll
+     * instead of one line at the start and then silence. */
+    let wait = null;
+    if (job.state === 'queued' || job.state === 'running') {
+      const cap = await readCapacity();
+      wait = waitInfo(job, cap);
+      wait.capacity = { throttled: cap.throttled, initializing: cap.initializing, ready: cap.ready, running: cap.running, ok: cap.ok };
+      wait.giveUpAfterS = Math.round(QUEUE_TIMEOUT_MS / 1000);
+    }
+    return res.json({ ...rest, wait, promptPreview: prompt.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) });
   });
 
   /* POST /audio/scenema/cancel {secret, jobId} */
@@ -261,6 +382,8 @@ function attachScenema(app, d = {}) {
       enabled: ENABLED, configured: !!(RUNPOD_KEY && ENDPOINT_ID), endpointId: ENDPOINT_ID, ratePerHr: RATE_PER_HR,
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP }, spend: { dayUSD: spendSince(now - 86400000), monthUSD: spendSince(now - 30 * 86400000) },
       open: jobs.filter((j) => j.state === 'queued' || j.state === 'running').length,
+      queueTimeoutS: Math.round(QUEUE_TIMEOUT_MS / 1000), coldWakeS: COLD_WAKE_S,
+      capacity: { ...capacity, ageS: capacity.at ? Math.round((now - capacity.at) / 1000) : null },
       recent: jobs.slice(-10).map(({ prompt, ...j }) => j),
     });
   });
@@ -273,4 +396,4 @@ function attachScenema(app, d = {}) {
   }
 }
 
-module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince } };
+module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, QUEUE_TIMEOUT_MS, COLD_WAKE_S } };
