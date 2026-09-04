@@ -290,11 +290,26 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
    * the caller say which is which. */
   const estWarmS = Math.round(estAudioS * 1.4) + 15;
   const estColdS = estWarmS + COLD_WAKE_S;
+  /* Part 123: the caller may hand us what the endpoint looked like a moment
+   * ago, so the promise names WHICH case she is in instead of both. "Minutes
+   * and minutes" of a preview that was quoted as a penny is what made her
+   * press Stop; a true sentence up front is the cheapest fix there is. */
+  const cap = options.capacity && options.capacity.ok ? options.capacity : null;
+  const cardAwake = !!(cap && (cap.idle > 0 || cap.ready > 0 || (cap.running > 0 && cap.inProgress > 0)));
+  const cardLoading = !!(cap && !cardAwake && (cap.initializing > 0 || cap.running > 0));
+  const spokenWait = cardAwake
+    ? `A card is awake, so about ${saySeconds(estWarmS)}.`
+    : cardLoading
+      ? `A card is waking up. About ${saySeconds(estWarmS + 120)}, up to ${saySeconds(estColdS)} if it is a slow boot.`
+      : cap && cap.throttled > 0
+        ? `No card is free right now, so this will wait for one. Up to ${saySeconds(estColdS)} once one comes free, and I give up after ${saySeconds(QUEUE_TIMEOUT_MS / 1000)} if none does.`
+        : `About ${saySeconds(estWarmS)} if a card is already awake, or up to ${saySeconds(estColdS)} if one has to wake up first.`;
   job.estimate = {
     words, audioSeconds: estAudioS,
-    renderSeconds: estWarmS, renderSecondsWarm: estWarmS, renderSecondsCold: estColdS,
-    costUSD: Math.round((estWarmS / 3600 * RATE_PER_HR + WAKE_USD) * 1000) / 1000,
-    spokenWait: `About ${saySeconds(estWarmS)} if a card is already awake, or up to ${saySeconds(estColdS)} if one has to wake up first.`,
+    renderSeconds: cardAwake ? estWarmS : estColdS, renderSecondsWarm: estWarmS, renderSecondsCold: estColdS,
+    cardAwake, cardLoading,
+    costUSD: Math.round((estWarmS / 3600 * RATE_PER_HR + (cardAwake ? 0 : WAKE_USD)) * 1000) / 1000,
+    spokenWait,
   };
   saveJobs();
   submit(input).then((r) => {
@@ -422,10 +437,12 @@ function attachScenema(app, d = {}) {
   const authOk = (req, provided) => (d.bridgeSecretOk && d.bridgeSecretOk(req, provided)) || (d.notifySecretOk && d.notifySecretOk(req, provided));
 
   /* POST /audio/scenema/start {secret, userId, agentId, agentName, prompt, reference_voice_url?, background_sfx?, mode?, seed?, pace?, keep_wav?} */
-  app.post('/audio/scenema/start', express.json({ limit: '64kb' }), (req, res) => {
+  app.post('/audio/scenema/start', express.json({ limit: '64kb' }), async (req, res) => {
     if (!authOk(req, req.body?.secret)) return res.status(403).json({ error: 'Unauthorized' });
     const b = req.body || {};
-    const r = makeJob({ userId: b.userId, agentId: b.agentId, agentName: b.agentName, prompt: b.prompt, options: b });
+    let capacity = null;
+    try { capacity = await readCapacity(); } catch (_) {}
+    const r = makeJob({ userId: b.userId, agentId: b.agentId, agentName: b.agentName, prompt: b.prompt, options: { ...b, capacity } });
     return res.status(r.error ? 400 : 200).json(r);
   });
 
