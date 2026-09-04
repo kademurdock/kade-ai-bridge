@@ -998,7 +998,7 @@ app.post('/push-send', async (req, res) => {
   if (!message) return res.status(400).json({ error: 'body required' });
   // July 21 2026: no more silent everyone-blast (and no baked-in persona copy).
   // token = one device, userId = that user's linked devices, all:true = explicit broadcast.
-  const targets = b.token ? [String(b.token).toLowerCase()]
+  const targets = b.token ? [fcm.looksLikeFcmToken(String(b.token)) ? String(b.token) : String(b.token).toLowerCase()]
     : b.userId ? tokensForUser(String(b.userId))
     : b.all === true ? [...pushTokens.keys()]
     : null;
