@@ -291,7 +291,15 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   };
   jobs.push(job); saveJobs();
   // words → a rough length estimate for the caller: ~2.6 words/s spoken, render ≈ 1.4× that at bf16
-  const words = prompt.replace(/<[^>]+>/g, ' ').split(/\s+/).filter(Boolean).length;
+  /* Part 126: directions and sound cues are not speech. This used to count
+   * every word inside <action> and <sound> as spoken, so a heavily directed
+   * script was quoted long; the fork worked around it, but Cadence's
+   * generate_narration reply still quoted this number. Fixed at the source. */
+  const words = prompt
+    .replace(/<action>[\s\S]*?<\/action>/gi, ' ')
+    .replace(/<sound>[\s\S]*?<\/sound>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .split(/\s+/).filter(Boolean).length;
   const estAudioS = Math.round(words / 2.6);
   /* TWO numbers, not one. The old single figure buried a 6-minute cold wake in
    * a flat 90-second allowance, so a warm render came back early and a cold one
