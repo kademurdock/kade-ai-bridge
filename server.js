@@ -932,6 +932,18 @@ function sendApnsPush(deviceToken, title, body, opts = {}) {
   });
 }
 
+/* Part 129 (Sep 4 2026) — ONE DOOR, TWO PLATFORMS. A registered token knows
+ * its platform; the dispatcher sends Android through FCM (fcm.js, HTTP v1,
+ * her Firebase project) and everything else through APNs. Result shape is
+ * identical, so every call site keeps its 200-counts and 410-prune as is. */
+const fcm = require('./fcm');
+function sendPush(deviceToken, title, body, opts = {}) {
+  const meta = pushTokens.get(deviceToken);
+  const platform = (meta && meta.platform) || (fcm.looksLikeFcmToken(deviceToken) ? 'android' : 'ios');
+  if (platform === 'android') return fcm.sendFcmPush(deviceToken, title, body, opts);
+  return sendApnsPush(deviceToken, title, body, opts);
+}
+
 // App posts its device token here on launch. Public + validated (hex only).
 // Optional `userId` (LibreChat user id) links the device to a person so agent
 // check-ins can target them specifically; omit it and the token stays "unlinked"
@@ -947,10 +959,16 @@ app.options('/push-register', (req, res) => {
 });
 app.post('/push-register', (req, res) => {
   res.set('Access-Control-Allow-Origin', 'https://kademurdock.com');
-  const token = String((req.body && req.body.token) || '').trim().toLowerCase();
-  if (!/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
+  const rawToken = String((req.body && req.body.token) || '').trim();
+  const platformIn = (req.body && req.body.platform ? String(req.body.platform) : 'ios').slice(0, 20);
+  /* Part 129: an Android (FCM) registration token is base64url with one colon
+   * and is CASE-SENSITIVE — lowercasing it would register a token that can
+   * never be delivered to. APNs tokens stay hex-and-lowercased as before. */
+  const isAndroid = platformIn === 'android' || fcm.looksLikeFcmToken(rawToken);
+  const token = isAndroid ? rawToken : rawToken.toLowerCase();
+  if (isAndroid ? !fcm.looksLikeFcmToken(token) : !/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
   const userId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
-  const platform = (req.body && req.body.platform ? String(req.body.platform) : 'ios').slice(0, 20);
+  const platform = isAndroid ? 'android' : platformIn;
   const existing = pushTokens.get(token);
   // Part 75 (Aug 21 2026): the app's Settings ringtone picker rides the same
   // register call — it becomes the DEFAULT ring for agent calls when a plan
@@ -972,8 +990,8 @@ app.post('/push-register', (req, res) => {
 app.post('/push-send', async (req, res) => {
   const b = req.body || {};
   if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
-  if (!process.env.APNS_KEY || !process.env.APNS_KEY_ID || !process.env.APNS_TEAM_ID) {
-    return res.status(500).json({ error: 'APNs not configured (APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID)' });
+  if ((!process.env.APNS_KEY || !process.env.APNS_KEY_ID || !process.env.APNS_TEAM_ID) && !fcm.fcmConfigured()) {
+    return res.status(500).json({ error: 'No push sender configured (APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID, or FCM_SERVICE_ACCOUNT_JSON)' });
   }
   const title   = b.title || 'Kade-AI';
   const message = b.body;
@@ -986,7 +1004,7 @@ app.post('/push-send', async (req, res) => {
     : null;
   if (targets === null) return res.status(400).json({ error: 'target required: token, userId, or all:true (explicit broadcast)' });
   if (!targets.length) return res.json({ ok: true, sent: 0, note: 'no matching device tokens' });
-  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message)));
+  const results = await Promise.all(targets.map((t) => sendPush(t, title, message)));
   let pruned = 0;
   results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); // 410 = dead token
   if (pruned) savePushTokens();
@@ -1178,7 +1196,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
     category: category || (routeName ? 'KADE_ROUTE' : undefined),
     data: routeName && !category ? { kadeRoute: routeName } : undefined,
   };
-  const results = await Promise.all(targets.map((t) => sendApnsPush(t, title, message, sendOpts)));
+  const results = await Promise.all(targets.map((t) => sendPush(t, title, message, sendOpts)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   const sent = results.filter((r) => r.status === 200).length;
   // adminAlert sends don't advance the counters — the outreach budget
@@ -3526,7 +3544,7 @@ function nextQuietEndUtc() {
 async function sendCallNotice(userId, title, body) {
   const targets = tokensForUser(userId);
   if (!targets.length) { console.warn(`[calls] notice ZERO TARGETS user=${String(userId).slice(0, 8)}...`); return { sent: 0 }; }
-  const results = await Promise.all(targets.map((t) => sendApnsPush(t, String(title).slice(0, 40), String(body).slice(0, 300))));
+  const results = await Promise.all(targets.map((t) => sendPush(t, String(title).slice(0, 40), String(body).slice(0, 300))));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
   return { sent: results.filter((r) => r.status === 200).length };
 }
@@ -3554,7 +3572,7 @@ async function fireCallPlan(plan, { test = false } = {}) {
   if (!targets.length) { console.warn(`[calls] RING ZERO TARGETS plan=${plan.id} user=${String(plan.userId).slice(0, 8)}...`); return { ok: true, sent: 0, note: 'no device linked to this user' }; }
   const sound = ringtoneFileFor(plan);
   const shortPurpose = String(plan.purpose || '').slice(0, 120);
-  const results = await Promise.all(targets.map((t) => sendApnsPush(
+  const results = await Promise.all(targets.map((t) => sendPush(
     t,
     `${plan.agentName} — ${shortPurpose}`.slice(0, 60),
     `Incoming call from ${plan.agentName}. Tap Answer to pick up.`,
