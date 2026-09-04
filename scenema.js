@@ -267,6 +267,15 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   if (Number.isInteger(options.seed) && options.seed >= 0) input.seed = options.seed;
   if (typeof options.pace === 'number' && options.pace >= 0.5 && options.pace <= 3) input.pace = options.pace;
   if (options.keep_wav === true) input.keep_wav = true;
+  /* Part 126 — the engine's real knobs (README): validate + min_match_ratio
+   * (Whisper re-check, up to 3 regenerations), the SeedVC clone stage
+   * (vc_cfg_rate identity pressure, vc_steps quality, skip_vc anchor mode).
+   * There is no temperature; the seed is the dice. Ranges per the README. */
+  if (options.validate === false) input.validate = false;
+  if (typeof options.min_match_ratio === 'number' && options.min_match_ratio >= 0.5 && options.min_match_ratio <= 1) input.min_match_ratio = options.min_match_ratio;
+  if (typeof options.vc_cfg_rate === 'number' && options.vc_cfg_rate >= 0 && options.vc_cfg_rate <= 1) input.vc_cfg_rate = options.vc_cfg_rate;
+  if (Number.isInteger(options.vc_steps) && options.vc_steps >= 10 && options.vc_steps <= 50) input.vc_steps = options.vc_steps;
+  if (options.skip_vc === true) input.skip_vc = true;
 
   const job = {
     id: `sc_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
