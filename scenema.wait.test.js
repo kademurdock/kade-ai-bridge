@@ -70,3 +70,39 @@ test('an unreadable endpoint falls back to plain queued, never to a guess', () =
   assert.doesNotMatch(w.spoken, /None are free/);
   assert.doesNotMatch(w.spoken, /waking up/);
 });
+
+/* Part 123 (Sep 4 2026) — the frozen card. RunPod kept resuming a 4090 pod
+ * that never came up; /health said running:1 with the job IN_QUEUE and
+ * inProgress 0 for 19½ minutes on her preview, and billed the whole time. */
+const { isZombie, ZOMBIE_MS } = _internals;
+
+test('a running worker with nothing in progress and the job still queued past the window is a frozen card', () => {
+  assert.equal(isZombie(CAP({ running: 1, inProgress: 0 }), ZOMBIE_MS + 1000), true);
+  assert.equal(isZombie(CAP({ running: 1, inProgress: 0 }), ZOMBIE_MS - 1000), false, 'still inside the loading window');
+  assert.equal(isZombie(CAP({ running: 1, inProgress: 1 }), ZOMBIE_MS + 1000), false, 'a worker doing a job is not frozen');
+  assert.equal(isZombie(CAP({ running: 1, initializing: 1 }), ZOMBIE_MS + 1000), false, 'a booting card is not frozen');
+  assert.equal(isZombie(CAP({ running: 0 }), ZOMBIE_MS + 1000), false, 'no worker is a queue problem, not a frozen card');
+  assert.equal(isZombie({ ...CAP({ running: 1 }), ok: false }, ZOMBIE_MS + 1000), false, 'an unreadable endpoint is never called frozen');
+});
+
+test('a card that is up but loading is named as loading, with the give-up promise', () => {
+  const w = waitInfo({ state: 'queued', submittedAt: agoS(60) }, CAP({ running: 1 }));
+  assert.equal(w.phase, 'loading');
+  assert.match(w.spoken, /loading the voice models/);
+  assert.match(w.spoken, /I give up in/);
+});
+
+test('past the window the same picture is called stuck and says a restart is coming', () => {
+  const w = waitInfo({ state: 'queued', submittedAt: agoS(ZOMBIE_MS / 1000 + 30) }, CAP({ running: 1 }));
+  assert.equal(w.phase, 'stuck-card');
+  assert.match(w.spoken, /has not taken the job/);
+  assert.match(w.spoken, /Restarting it now/);
+});
+
+test('after a kick the line says so, counts from the restart, and the give-up clock restarts too', () => {
+  const w = waitInfo({ state: 'queued', submittedAt: agoS(400), kickedAt: agoS(20) }, CAP({ running: 1 }));
+  assert.equal(w.phase, 'restarted-card');
+  assert.match(w.spoken, /froze without taking the job, so I restarted it/);
+  assert.match(w.spoken, /20 seconds since the restart/);
+  assert.match(w.spoken, /I give up in 9 minutes 40 seconds/, w.spoken);
+});

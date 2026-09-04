@@ -71,6 +71,18 @@ const QUEUE_TIMEOUT_MS = parseInt(process.env.SCENEMA_QUEUE_TIMEOUT_MS || String
  * half -- which is what made a working render look broken to someone
  * listening. 420 is an UPPER bound and the line that speaks it says "up to". */
 const COLD_WAKE_S = parseInt(process.env.SCENEMA_COLD_WAKE_S || '420', 10);
+/* THE FROZEN CARD (Part 123, Sep 4 2026). Her "hear this voice" sat 19½ minutes
+ * at 01:39Z while RunPod's /health said `running: 1` the whole time -- so the
+ * floor above doubled its grace ("a card is coming") and nothing gave up. The
+ * card was not coming. RunPod kept RESUMING the same 4090 pod (850ilos9nijpmp)
+ * that never came up: desiredStatus RUNNING, the job IN_QUEUE, inProgress 0,
+ * and it BILLED -- 31 minutes on the Sep 4 statement for two renders that took
+ * 30 s between them. Reproduced at 02:14Z with a fresh job; terminating that
+ * pod by hand put a 5090 on the job inside a minute. A worker that is running
+ * with a job in the queue and nothing in progress for this long is frozen:
+ * terminate it (RunPod places a fresh one), once per job, then the floor. */
+const ZOMBIE_MS = parseInt(process.env.SCENEMA_ZOMBIE_MS || String(4 * 60 * 1000), 10);
+const RUNPOD_GQL = 'https://api.runpod.io/graphql';
 const FORK_URL = (process.env.FORK_USAGE_URL || process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
 const USAGE_SECRET = process.env.KADE_USAGE_EVENT_SECRET || '';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -123,7 +135,7 @@ async function cancel(id) {
  * whole difference between waiting and wasting your evening, and until now
  * nothing asked. RunPod answers it on /health: `throttled` means it wants a
  * worker and cannot place one. Cached 15 s so a poll loop cannot hammer it. */
-let capacity = { at: 0, ok: false, throttled: 0, idle: 0, initializing: 0, ready: 0, running: 0, unhealthy: 0, inQueue: 0 };
+let capacity = { at: 0, ok: false, throttled: 0, idle: 0, initializing: 0, ready: 0, running: 0, unhealthy: 0, inQueue: 0, inProgress: 0 };
 async function readCapacity() {
   if (Date.now() - capacity.at < 15000) return capacity;
   try {
@@ -133,12 +145,43 @@ async function readCapacity() {
     capacity = {
       at: Date.now(), ok: true,
       throttled: w.throttled | 0, idle: w.idle | 0, initializing: w.initializing | 0,
-      ready: w.ready | 0, running: w.running | 0, unhealthy: w.unhealthy | 0, inQueue: j.inQueue | 0,
+      ready: w.ready | 0, running: w.running | 0, unhealthy: w.unhealthy | 0, inQueue: j.inQueue | 0, inProgress: j.inProgress | 0,
     };
   } catch (e) {
     capacity = { ...capacity, at: Date.now(), ok: false };
   }
   return capacity;
+}
+
+/* A frozen card: the endpoint says a worker is RUNNING, nothing is in
+ * progress, and the job has sat in the queue past ZOMBIE_MS. A healthy worker
+ * with the image cached takes a job in 70-160 s (measured Sep 3-4); a fresh
+ * machine pulling the image shows as `initializing`, not `running`. */
+function isZombie(cap, waitedMs) {
+  return !!(cap && cap.ok && cap.running > 0 && !cap.initializing && !(cap.inProgress > 0) && waitedMs > ZOMBIE_MS);
+}
+async function listRunningPods() {
+  const r = await axios.post(RUNPOD_GQL, { query: '{ myself { endpoints { id pods { id desiredStatus lastStatusChange machine { gpuDisplayName location } } } } }' },
+    { headers: { Authorization: `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json', 'User-Agent': UA }, timeout: 20000 });
+  const eps = r.data?.data?.myself?.endpoints || [];
+  const ep = eps.find((e) => e.id === ENDPOINT_ID);
+  return (ep?.pods || []).filter((p) => p.desiredStatus === 'RUNNING');
+}
+async function terminatePod(podId) {
+  const r = await axios.post(RUNPOD_GQL, { query: `mutation { podTerminate(input:{podId:"${String(podId).replace(/[^A-Za-z0-9]/g, '')}"}) }` },
+    { headers: { Authorization: `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json', 'User-Agent': UA }, timeout: 20000 });
+  if (r.data?.errors?.length) throw new Error(r.data.errors[0].message);
+}
+/* Kick the frozen worker(s) off this endpoint. Returns the pods it killed. */
+async function kickZombies() {
+  const pods = await listRunningPods();
+  const killed = [];
+  for (const p of pods) {
+    try { await terminatePod(p.id); killed.push({ id: p.id, gpu: p.machine?.gpuDisplayName, location: p.machine?.location, since: p.lastStatusChange }); }
+    catch (e) { console.warn(`[scenema] terminate ${p.id} failed:`, e.message); }
+  }
+  capacity.at = 0; // force a fresh /health read on the next poll
+  return killed;
 }
 
 function saySeconds(n) {
@@ -154,13 +197,24 @@ function saySeconds(n) {
 function waitInfo(job, cap) {
   const submitted = Date.parse(job.submittedAt || job.createdAt) || Date.now();
   const waitedS = Math.max(0, Math.round((Date.now() - submitted) / 1000));
-  const leftS = Math.max(0, Math.round(QUEUE_TIMEOUT_MS / 1000 - waitedS));
+  const clockFrom = job.kickedAt ? Date.parse(job.kickedAt) : submitted;
+  const leftS = Math.max(0, Math.round(QUEUE_TIMEOUT_MS / 1000 - (Date.now() - clockFrom) / 1000));
   if (job.state === 'running' || job.startedAt) {
     return { phase: 'rendering', waitedS, spoken: `Rendering now. ${saySeconds(waitedS)} in.` };
   }
   const giveUp = leftS > 0
     ? ` I give up in ${saySeconds(leftS)} if nothing comes free.`
     : ' Giving up now.';
+  if (job.kickedAt) {
+    const sinceKickS = Math.max(0, Math.round((Date.now() - Date.parse(job.kickedAt)) / 1000));
+    return { phase: 'restarted-card', waitedS, spoken: `The graphics card froze without taking the job, so I restarted it. Waiting for a fresh one. ${saySeconds(sinceKickS)} since the restart, ${saySeconds(waitedS)} in all.${giveUp}` };
+  }
+  if (isZombie(cap, waitedS * 1000)) {
+    return { phase: 'stuck-card', waitedS, spoken: `A graphics card is up but has not taken the job. That is not normal. ${saySeconds(waitedS)} so far. Restarting it now.` };
+  }
+  if (cap.ok && cap.running > 0 && !cap.initializing && !(cap.inProgress > 0)) {
+    return { phase: 'loading', waitedS, spoken: `Got a card. It is loading the voice models, which takes a minute or two. ${saySeconds(waitedS)} so far.${giveUp}` };
+  }
   if (cap.ok && cap.throttled > 0 && !cap.initializing && !cap.ready && !cap.idle && !cap.running) {
     return { phase: 'no-card', waitedS, spoken: `Still waiting for a graphics card. None are free right now, so nothing has started. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
@@ -280,20 +334,40 @@ async function pump() {
          * worker initializing, ready or running, the wait is EARNED and the
          * grace doubles; the timer only bites when nothing is coming. */
         const capNow = await readCapacity();
-        const cardComing = capNow.ok && (capNow.initializing > 0 || capNow.ready > 0 || capNow.running > 0 || capNow.idle > 0);
+        /* THE FROZEN CARD. Running, nothing in progress, job still queued past
+         * ZOMBIE_MS: terminate the worker so RunPod places a fresh one. Once
+         * per job; the give-up clock restarts at the kick. */
+        if (!job.kickedAt && isZombie(capNow, waitedMs)) {
+          let killed = [];
+          try { killed = await kickZombies(); } catch (e) { console.warn('[scenema] kick failed:', e.message); }
+          job.kickedAt = new Date().toISOString();
+          job.kicked = killed;
+          saveJobs();
+          receipt({ jobId: job.id, userId: job.userId, state: 'kicked-frozen-worker', waitedS: Math.round(waitedMs / 1000), killed, costUSD: 0 });
+          console.warn(`[scenema] ${job.id} frozen worker after ${Math.round(waitedMs / 1000)}s queued (running=${capNow.running} inProgress=${capNow.inProgress}); terminated ${killed.map((k) => `${k.id} ${k.gpu || ''}`).join(', ') || 'nothing (no RUNNING pod found)'}`);
+          continue;
+        }
+        const sinceKickMs = job.kickedAt ? Date.now() - Date.parse(job.kickedAt) : null;
+        /* A worker that is `running` only counts as "coming" while it is doing
+         * something -- a frozen one is exactly what the old rule waited 20
+         * minutes for. */
+        const cardComing = capNow.ok && (capNow.initializing > 0 || capNow.ready > 0 || capNow.idle > 0 || (capNow.running > 0 && capNow.inProgress > 0));
         const limitMs = cardComing ? QUEUE_TIMEOUT_MS * 2 : QUEUE_TIMEOUT_MS;
-        if (waitedMs > limitMs) {
+        const clockMs = sinceKickMs !== null ? sinceKickMs : waitedMs;
+        if (clockMs > limitMs || (job.kickedAt && isZombie(capNow, sinceKickMs))) {
           const cap = capNow;
           await cancel(job.runpodId);
           const mins = Math.round(waitedMs / 60000);
           job.state = 'failed';
           job.gaveUp = true;
-          job.error = cap.ok && cap.throttled > 0
-            ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. Nothing was charged. Try again in a few minutes.`
-            : `This render waited ${mins} minutes and no graphics card picked it up. Nothing was charged. Try again.`;
+          job.error = job.kickedAt
+            ? `A graphics card took the job and froze, twice. I stopped after ${mins} minutes. Nothing was charged for the render itself. Try again in a few minutes; if it happens again, the card provider is having a bad night.`
+            : cap.ok && cap.throttled > 0
+              ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. Nothing was charged. Try again in a few minutes.`
+              : `This render waited ${mins} minutes and no graphics card picked it up. Nothing was charged. Try again.`;
           job.finishedAt = new Date().toISOString();
           saveJobs();
-          receipt({ jobId: job.id, userId: job.userId, state: 'gave-up', error: job.error, waitedS: Math.round(waitedMs / 1000), throttled: cap.throttled, costUSD: 0 });
+          receipt({ jobId: job.id, userId: job.userId, state: 'gave-up', error: job.error, waitedS: Math.round(waitedMs / 1000), throttled: cap.throttled, kicked: !!job.kickedAt, costUSD: 0 });
           console.warn(`[scenema] ${job.id} gave up after ${mins}m unplaced (throttled=${cap.throttled})`);
           await notifyFail(job);
           continue;
@@ -370,7 +444,7 @@ function attachScenema(app, d = {}) {
     if (job.state === 'queued' || job.state === 'running') {
       const cap = await readCapacity();
       wait = waitInfo(job, cap);
-      wait.capacity = { throttled: cap.throttled, initializing: cap.initializing, ready: cap.ready, running: cap.running, ok: cap.ok };
+      wait.capacity = { throttled: cap.throttled, initializing: cap.initializing, ready: cap.ready, running: cap.running, inProgress: cap.inProgress, ok: cap.ok };
       wait.giveUpAfterS = Math.round(QUEUE_TIMEOUT_MS / 1000);
     }
     return res.json({ ...rest, wait, promptPreview: prompt.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) });
@@ -394,7 +468,7 @@ function attachScenema(app, d = {}) {
       enabled: ENABLED, configured: !!(RUNPOD_KEY && ENDPOINT_ID), endpointId: ENDPOINT_ID, ratePerHr: RATE_PER_HR,
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP }, spend: { dayUSD: spendSince(now - 86400000), monthUSD: spendSince(now - 30 * 86400000) },
       open: jobs.filter((j) => j.state === 'queued' || j.state === 'running').length,
-      queueTimeoutS: Math.round(QUEUE_TIMEOUT_MS / 1000), coldWakeS: COLD_WAKE_S,
+      queueTimeoutS: Math.round(QUEUE_TIMEOUT_MS / 1000), coldWakeS: COLD_WAKE_S, zombieS: Math.round(ZOMBIE_MS / 1000),
       capacity: { ...capacity, ageS: capacity.at ? Math.round((now - capacity.at) / 1000) : null },
       recent: jobs.slice(-10).map(({ prompt, ...j }) => j),
     });
@@ -408,4 +482,4 @@ function attachScenema(app, d = {}) {
   }
 }
 
-module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, QUEUE_TIMEOUT_MS, COLD_WAKE_S } };
+module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, isZombie, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
