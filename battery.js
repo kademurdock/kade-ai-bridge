@@ -262,6 +262,34 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
     return retired;
   }
 
+  /* Part 129: the battery retired its CARDS and left its LOGBOOK lines — nine
+   * a night on the vischeck seat (found by listing the seat's diary, not by
+   * a complaint). Same before/after shape as the cards, ids instead of keys. */
+  async function listSeatDiaryIds() {
+    try {
+      const r = await axios.get(`${proxyUrl}/librechat/diary-admin-list`, {
+        params: { userId: VISCHECK_USER_ID, limit: 500 },
+        headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA }, timeout: 60000,
+      });
+      const rows = (r.data && (r.data.entries || r.data.rows)) || [];
+      return rows.map((e) => String(e.id || e._id || '')).filter(Boolean);
+    } catch (e) {
+      log.warn('[battery] could not list vischeck logbook (diary sweep will be skipped):', e.message);
+      return null;
+    }
+  }
+  async function deleteSeatDiary(ids) {
+    let deleted = 0;
+    for (const id of ids) {
+      try {
+        await axios.post(`${proxyUrl}/librechat/diary-admin-delete`, { userId: VISCHECK_USER_ID, id },
+          { headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA }, timeout: 60000 });
+        deleted += 1;
+      } catch (e) { log.warn(`[battery] diary delete ${id} failed:`, e.message); }
+    }
+    return deleted;
+  }
+
   function dayKey(d = new Date()) { return d.toISOString().slice(0, 10); }
   function spend(usd) {
     const today = dayKey();
@@ -276,6 +304,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
     const row = { at: state.startedAt, trigger, probes: PROBES.length, judges: JUDGES, agents: {}, judgeCostUsd: 0, judgeCostEstimated: false, swept: null, ok: false };
     try {
       const before = await listSeatCards();
+      const diaryBefore = await listSeatDiaryIds();
       for (const [name, agentId] of [['kiana', KIANA_ID], ['control', CONTROL_ID]]) {
         const per = [];
         for (const probe of PROBES) {
@@ -333,6 +362,13 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
         if (after) {
           const fresh = after.filter((k) => !before.includes(k));
           row.swept = { newCards: fresh.length, retired: await retireSeatCards(fresh) };
+        }
+      }
+      if (diaryBefore) {
+        const diaryAfter = await listSeatDiaryIds();
+        if (diaryAfter) {
+          const freshDiary = diaryAfter.filter((id) => !diaryBefore.includes(id));
+          row.sweptDiary = { newEntries: freshDiary.length, deleted: await deleteSeatDiary(freshDiary) };
         }
       }
       row.ok = true;
