@@ -1039,6 +1039,16 @@ let deferredNotifies = (() => {
   return [];
 })();
 function saveDeferredNotifies() { try { fs.writeFileSync(DEFERRED_NOTIFY_FILE, JSON.stringify(deferredNotifies)); } catch (e) { console.error('[notify] deferred save:', e.message); } }
+/* Part 127 (Sep 4 2026): a deferred alert can go STALE before quiet hours end.
+ * The deploy watch queued "fork deploy FAILED" at 03:03Z, the fork recovered at
+ * 03:18Z, and the alert still landed on her phone at 8:03 a.m. saying "queued
+ * 600m ago". Whoever knows the condition cleared can pull its queued alerts. */
+function cancelDeferredNotify(agentId) {
+  const before = deferredNotifies.length;
+  deferredNotifies = deferredNotifies.filter((d) => d.agentId !== agentId);
+  if (deferredNotifies.length !== before) saveDeferredNotifies();
+  return before - deferredNotifies.length;
+}
 function queueDeferredNotify(payload) {
   deferredNotifies.push({ ...payload, queuedAt: Date.now() });
   if (deferredNotifies.length > 20) deferredNotifies = deferredNotifies.slice(-20); // bound the queue
@@ -4160,9 +4170,13 @@ console.log(
 const clockLastPoke = { nudges: null, ok: null };
 
 async function clockPoke(job) {
+  /* Part 127: the dreaming pass now writes six sections per relationship and
+   * outran a two-minute wait on Sep 4 ("summary failed: timeout of 120000ms")
+   * while the sweep itself finished fine. Long jobs get a long wait. */
+  const LONG_JOBS = { summary: 900000, consolidation: 900000 };
   const r = await axios.post(`${LIBRECHAT_URL}/api/kade/clock/${job}`, {}, {
     headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
-    timeout: 120000,
+    timeout: LONG_JOBS[job] || 120000,
   });
   return r.data;
 }
@@ -5796,7 +5810,7 @@ try {
 
 try {
   const { attachDeployWatch } = require('./deploywatch');
-  attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER }, DEPLOY_READER);
+  attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser: CANARY_ADMIN_USER, cancelDeferred: cancelDeferredNotify }, DEPLOY_READER);
 } catch (e) { console.warn('[deploywatch] attach failed (bridge unaffected):', e.message); }
 
 server.listen(port, () => {

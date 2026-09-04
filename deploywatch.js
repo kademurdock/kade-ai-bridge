@@ -196,7 +196,7 @@ async function railwayLatest(serviceId, environmentId, token) {
   return { status: n.status, sha: n.meta?.commitHash || null, at: n.createdAt };
 }
 
-function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader = {}) {
+function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser, cancelDeferred }, reader = {}) {
   const ENABLED = process.env.DEPLOYWATCH !== '0';
   const INTERVAL_MIN = Math.max(5, parseInt(process.env.DEPLOYWATCH_INTERVAL_MIN || '15', 10));
   const GRACE_MIN = Math.max(3, parseInt(process.env.DEPLOYWATCH_GRACE_MIN || '10', 10));
@@ -243,6 +243,13 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser }, reader
         } else if (!condition && prev) {
           delete state.deploy[w.key];
           console.log(`[deploywatch] ${w.name} recovered (${row.deployed} ${dep.status})`);
+          /* Part 127: if the alert for this is still sitting in the quiet-hours
+           * queue, pull it — a "FAILED" that recovered fifteen minutes later is
+           * not news at 8 a.m. Live alerts already sent are not recalled. */
+          if (typeof cancelDeferred === 'function' && Object.keys(state.deploy).length === 0) {
+            const pulled = cancelDeferred('kade-deploy-watch');
+            if (pulled) console.log(`[deploywatch] pulled ${pulled} stale deferred alert(s) after recovery`);
+          }
         }
       } catch (e) {
         rows.push({ key: w.key, name: w.name, error: e.message });
