@@ -39,18 +39,19 @@ function daysInto(now = new Date()) { return centralParts(now).d; }
 /* Real provider spend across a month from the bridge's daily snapshots.
  * A snapshot row: {dateKey:'YYYY-MM-DD', moonshot, openrouter_usage, openrouter, fish, twilio, ...}.
  * balance-kind pots go DOWN as they are spent; usage-kind go UP. */
-function realSpend(history, monthKey) {
+function realSpend(history, monthKey, zaiDays = {}) {
   const rows = history.filter((h) => h && typeof h.dateKey === 'string' && h.dateKey.startsWith(monthKey)).sort((a, b) => a.dateKey < b.dateKey ? -1 : 1);
-  if (rows.length < 2) return { models: 0, days: rows.length, note: 'fewer than two snapshots this month' };
+  const zai = round(Object.entries(zaiDays || {}).filter(([k]) => k.startsWith(monthKey)).reduce((s, [, v]) => s + (Number(v) || 0), 0));
+  if (rows.length < 2) return { models: zai, zai, days: rows.length, note: 'fewer than two snapshots this month' };
   const first = rows[0], last = rows[rows.length - 1];
   const delta = (key, kind) => (first[key] == null || last[key] == null) ? 0 : Math.max(0, kind === 'usage' ? last[key] - first[key] : first[key] - last[key]);
   const moonshot = delta('moonshot', 'balance');
   const openrouter = last.openrouter_usage != null ? delta('openrouter_usage', 'usage') : delta('openrouter', 'balance');
-  return { models: round(moonshot + openrouter), moonshot: round(moonshot), openrouter: round(openrouter), days: rows.length, from: first.dateKey, to: last.dateKey };
+  return { models: round(moonshot + openrouter + zai), moonshot: round(moonshot), openrouter: round(openrouter), zai, days: rows.length, from: first.dateKey, to: last.dateKey };
 }
 function round(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
-function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adminUserId, log = console, fetchImpl = global.fetch }) {
+function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = () => ({}), runNotify, adminUserId, log = console, fetchImpl = global.fetch }) {
   async function chargedFromFork(days) {
     const r = await fetchImpl(`${proxyUrl}/librechat/usage?days=${Math.max(1, days)}`, {
       headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
@@ -78,7 +79,7 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
     const mk = monthKey || monthKeyOf(now);
     const nDays = days != null ? days : daysInto(now);
     const [forkRes, hist] = await Promise.all([chargedFromFork(nDays).catch((e) => ({ error: e.message })), Promise.resolve(readBalanceHistory())]);
-    const real = realSpend(hist, mk);
+    const real = realSpend(hist, mk, readZaiDays());
     const charged = forkRes.charged || 0;
     const mult = await multiplierInForce();
     const realModels = real.models || 0;
@@ -92,7 +93,7 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
     const ratio = realModels > 0 ? round(charged / realModels) : null;
     const spoken =
       `${closing ? 'Books for ' : 'So far in '}${mk}: the family was charged $${charged.toFixed(2)} for models; the models really cost $${realModels.toFixed(2)}` +
-      ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}; the Z.AI pot is not watched, so it is missing here)` +
+      ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}, Z.AI $${(real.zai || 0).toFixed(2)} metered by the proxy)` +
       `; metered extras $${(forkRes.extras || 0).toFixed(2)}; fixed bills about $${FIXED_USD} a month${closing ? '' : ` ($${fixedSoFar.toFixed(2)} so far)`}. The multiplier is ${mult}` +
       (needed != null ? `; this month needed about ${needed}.` : '.') +
       (ratio != null ? ` Charged over real: ${ratio}x.` : '') + (forkRes.error ? ` (fork usage read failed: ${forkRes.error})` : '');
@@ -119,8 +120,8 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
   return { report, close, lastClosed, monthKeyOf, realSpend };
 }
 
-function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalanceHistory, runNotify, adminUserId }) {
-  const monthly = makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adminUserId });
+function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalanceHistory, readZaiDays, runNotify, adminUserId }) {
+  const monthly = makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays, runNotify, adminUserId });
   const adminOk = (req) => bridgeSecretOk(req, req.get('x-kade-secret') || req.get('x-bridge-secret') || req.query.secret || (req.body && req.body.secret));
   app.get('/monthly', async (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'Unauthorized' });

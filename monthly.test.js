@@ -38,6 +38,13 @@ test('report reads charged from the fork and names the multiplier the month need
   assert.equal(r.fixedSoFar, 11.67); // 5 of 30 September days of $70
   const c = await m.report({ monthKey: '2026-09', days: 30, closing: true });
   assert.equal(c.fixedSoFar, 70);
-  assert.match(r.spoken, /Z\.AI pot is not watched/);
+  assert.match(r.spoken, /Z\.AI \$0\.00 metered/);
   delete process.env.KADE_BILLING_MULTIPLIER;
+});
+
+test('Z.AI metered days join real spend for the month', () => {
+  const hist = [{ dateKey: '2026-09-01', moonshot: 9, openrouter_usage: 52 }, { dateKey: '2026-09-05', moonshot: 4.12, openrouter_usage: 81.42 }];
+  const r = realSpend(hist, '2026-09', { '2026-08-31': 5, '2026-09-02': 1.25, '2026-09-04': 0.75 });
+  assert.equal(r.zai, 2);
+  assert.equal(r.models, 36.3);
 });

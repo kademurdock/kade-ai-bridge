@@ -4980,6 +4980,45 @@ function parseBalanceNumbers(b) {
 }
 
 let lastSnapshotDay = null;
+/* Part 131 (Sep 5 2026) — THE Z.AI POT, METERED. Z.AI has no balance API, so
+ * the reframe meters every Z.AI response (tokens x stickers, per UTC day) at
+ * GET /zai-spend, and this snapshot folds each day's dollars into a ledger
+ * the reframe's redeploys cannot erase: /data/zai-days.json {date: usd}.
+ * Merge rule is MAX per date, so a proxy that rebooted mid-day and reports a
+ * smaller number for a day we already hold never shrinks the books; a day
+ * that is still growing keeps growing. Read by computeSpend (the Z.AI spend
+ * line) and by monthly.js (real model spend). */
+const ZAI_DAYS_FILE = path.join(path.dirname(BALANCE_HISTORY_FILE), 'zai-days.json');
+function readZaiDays() {
+  try { return JSON.parse(fs.readFileSync(ZAI_DAYS_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+async function mergeZaiDays() {
+  const sec = process.env.REFRAME_PROXY_SECRET;
+  if (!sec) return null;
+  try {
+    const r = await axios.get('https://reframe-proxy-production.up.railway.app/zai-spend', {
+      headers: { Authorization: `Bearer ${sec}`, 'User-Agent': BROWSER_UA }, timeout: 20000,
+    });
+    const days = (r.data && r.data.days) || {};
+    const cur = readZaiDays();
+    let changed = 0;
+    for (const [k, v] of Object.entries(days)) {
+      const usd = Number(v && v.usd);
+      if (!isFinite(usd)) continue;
+      if (cur[k] == null || usd > cur[k]) { cur[k] = Math.round(usd * 10000) / 10000; changed++; }
+    }
+    const keys = Object.keys(cur).sort();
+    while (keys.length > 400) delete cur[keys.shift()];
+    if (changed) fs.writeFileSync(ZAI_DAYS_FILE, JSON.stringify(cur));
+    return cur;
+  } catch (e) {
+    console.warn(`[heartbeat] zai-spend read failed (${e.message})`);
+    return null;
+  }
+}
+setTimeout(mergeZaiDays, 120 * 1000);
+setInterval(mergeZaiDays, 60 * 60 * 1000); // hourly, so a proxy redeploy loses minutes, not a day
+
 async function snapshotBalancesDaily() {
   const today = bridgeCentralDateKey();
   if (lastSnapshotDay === today) return;
@@ -5035,6 +5074,24 @@ function computeSpend() {
   ];
   const lines = [];
   const seenNames = new Set();
+  /* Z.AI: from the metered ledger, not a balance. Yesterday = the last full
+   * UTC day; the average over what we hold, up to 30 days. */
+  try {
+    const zd = readZaiDays();
+    const zk = Object.keys(zd).sort();
+    if (zk.length) {
+      const todayUtc = new Date().toISOString().slice(0, 10);
+      const full = zk.filter((k) => k < todayUtc);
+      if (full.length) {
+        const y = zd[full[full.length - 1]];
+        const window = full.slice(-30).map((k) => zd[k]);
+        const avg = window.reduce((s, v) => s + Math.max(0, v), 0) / window.length;
+        lines.push({ provider: 'Z.AI', unit: '$', yesterday: Math.round(y * 100) / 100, avg30: Math.round(avg * 100) / 100, hot: avg > 0.01 && y > avg * 1.5,
+          spoken: `Z.AI: $${y.toFixed(2)} yesterday against a $${avg.toFixed(2)} average (metered by the proxy)` });
+        seenNames.add('Z.AI');
+      }
+    }
+  } catch {}
   for (const p of providers) {
     if (seenNames.has(p.name)) continue;
     const deltas = [];
@@ -5817,6 +5874,7 @@ try {
     proxyUrl: PROXY_URL,
     proxySecret: PROXY_SECRET,
     readBalanceHistory,
+    readZaiDays,
     runNotify,
     adminUserId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7',
   });
