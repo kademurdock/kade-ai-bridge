@@ -82,15 +82,21 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
     const charged = forkRes.charged || 0;
     const mult = await multiplierInForce();
     const realModels = real.models || 0;
-    const needed = realModels > 0 ? round((realModels + (forkRes.extras || 0) + FIXED_USD) / realModels) : null;
+    /* Fixed bills are a MONTH's worth; a mid-month read compares them against
+     * only nDays of model spend, which made a 5-day read say "needed 38" the
+     * night this shipped. Prorate: days elapsed over days in the month. */
+    const [my, mm] = mk.split('-').map(Number);
+    const daysInMonth = new Date(Date.UTC(my, mm, 0)).getUTCDate();
+    const fixedSoFar = closing ? FIXED_USD : round(FIXED_USD * Math.min(1, nDays / daysInMonth));
+    const needed = realModels > 0 ? round((realModels + (forkRes.extras || 0) + fixedSoFar) / realModels) : null;
     const ratio = realModels > 0 ? round(charged / realModels) : null;
     const spoken =
       `${closing ? 'Books for ' : 'So far in '}${mk}: the family was charged $${charged.toFixed(2)} for models; the models really cost $${realModels.toFixed(2)}` +
       ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}; the Z.AI pot is not watched, so it is missing here)` +
-      `; metered extras $${(forkRes.extras || 0).toFixed(2)}; fixed bills about $${FIXED_USD}. The multiplier is ${mult}` +
+      `; metered extras $${(forkRes.extras || 0).toFixed(2)}; fixed bills about $${FIXED_USD} a month${closing ? '' : ` ($${fixedSoFar.toFixed(2)} so far)`}. The multiplier is ${mult}` +
       (needed != null ? `; this month needed about ${needed}.` : '.') +
       (ratio != null ? ` Charged over real: ${ratio}x.` : '') + (forkRes.error ? ` (fork usage read failed: ${forkRes.error})` : '');
-    return { month: mk, days: nDays, closing: !!closing, charged, extras: forkRes.extras || 0, real, fixedUSD: FIXED_USD, multiplier: mult, multiplierNeeded: needed, ratio, users: forkRes.users, spoken, at: now.toISOString() };
+    return { month: mk, days: nDays, closing: !!closing, charged, extras: forkRes.extras || 0, real, fixedUSD: FIXED_USD, fixedSoFar, multiplier: mult, multiplierNeeded: needed, ratio, users: forkRes.users, spoken, at: now.toISOString() };
   }
   function appendLedger(row) { try { fs.mkdirSync(path.dirname(LEDGER), { recursive: true }); fs.appendFileSync(LEDGER, JSON.stringify(row) + '\n'); } catch (e) { log.warn('[monthly] ledger write failed:', e.message); } }
   function lastClosed() {

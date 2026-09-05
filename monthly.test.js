@@ -35,6 +35,9 @@ test('report reads charged from the fork and names the multiplier the month need
   assert.equal(r.multiplier, 2);
   assert.equal(r.ratio, 2);
   assert.ok(r.multiplierNeeded > 2);
+  assert.equal(r.fixedSoFar, 11.67); // 5 of 30 September days of $70
+  const c = await m.report({ monthKey: '2026-09', days: 30, closing: true });
+  assert.equal(c.fixedSoFar, 70);
   assert.match(r.spoken, /Z\.AI pot is not watched/);
   delete process.env.KADE_BILLING_MULTIPLIER;
 });
