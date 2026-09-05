@@ -24,8 +24,9 @@ test('month keys roll in Central time', () => {
 });
 
 test('report reads charged from the fork and names the multiplier the month needed', async () => {
-  process.env.KADE_BILLING_MULTIPLIER = '2';
-  const fetchImpl = async () => ({ ok: true, json: async () => ({ totals: { llmSpendUSD: { window: 68.6 }, extraSpendUSD: { window: 2.93 } }, users: [1, 2, 3] }) });
+  const fetchImpl = async (url) => String(url).includes('/my-cost')
+    ? ({ ok: true, json: async () => ({ multiplier: 2 }) })
+    : ({ ok: true, json: async () => ({ totals: { llmSpendUSD: { window: 68.6 }, extraSpendUSD: { window: 2.93 } }, users: [1, 2, 3] }) });
   const hist = [{ dateKey: '2026-09-01', moonshot: 9, openrouter_usage: 52 }, { dateKey: '2026-09-05', moonshot: 4.12, openrouter_usage: 81.42 }];
   const m = makeMonthly({ proxyUrl: 'x', proxySecret: 'y', readBalanceHistory: () => hist, runNotify: async () => ({}), adminUserId: 'u', fetchImpl, log: { warn() {} } });
   const r = await m.report({ monthKey: '2026-09', days: 5 });

@@ -60,7 +60,16 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
     const t = u.totals || {};
     return { charged: round((t.llmSpendUSD || {}).window || 0), extras: round((t.extraSpendUSD || {}).window || 0), users: Array.isArray(u.users) ? u.users.length : null };
   }
-  function multiplierInForce() {
+  /* The multiplier LIVES on the fork (KADE_BILLING_MULTIPLIER on the LibreChat
+   * service). Read it back through the fork's own my-cost route so the books
+   * can never disagree with the meter; the env here is only a fallback. */
+  async function multiplierInForce() {
+    try {
+      const r = await fetchImpl(`${proxyUrl}/librechat/my-cost?userId=${encodeURIComponent(adminUserId)}`, {
+        headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
+      });
+      if (r.ok) { const j = await r.json(); if (Number.isFinite(j.multiplier) && j.multiplier > 0) return j.multiplier; }
+    } catch {}
     const raw = Number(process.env.KADE_BILLING_MULTIPLIER);
     return Number.isFinite(raw) && raw > 0 ? raw : 1;
   }
@@ -71,7 +80,7 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, runNotify, adm
     const [forkRes, hist] = await Promise.all([chargedFromFork(nDays).catch((e) => ({ error: e.message })), Promise.resolve(readBalanceHistory())]);
     const real = realSpend(hist, mk);
     const charged = forkRes.charged || 0;
-    const mult = multiplierInForce();
+    const mult = await multiplierInForce();
     const realModels = real.models || 0;
     const needed = realModels > 0 ? round((realModels + (forkRes.extras || 0) + FIXED_USD) / realModels) : null;
     const ratio = realModels > 0 ? round(charged / realModels) : null;
