@@ -5807,6 +5807,21 @@ try {
   });
 } catch (e) { console.warn('[battery] attach failed (bridge unaffected):', e.message); }
 
+// Part 131 (Sep 5 2026) — THE MONTHLY BOOKS: on the 1st, charged vs real, and
+// the multiplier the month needed, pushed to her phone. Her rule: scheduling
+// lives on the platform, never on her computer. Full story atop monthly.js.
+try {
+  const { attachMonthly } = require('./monthly');
+  attachMonthly(app, {
+    bridgeSecretOk,
+    proxyUrl: PROXY_URL,
+    proxySecret: PROXY_SECRET,
+    readBalanceHistory,
+    runNotify,
+    adminUserId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7',
+  });
+} catch (e) { console.warn('[monthly] attach failed (bridge unaffected):', e.message); }
+
 // Part 85 (Aug 22 2026) — TWO NEW REFLEXES: the deploy self-verifier (the
 // stale-hash scar turned into a 15-minute check) and the TTS-synth probe
 // (the voice lane's first tripwire). Kill: DEPLOYWATCH=0 / TTS_PROBE=0.
