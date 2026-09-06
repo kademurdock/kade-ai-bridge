@@ -127,7 +127,7 @@ async function status(id) {
   return r.data; // { id, status: IN_QUEUE|IN_PROGRESS|COMPLETED|FAILED|CANCELLED|TIMED_OUT, output?, error?, executionTime?, delayTime? }
 }
 async function cancel(id) {
-  try { await rp.post(`/cancel/${id}`); } catch (_) {}
+  await rp.post(`/cancel/${id}`);
 }
 
 /* ---------- what the endpoint is actually doing ----------
@@ -329,10 +329,19 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     spokenWait,
   };
   saveJobs();
-  submit(input).then((r) => {
+  submit(input).then(async (r) => {
+    job.runpodId = r.id;
+    if (job.state === 'cancelled') {
+      try { await cancel(r.id); saveJobs(); return; }
+      catch (error) {
+        job.state = 'queued'; job.error = 'Stop could not be confirmed at the audio provider. Please try Stop again.';
+        saveJobs(); console.warn('[scenema] late-submit cancellation failed:', error.message); return;
+      }
+    }
     job.runpodId = r.id; job.state = r.status === 'IN_PROGRESS' ? 'running' : 'queued'; job.submittedAt = new Date().toISOString(); saveJobs();
     console.log(`[scenema] ${job.id} submitted → runpod ${r.id} (${words} words, ~${estAudioS}s of audio)`);
   }).catch((e) => {
+    if (job.state === 'cancelled') return;
     job.state = 'failed'; job.error = `submit: ${e.response?.data?.error || e.message}`; job.finishedAt = new Date().toISOString(); saveJobs();
     console.warn('[scenema] submit failed:', job.error);
   });
@@ -349,6 +358,7 @@ async function pump() {
       if (!(job.state === 'queued' || job.state === 'running') || !job.runpodId) continue;
       let s;
       try { s = await status(job.runpodId); } catch (e) { console.warn(`[scenema] status ${job.id}:`, e.message); continue; }
+      if (job.state === 'cancelled') continue;
       if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date().toISOString(); saveJobs(); }
       /* THE FLOOR. Still queued, no card has picked it up, and the clock has
        * run out: stop waiting and SAY SO. Nothing was charged, because RunPod
@@ -489,9 +499,16 @@ function attachScenema(app, d = {}) {
     if (!authOk(req, req.body?.secret)) return res.status(403).json({ error: 'Unauthorized' });
     const job = jobs.find((j) => j.id === String(req.body?.jobId || ''));
     if (!job) return res.status(404).json({ error: 'no such job' });
-    if (job.runpodId && (job.state === 'queued' || job.state === 'running')) await cancel(job.runpodId);
-    job.state = 'cancelled'; job.finishedAt = new Date().toISOString(); saveJobs();
-    return res.json({ ok: true });
+    if (!['queued', 'running'].includes(job.state)) return res.json({ ok: true, state: job.state });
+    try {
+      if (job.runpodId) await cancel(job.runpodId);
+      if (job.state === 'done') return res.json({ ok: true, state: 'done' });
+      job.state = 'cancelled'; job.finishedAt = new Date().toISOString(); saveJobs();
+      return res.json({ ok: true, state: job.state });
+    } catch (error) {
+      console.warn('[scenema] cancel failed:', error.message);
+      return res.status(502).json({ error: 'The audio provider did not confirm Stop. The render may still be working. Try Stop again.' });
+    }
   });
 
   /* GET /audio/scenema/health (BRIDGE_SECRET): enabled, caps, spend, recent jobs — for platform-status and the record */
