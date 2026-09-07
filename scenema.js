@@ -478,8 +478,9 @@ function attachScenema(app, d = {}) {
     if (!authOk(req, req.query?.secret)) return res.status(403).json({ error: 'Unauthorized' });
     const { jobId, userId } = req.query || {};
     let job = jobId ? jobs.find((j) => j.id === String(jobId)) : null;
-    if (!job && userId) job = [...jobs].reverse().find((j) => j.userId === String(userId));
-    if (!job) return res.status(404).json({ error: 'no such job' });
+    if (!jobId && userId) job = [...jobs].reverse().find((j) => j.userId === String(userId));
+    if (!job || (userId && job.userId !== String(userId))) return res.status(404).json({ error: 'no such job' });
+    res.setHeader('Cache-Control', 'no-store');
     const { prompt, ...rest } = job;
     /* An unfinished job now carries WHY it is unfinished and how long it has
      * been that way, so the caller has a true sentence to speak on every poll
