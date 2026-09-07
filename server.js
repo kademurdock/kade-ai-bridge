@@ -1121,7 +1121,7 @@ function recordBroadcast(entry) {
  * brief was blocked by the same window. Two things she asked for, both
  * dropped, both silent. A result someone requested is not outreach and must
  * not compete with outreach for budget. */
-async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested }) {
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested, runId }) {
   /* Part 83 (her report: tapping the bug-report push opened a NEW
    * CONVERSATION — the app's launch default — instead of the bug window):
    * pushes with a real home now carry one. `route` is a short screen name
@@ -1177,7 +1177,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   if (notifyPrefs.mutedAgents.includes(agentId)) return refuse('this agent is muted');
   if (!urgent && notifyInQuietHours(hhmm)) {
     if (adminAlert === true || requested === true) {
-      queueDeferredNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested });
+      queueDeferredNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested, runId });
       console.warn(`[notify] DEFERRED — ${agentName} (${agentId}): quiet hours (Central), queued for morning (${deferredNotifies.length} waiting)`);
       return { ok: true, sent: 0, deferred: true, blocked: 'quiet hours (Central) — queued for morning' };
     }
@@ -1205,7 +1205,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   }
   const sendOpts = {
     category: category || (routeName ? 'KADE_ROUTE' : undefined),
-    data: routeName && !category ? { kadeRoute: routeName } : undefined,
+    data: !category ? require('./notify-data').notificationData(routeName, runId) : undefined,
   };
   const results = await Promise.all(targets.map((t) => sendPush(t, title, message, sendOpts)));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
@@ -1251,7 +1251,7 @@ app.post('/notify', async (req, res) => {
    * falling back to every registered phone. An admin caller that means someone
    * else still passes userId and still wins. */
   const isAdminAlert = bridgeSecretOk(req, b.secret) && b.adminAlert === true;
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, category, route: b.route });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, category, route: b.route, runId: b.runId });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });
