@@ -344,6 +344,7 @@ function jobPublic(j, withReport = false) {
     sourcesFound: j.sources.filter((s) => s.note).length,
     costs: { estUSD: j.costs.estUSD, tavilyCredits: j.costs.tavilyCredits },
     error: j.error || null,
+    notify: j.notify || null, // Part 142: {sent}|{deferred,why}|{blocked} — did the phone tap actually go out
   };
   if (withReport && j.report) {
     out.report = j.report;
@@ -471,15 +472,30 @@ async function runJob(job, deps) {
     job.finishedAt = new Date().toISOString();
     const firstLine = job.report.split(/\n/).find((l) => l.trim().length > 40) || job.report.slice(0, 160);
     setStage(job, 'done', 'finished — report ready');
+    /* Part 142 (Sep 7 2026): runNotify REFUSES BY RETURN VALUE, not by throw
+     * ({ok:false, blocked}), so this catch never saw the 15:07:38Z "cooldown
+     * active" refusal and the job sat "done" with nobody told. The tap is now
+     * a requested push (skips the outreach budget) and its outcome is written
+     * on the job, so check/get can say "ready — and the phone tap did not go
+     * out" instead of pretending. */
     if (deps.runNotify && job.notifyOnDone !== false) {
       try {
-        await deps.runNotify({
+        const out = await deps.runNotify({
           agentId: job.agentId, agentName: job.agentName || 'Research',
           title: 'Your research is ready',
           body: `"${cutAtWord(job.question, 70)}" — ${cutAtWord(firstLine, 140)} Ask ${job.agentName || 'me'} for the full story.`,
-          urgent: false, userId: job.userId, category: 'KADE_RESEARCH',
-        });
-      } catch (e) { console.warn('[research] notify failed:', e.message); }
+          urgent: false, userId: job.userId, category: 'KADE_RESEARCH', requested: true,
+        }) || {};
+        if (out.ok && out.sent > 0) job.notify = { sent: out.sent, at: new Date().toISOString() };
+        else if (out.ok && out.deferred) job.notify = { deferred: true, why: out.blocked, at: new Date().toISOString() };
+        else {
+          job.notify = { blocked: out.blocked || out.note || out.error || 'unknown', at: new Date().toISOString() };
+          console.warn(`[research] job ${job.id} done but the phone tap did NOT go out: ${job.notify.blocked}`);
+        }
+      } catch (e) {
+        job.notify = { blocked: e.message, at: new Date().toISOString() };
+        console.warn('[research] notify failed:', e.message);
+      }
     }
   } catch (e) {
     job.status = job.cancelRequested && /cancel/i.test(e.message) ? 'cancelled' : 'failed';

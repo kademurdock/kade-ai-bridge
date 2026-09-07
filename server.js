@@ -1110,7 +1110,18 @@ function recordBroadcast(entry) {
 
 // Core notify logic (guardrails + APNs send), shared by the /notify route AND the
 // scheduled "Ki reaches out" job so caps / quiet-hours / cooldown apply to both.
-async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route }) {
+/* Part 142 (Sep 7 2026) — `requested`: the person ASKED for this exact result
+ * (a finished research report, their own scheduled morning brief). Internal
+ * callers only — the /notify route never forwards it, so an agent cannot
+ * claim it. It skips the outreach budget (cooldown + daily caps) the way
+ * adminAlert does, and in quiet hours it queues for morning instead of
+ * vanishing. The receipt: research job 0953f60cb9 finished 15:07:36Z and its
+ * done-push was BLOCKED "cooldown active" because a self-sent Kiana push at
+ * 15:00:21Z had eaten the 30-minute window — and 0 ms later the real morning
+ * brief was blocked by the same window. Two things she asked for, both
+ * dropped, both silent. A result someone requested is not outreach and must
+ * not compete with outreach for budget. */
+async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested }) {
   /* Part 83 (her report: tapping the bug-report push opened a NEW
    * CONVERSATION — the app's launch default — instead of the bug window):
    * pushes with a real home now carry one. `route` is a short screen name
@@ -1147,7 +1158,7 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   // notify-prefs turns bug pushes off with no code change), and quiet
   // hours unless urgent (a 2 a.m. report waits for morning; its in-chat
   // nudge carries it meanwhile).
-  const skipBudget = adminAlert === true;
+  const skipBudget = adminAlert === true || requested === true;
   /* Aug 13 2026 — EVERY REFUSAL SAYS SO OUT LOUD NOW, and this cost a real
    * one to learn. The crash alert below had been shipping a push with no
    * userId and no broadcast since Aug 10: runNotify resolved
@@ -1165,8 +1176,8 @@ async function runNotify({ agentId, agentName, title, body, urgent, userId, broa
   if (!notifyPrefs.enabled) return refuse('notifications are globally muted');
   if (notifyPrefs.mutedAgents.includes(agentId)) return refuse('this agent is muted');
   if (!urgent && notifyInQuietHours(hhmm)) {
-    if (adminAlert === true) {
-      queueDeferredNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route });
+    if (adminAlert === true || requested === true) {
+      queueDeferredNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested });
       console.warn(`[notify] DEFERRED — ${agentName} (${agentId}): quiet hours (Central), queued for morning (${deferredNotifies.length} waiting)`);
       return { ok: true, sent: 0, deferred: true, blocked: 'quiet hours (Central) — queued for morning' };
     }
@@ -1439,7 +1450,9 @@ function composeBriefPrompt(p, memCtx) {
   parts.push(
     "Compose this person's MORNING BRIEF. OUTPUT RULES FIRST: this lands as a plain lock-screen " +
     'notification — output ONLY the brief itself, no preamble about what you are going to do, no ' +
-    'steering tags of any kind, no percent signs, plain prose under 270 characters total.',
+    'steering tags of any kind, no percent signs, plain prose under 270 characters total. ' +
+    'DO NOT send any notification, push, reminder or message yourself (no kade_notify) — the bridge ' +
+    'delivers the text you return; a push you send here would land instead of the brief.',
   );
   const wants = [];
   if (p.items.weather) {
@@ -1483,7 +1496,11 @@ async function fireBrief(userId, urgent = false) {
     urgent: urgent === true,
     userId,
     category: 'KADE_BRIEF', // build 193's LISTEN/READ notification actions
+    requested: true, // Part 142: her own scheduled brief is not outreach — never lose it to the cooldown
   });
+  if (!delivery.ok || !delivery.sent) {
+    console.warn(`[brief] NOT DELIVERED for ${userId.slice(-6)}: ${delivery.blocked || delivery.note || delivery.error || 'unknown'}`);
+  }
   const { day } = centralClock();
   briefStore.users[userId] = { ...p, lastBrief: { date: day, text: body, at: new Date().toISOString() } };
   saveBriefStore();
