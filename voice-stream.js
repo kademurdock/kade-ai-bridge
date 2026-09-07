@@ -619,6 +619,42 @@ function isBareSwitchRequest(text) {
 function normalizeWords(s) {
   return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
 }
+// ⭐ PART 141 (Sep 7 2026, Kade: barge "still hears itself when it's on speaker
+// through different services, a LOT"). The echo check above compared the mic
+// against `_currentSpokenText` — which is ONE sentence, and it is stamped the
+// moment the clip SHIPS. On app/web the clips are shipped WEB_LEAD_MS early and
+// queued client-side, the chain synthesizes sentence N+1 while N plays, and
+// the echo itself arrives late (speaker → mic → Deepgram is ~1–2 s). So by the
+// time her sentence N comes back through the mic, the server is comparing it
+// against sentence N+1 or N+2, the overlap comes up short, and she barges
+// herself. Fix: the reference is a ROLLING WINDOW of everything she has said
+// in the last SPOKEN_WINDOW_MS, not the one sentence that happens to be
+// current. `noteSpoken()` is the one writer; `echoReference()` the one reader.
+const SPOKEN_WINDOW_MS = parseInt(process.env.BARGE_SPOKEN_WINDOW_MS || '15000', 10);
+const SPOKEN_WINDOW_MAX = 8;
+function noteSpoken(session, text) {
+  session._currentSpokenText = text; // kept for captions and every older reader
+  if (!text) return;
+  const now = Date.now();
+  const win = (session._spokenWindow || []).filter((e) => now - e.at < SPOKEN_WINDOW_MS);
+  win.push({ text, at: now });
+  session._spokenWindow = win.slice(-SPOKEN_WINDOW_MAX);
+}
+function echoReference(session) {
+  const now = Date.now();
+  const parts = (session._spokenWindow || []).filter((e) => now - e.at < SPOKEN_WINDOW_MS).map((e) => e.text);
+  if (session._currentSpokenText && !parts.includes(session._currentSpokenText)) parts.push(session._currentSpokenText);
+  return parts.join(' ');
+}
+// A LONE word that she herself said in the window ("no", "actually", "hey",
+// "sorry" — half the single-word allow-list is ordinary Kiana vocabulary) is
+// far more likely her own voice off a speaker than a caller's interruption.
+// Words she did NOT just say ("wait", "stop", "hold") still get straight in.
+function loneWordIsEcho(heard, reference) {
+  const words = normalizeWords(heard);
+  if (words.length !== 1) return false;
+  return new Set(normalizeWords(reference)).has(words[0]);
+}
 function looksLikeEcho(heard, currentlySpeaking, threshold = 0.6) {
   if (!heard || !currentlySpeaking) return false;
   const heardWords = normalizeWords(heard);
@@ -751,8 +787,10 @@ function shouldBargeIn(session, heard, words) {
   if (session.bargeMode === 'push') return false;
   if (!session.isSpeaking || session.bargedIn) return false;
   if (Date.now() - session.speakStartedAt <= 1000) return false;   // grace window
-  if (looksLikeEcho(heard, session._currentSpokenText)) return false;
+  const reference = echoReference(session);
+  if (looksLikeEcho(heard, reference)) return false;
   if (!isPlausibleBargeIn(heard)) return false;
+  if (loneWordIsEcho(heard, reference)) return false;       // Part 141: her own "no" off the speaker
   if (session.surface === 'web' && !passesRoomGate(heard, words)) return false;
   return true;
 }
@@ -1313,7 +1351,7 @@ function openDeepgramFlux(session, key) {
         const sinceSpoke = Date.now() - session.lastSpokAt;
         const echoPossible = session.isSpeaking || sinceSpoke < 3000;
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-        const isEcho = echoPossible && looksLikeEcho(full, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        const isEcho = echoPossible && looksLikeEcho(full, echoReference(session), echoWindow ? 0.35 : 0.6);
         if (!isEcho) handleUtterance(session, full);
         else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${full.slice(0, 60)}"`);
       };
@@ -1476,7 +1514,7 @@ function openDeepgram(session) {
         const sinceSpoke = Date.now() - session.lastSpokAt;
         const echoPossible = session.isSpeaking || sinceSpoke < 3000;
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-        const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+        const isEcho = echoPossible && looksLikeEcho(utterance, echoReference(session), echoWindow ? 0.35 : 0.6);
         console.log(`[timing] speech_final +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms speaking=${!!session.isSpeaking})`);
         if (!isEcho) {
           updateMoodStats(session, {
@@ -1498,7 +1536,7 @@ function openDeepgram(session) {
       const sinceSpoke = Date.now() - session.lastSpokAt;
       const echoPossible = session.isSpeaking || sinceSpoke < 3000; // see speech_final note
       const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-      const isEcho = echoPossible && looksLikeEcho(utterance, session._currentSpokenText, echoWindow ? 0.35 : 0.6);
+      const isEcho = echoPossible && looksLikeEcho(utterance, echoReference(session), echoWindow ? 0.35 : 0.6);
       console.log(`[timing] UtteranceEnd +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms) -- speech_final never came`);
       if (!isEcho) {
         updateMoodStats(session, {
@@ -2492,7 +2530,7 @@ async function streamReply(session, userText) {
             await new Promise(r => setTimeout(r, 100));
           }
         }
-        session._currentSpokenText = sentence; // for echo detection, see looksLikeEcho
+        noteSpoken(session, sentence); // for echo detection, see looksLikeEcho / echoReference
         await playBuffer(session, mulawBuf);
       }
       // Touch-tones AFTER the words (an IVR hears digits any time its menu is
@@ -2721,7 +2759,7 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
 async function speak(session, text, voice) {
   try {
     const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
-    session._currentSpokenText = text; // for echo detection, see looksLikeEcho
+    noteSpoken(session, text); // for echo detection, see looksLikeEcho / echoReference
     await playBuffer(session, buf);
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
 }

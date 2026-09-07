@@ -40,7 +40,10 @@ vm.runInContext(
     '\nthis.looksLikeScreenReader = looksLikeScreenReader;' +
     '\nthis.meanWordConfidence = meanWordConfidence;' +
     '\nthis.passesRoomGate = passesRoomGate;' +
-    '\nthis.shouldBargeIn = shouldBargeIn;',
+    '\nthis.shouldBargeIn = shouldBargeIn;' +
+    '\nthis.noteSpoken = noteSpoken;' +
+    '\nthis.echoReference = echoReference;' +
+    '\nthis.loneWordIsEcho = loneWordIsEcho;',
   ctx,
 );
 // ── the sentence streamer ────────────────────────────────────────────────────
@@ -59,6 +62,7 @@ vm.runInContext(
 
 const {
   looksLikeScreenReader, meanWordConfidence, passesRoomGate, shouldBargeIn,
+  noteSpoken, echoReference, loneWordIsEcho,
   SentenceStreamer, PHONE_FIRST_PIECE_CHARS, PHONE_MIN_PIECE_CHARS, surfaceLine,
 } = ctx;
 
@@ -325,4 +329,59 @@ test('a sound tag never becomes a carried direction', () => {
   const out = carried(['%%%laugh%%% One.', 'Two.', 'Three.', 'Four.']);
   assert.equal(out[1], 'Two.');
   assert.ok(!out.some((p) => p.startsWith('%%%reset%%%')), 'reset fired for a sound tag');
+});
+
+// ═══ PART 141 — the speaker hears HERSELF, a sentence late ═══════════════════
+// (Sep 7 2026, Kade: "it still hears itself when it's on speaker through
+// different services, a lot.") The echo reference used to be the ONE sentence
+// that shipped last; the echo of the PREVIOUS sentence — the one actually
+// sounding off the speaker — no longer matched it and barged her.
+
+test('echo of the PREVIOUS sentence is still echo (rolling window)', () => {
+  const s = speakingSession({ _currentSpokenText: '' });
+  noteSpoken(s, 'so the way the permit test works in Missouri is');
+  noteSpoken(s, 'you take the written part first at the license office');
+  noteSpoken(s, 'then the driving part comes later');   // what the server is "on" now
+  // ...but the SPEAKER is still on sentence one, and the mic sends it back:
+  assert.equal(shouldBargeIn(s, 'the permit test works in missouri', conf(6, 0.95)), false);
+  assert.equal(shouldBargeIn(s, 'written part first at the license', conf(6, 0.95)), false);
+});
+
+test('the window forgets: 15 s later the same words are a real turn', () => {
+  const s = speakingSession({ _currentSpokenText: '' });
+  s._spokenWindow = [{ text: 'the permit test works in missouri', at: Date.now() - 20000 }];
+  noteSpoken(s, 'anyway what else is on your mind');
+  assert.equal(echoReference(s).includes('permit'), false);
+  assert.equal(shouldBargeIn(s, 'the permit test works in missouri', conf(6, 0.95)), true);
+});
+
+test('a lone allow-list word SHE just said is treated as her own echo', () => {
+  const s = speakingSession({ _currentSpokenText: '' });
+  noteSpoken(s, 'no actually the office closes at four, sorry');
+  assert.equal(loneWordIsEcho('no', echoReference(s)), true);
+  assert.equal(shouldBargeIn(s, 'no', conf(1, 0.99)), false);
+  assert.equal(shouldBargeIn(s, 'actually', conf(1, 0.99)), false);
+  assert.equal(shouldBargeIn(s, 'sorry', conf(1, 0.99)), false);
+});
+
+test('a lone allow-list word she did NOT say still interrupts', () => {
+  const s = speakingSession({ _currentSpokenText: '' });
+  noteSpoken(s, 'no actually the office closes at four, sorry');
+  assert.equal(shouldBargeIn(s, 'wait', conf(1, 0.99)), true);
+  assert.equal(shouldBargeIn(s, 'stop', conf(1, 0.99)), true);
+});
+
+test('a real multi-word interruption still gets through the window', () => {
+  const s = speakingSession({ _currentSpokenText: '' });
+  noteSpoken(s, 'so the way the permit test works in Missouri is');
+  noteSpoken(s, 'you take the written part first');
+  assert.equal(shouldBargeIn(s, 'hang on my dog is barking', conf(6, 0.95)), true);
+});
+
+test('noteSpoken keeps _currentSpokenText for captions and caps the window', () => {
+  const s = {};
+  for (let i = 0; i < 12; i++) noteSpoken(s, 'sentence number ' + i);
+  assert.equal(s._currentSpokenText, 'sentence number 11');
+  assert.equal(s._spokenWindow.length, 8);
+  assert.ok(echoReference(s).includes('sentence number 11'));
 });
