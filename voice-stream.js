@@ -2532,7 +2532,7 @@ async function streamReply(session, userText) {
           }
         }
         noteSpoken(session, sentence); // for echo detection, see looksLikeEcho / echoReference
-        await playBuffer(session, mulawBuf);
+        await playBuffer(session, mulawBuf, { synthInput });
       }
       // Touch-tones AFTER the words (an IVR hears digits any time its menu is
       // talking, and this keeps "I'll press two now" honest). Phone lane only
@@ -2761,7 +2761,7 @@ async function speak(session, text, voice) {
   try {
     const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
     noteSpoken(session, text); // for echo detection, see looksLikeEcho / echoReference
-    await playBuffer(session, buf);
+    await playBuffer(session, buf, { synthInput: text });
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
 }
 
@@ -2798,7 +2798,7 @@ async function playBufferWav(session, wavBuf, opts = {}) {
   session.bargedIn       = false;
   if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', captionSafe(session._currentSpokenText));
   if (session.sendState) session.sendState('speaking');
-  try { session.ws.send(JSON.stringify(characterAudio(session.agentId, !opts.noCaption))); } catch { /* Visual metadata never blocks audio. */ }
+  try { session.ws.send(JSON.stringify(characterAudio(session.agentId, !opts.noCaption, opts.synthInput))); } catch { /* Visual metadata never blocks audio. */ }
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
   // Return WEB_LEAD_MS early so the playChain synthesizes/ships the NEXT clip
@@ -2825,10 +2825,10 @@ async function playBufferWav(session, wavBuf, opts = {}) {
 // ── Play μ-law as 20ms frames ─────────────────────────────────────────────────
 const FRAME_BYTES = 160;
 
-async function playBuffer(session, mulawBuf) {
+async function playBuffer(session, mulawBuf, opts = {}) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
-  if (session.media === 'wav') return playBufferWav(session, mulawBuf);
+  if (session.media === 'wav') return playBufferWav(session, mulawBuf, opts);
   session.finalBuf       = '';
   session.partialBuf     = '';
   session.isSpeaking     = true;
