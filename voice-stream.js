@@ -1,3 +1,4 @@
+const { characterAudio } = require('./character-audio');
 'use strict';
 
 /**
@@ -2797,6 +2798,7 @@ async function playBufferWav(session, wavBuf, opts = {}) {
   session.bargedIn       = false;
   if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', captionSafe(session._currentSpokenText));
   if (session.sendState) session.sendState('speaking');
+  try { session.ws.send(JSON.stringify(characterAudio(session.agentId, !opts.noCaption))); } catch { /* Visual metadata never blocks audio. */ }
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
   // Return WEB_LEAD_MS early so the playChain synthesizes/ships the NEXT clip
