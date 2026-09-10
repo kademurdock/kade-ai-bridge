@@ -10,7 +10,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const vm = require('vm');
 
-const SRC = fs.readFileSync(require.resolve('./voice-stream.js'), 'utf8');
+const SRC = fs.readFileSync(require.resolve('./voice-stream.js'), 'utf8').replace(/\r\n/g, '\n');
 
 function grab(anchor, endAnchor) {
   const a = SRC.indexOf(anchor);

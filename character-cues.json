@@ -1,0 +1,112 @@
+[
+  {
+    "input": "%%%warm and friendly%%% Hello.",
+    "expression": "warm",
+    "moment": null
+  },
+  {
+    "input": "%%%amused%%% That was funny.",
+    "expression": "amused",
+    "moment": null
+  },
+  {
+    "input": "%%%firm%%% Stop there.",
+    "expression": "serious",
+    "moment": null
+  },
+  {
+    "input": "%%%worried%%% Are you all right?",
+    "expression": "concerned",
+    "moment": null
+  },
+  {
+    "input": "%%%skeptical%%% I would check.",
+    "expression": "skeptical",
+    "moment": null
+  },
+  {
+    "input": "%%%surprised%%% Oh!",
+    "expression": "surprised",
+    "moment": null
+  },
+  {
+    "input": "%%%warm%%% %%%gasp%%% Hello.",
+    "expression": "warm",
+    "moment": "surprised"
+  },
+  {
+    "input": "%%%warm%%% %%%cough%%% Hello.",
+    "expression": "warm",
+    "moment": null
+  },
+  {
+    "input": "%%%laugh%%% Hello.",
+    "expression": "neutral",
+    "moment": "amused"
+  },
+  {
+    "input": "%%%warm%%% %%%reset%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%not sad%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%serious without anger%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "These words say sad, amused and surprised.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "Hello. %%%amused%%% Later.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%warm%%% Hello. %%%concerned%%% Later.",
+    "expression": "warm",
+    "moment": null
+  },
+  {
+    "input": "%%%warm but firm%%% Hello.",
+    "expression": "serious",
+    "moment": null
+  },
+  {
+    "input": "%%%AMUSED!%%% Hello.",
+    "expression": "amused",
+    "moment": null
+  },
+  {
+    "input": "%%%warm\\nand friendly%%% Hello.",
+    "expression": "warm",
+    "moment": null
+  },
+  {
+    "input": "%%%warm\nand friendly%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%%%% %%%warm%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%warm xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  },
+  {
+    "input": "%%%unknown direction%%% Hello.",
+    "expression": "neutral",
+    "moment": null
+  }
+]

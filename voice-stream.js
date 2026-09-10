@@ -24,6 +24,7 @@ const http = require('http');
 const { URL } = require('url');
 const crypto = require('crypto');
 const fs = require('fs');
+const { speechMetadata, sendCharacterMetadata } = require('./character-audio');
 const path = require('path');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2451,6 +2452,7 @@ async function streamReply(session, userText) {
       : session._businessCall
         ? sentence.replace(/%%%[\s\S]*?%%%/g, ' ').replace(/\s+/g, ' ').trim()
         : applyDirectionCarry(sentence, dirState);
+    const characterMetadata = hasSpeech && synthInput ? speechMetadata(session.agentId, synthInput) : null;
     const synthPromise = hasSpeech && synthInput
       ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
@@ -2531,7 +2533,7 @@ async function streamReply(session, userText) {
           }
         }
         noteSpoken(session, sentence); // for echo detection, see looksLikeEcho / echoReference
-        await playBuffer(session, mulawBuf);
+        await playBuffer(session, mulawBuf, { characterMetadata });
       }
       // Touch-tones AFTER the words (an IVR hears digits any time its menu is
       // talking, and this keeps "I'll press two now" honest). Phone lane only
@@ -2758,9 +2760,10 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
 // ── Speak (one-shot, not streamed) ────────────────────────────────────────────
 async function speak(session, text, voice) {
   try {
+    const characterMetadata = speechMetadata(session.agentId, text);
     const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
     noteSpoken(session, text); // for echo detection, see looksLikeEcho / echoReference
-    await playBuffer(session, buf);
+    await playBuffer(session, buf, { characterMetadata });
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
 }
 
@@ -2797,6 +2800,7 @@ async function playBufferWav(session, wavBuf, opts = {}) {
   session.bargedIn       = false;
   if (!opts.noCaption && session.sendCaption && session._currentSpokenText) session.sendCaption('assistant', captionSafe(session._currentSpokenText));
   if (session.sendState) session.sendState('speaking');
+  sendCharacterMetadata(session, opts.characterMetadata);
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
   // Return WEB_LEAD_MS early so the playChain synthesizes/ships the NEXT clip
@@ -2823,10 +2827,10 @@ async function playBufferWav(session, wavBuf, opts = {}) {
 // ── Play μ-law as 20ms frames ─────────────────────────────────────────────────
 const FRAME_BYTES = 160;
 
-async function playBuffer(session, mulawBuf) {
+async function playBuffer(session, mulawBuf, opts = {}) {
   if (!mulawBuf || !mulawBuf.length) return;
   if (session.ws.readyState !== WebSocket.OPEN) return;
-  if (session.media === 'wav') return playBufferWav(session, mulawBuf);
+  if (session.media === 'wav') return playBufferWav(session, mulawBuf, opts);
   session.finalBuf       = '';
   session.partialBuf     = '';
   session.isSpeaking     = true;
