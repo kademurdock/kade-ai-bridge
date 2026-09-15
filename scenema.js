@@ -214,7 +214,7 @@ function waitInfo(job, cap) {
     return { phase: 'stuck-card', waitedS, spoken: `A graphics card is up but has not taken the job. That is not normal. ${saySeconds(waitedS)} so far. Restarting it now.` };
   }
   if (cap.ok && cap.running > 0 && !cap.initializing && !(cap.inProgress > 0)) {
-    return { phase: 'loading', waitedS, spoken: `Got a card. It is loading the voice models, which takes a minute or two. ${saySeconds(waitedS)} so far.${giveUp}` };
+    return { phase: 'loading', waitedS, spoken: `Got a card. It is loading the voice models. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   if (cap.ok && cap.throttled > 0 && !cap.initializing && !cap.ready && !cap.idle && !cap.running) {
     return { phase: 'no-card', waitedS, spoken: `Still waiting for a graphics card. None are free right now, so nothing has started. ${saySeconds(waitedS)} so far.${giveUp}` };
