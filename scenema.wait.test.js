@@ -19,17 +19,18 @@ test('saySeconds speaks, never prints a raw number of seconds past a minute', ()
   assert.equal(saySeconds(-5), '0 seconds');
 });
 
-test('no card free is named as no card free, not as waking up', () => {
+test('throttled capacity does not invent a datacentre diagnosis', () => {
   const w = waitInfo({ state: 'queued', submittedAt: agoS(120) }, CAP({ throttled: 1 }));
   assert.equal(w.phase, 'no-card');
-  assert.match(w.spoken, /None are free right now/);
-  assert.match(w.spoken, /nothing has started/);
+  assert.match(w.spoken, /not assigned a ready worker/);
+  assert.match(w.spoken, /generation has not begun/);
+  assert.doesNotMatch(w.spoken, /None are free|datacentre is full/);
 });
 
 test('a booting card names loading without borrowing another model benchmark', () => {
   const w = waitInfo({ state: 'queued', submittedAt: agoS(60) }, CAP({ initializing: 1 }));
   assert.equal(w.phase, 'waking');
-  assert.match(w.spoken, /loading the audio model/);
+  assert.match(w.spoken, /preparing a worker/);
   assert.doesNotMatch(w.spoken, /about six minutes/);
 });
 
@@ -88,7 +89,7 @@ test('a running worker with nothing in progress and the job still queued past th
 test('a card that is up but loading is named as loading, with the give-up promise', () => {
   const w = waitInfo({ state: 'queued', submittedAt: agoS(60) }, CAP({ running: 1 }));
   assert.equal(w.phase, 'loading');
-  assert.match(w.spoken, /loading the voice models/);
+  assert.match(w.spoken, /worker is starting/);
   assert.match(w.spoken, /I give up in/);
 });
 

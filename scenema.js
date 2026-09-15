@@ -159,7 +159,15 @@ async function readCapacity() {
  * with the image cached takes a job in 70-160 s (measured Sep 3-4); a fresh
  * machine pulling the image shows as `initializing`, not `running`. */
 function isZombie(cap, waitedMs) {
+  // AuK may report a running worker while its container/cache is still loading.
+  // Queue age alone is not evidence that restarting it will help.
+  if (IS_AUK) return false;
   return !!(cap && cap.ok && cap.running > 0 && !cap.initializing && !(cap.inProgress > 0) && waitedMs > ZOMBIE_MS);
+}
+function queueLimitMs(cap) {
+  if (IS_AUK) return QUEUE_TIMEOUT_MS;
+  const cardComing = cap.ok && (cap.initializing > 0 || cap.ready > 0 || cap.idle > 0 || (cap.running > 0 && cap.inProgress > 0));
+  return cardComing ? QUEUE_TIMEOUT_MS * 2 : QUEUE_TIMEOUT_MS;
 }
 async function listRunningPods() {
   const r = await axios.post(RUNPOD_GQL, { query: '{ myself { endpoints { id pods { id desiredStatus lastStatusChange machine { gpuDisplayName location } } } } }' },
@@ -199,7 +207,7 @@ function waitInfo(job, cap) {
   const submitted = Date.parse(job.submittedAt || job.createdAt) || Date.now();
   const waitedS = Math.max(0, Math.round((Date.now() - submitted) / 1000));
   const clockFrom = job.kickedAt ? Date.parse(job.kickedAt) : submitted;
-  const leftS = Math.max(0, Math.round(QUEUE_TIMEOUT_MS / 1000 - (Date.now() - clockFrom) / 1000));
+  const leftS = Math.max(0, Math.round(queueLimitMs(cap) / 1000 - (Date.now() - clockFrom) / 1000));
   if (job.state === 'running' || job.startedAt) {
     return { phase: 'rendering', waitedS, spoken: `Rendering now. ${saySeconds(waitedS)} in.` };
   }
@@ -214,13 +222,13 @@ function waitInfo(job, cap) {
     return { phase: 'stuck-card', waitedS, spoken: `A graphics card is up but has not taken the job. That is not normal. ${saySeconds(waitedS)} so far. Restarting it now.` };
   }
   if (cap.ok && cap.running > 0 && !cap.initializing && !(cap.inProgress > 0)) {
-    return { phase: 'loading', waitedS, spoken: `Got a card. It is loading the voice models. ${saySeconds(waitedS)} so far.${giveUp}` };
+    return { phase: 'loading', waitedS, spoken: `The worker is starting, but audio generation has not begun. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   if (cap.ok && cap.throttled > 0 && !cap.initializing && !cap.ready && !cap.idle && !cap.running) {
-    return { phase: 'no-card', waitedS, spoken: `Still waiting for a graphics card. None are free right now, so nothing has started. ${saySeconds(waitedS)} so far.${giveUp}` };
+    return { phase: 'no-card', waitedS, spoken: `The provider has not assigned a ready worker. Audio generation has not begun. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   if (cap.ok && cap.initializing > 0) {
-    return { phase: 'waking', waitedS, spoken: `Got a card. It is loading the audio model. ${saySeconds(waitedS)} so far.${giveUp}` };
+    return { phase: 'waking', waitedS, spoken: `The provider is preparing a worker. Audio generation has not begun. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   return { phase: 'queued', waitedS, spoken: `Queued, waiting for a card. ${saySeconds(waitedS)} so far.${giveUp}` };
 }
@@ -375,8 +383,8 @@ async function pump() {
       if (job.state === 'cancelled') continue;
       if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date().toISOString(); saveJobs(); }
       /* THE FLOOR. Still queued, no card has picked it up, and the clock has
-       * run out: stop waiting and SAY SO. Nothing was charged, because RunPod
-       * bills worker seconds and this job never got a worker. Giving up also
+       * run out: stop waiting and SAY SO. Startup may still be billed even
+       * when the job never reaches inference. Giving up also
        * releases the one-render-at-a-time lock, which a stuck job used to hold
        * for as long as it sat there — so a dead queue used to lock her out of
        * starting a fresh one, on top of saying nothing. */
@@ -407,8 +415,7 @@ async function pump() {
         /* A worker that is `running` only counts as "coming" while it is doing
          * something -- a frozen one is exactly what the old rule waited 20
          * minutes for. */
-        const cardComing = capNow.ok && (capNow.initializing > 0 || capNow.ready > 0 || capNow.idle > 0 || (capNow.running > 0 && capNow.inProgress > 0));
-        const limitMs = cardComing ? QUEUE_TIMEOUT_MS * 2 : QUEUE_TIMEOUT_MS;
+        const limitMs = queueLimitMs(capNow);
         const clockMs = sinceKickMs !== null ? sinceKickMs : waitedMs;
         if (clockMs > limitMs || (job.kickedAt && isZombie(capNow, sinceKickMs))) {
           const cap = capNow;
@@ -417,9 +424,9 @@ async function pump() {
           job.state = 'failed';
           job.gaveUp = true;
           job.error = job.kickedAt
-            ? `A graphics card took the job and froze, twice. I stopped after ${mins} minutes. No usable audio was produced; startup time may still be billed. Try again in a few minutes; if it happens again, the card provider is having a bad night.`
+            ? `The worker did not begin this job after a restart. I stopped after ${mins} minutes. No usable audio was produced; startup time may still be billed.`
             : cap.ok && cap.throttled > 0
-              ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. No audio was produced; startup time may still be billed. Try again in a few minutes.`
+              ? `The provider did not get a worker ready in ${mins} minutes. Capacity or startup may be blocking it. No audio was produced; startup time may still be billed.`
               : `This render waited ${mins} minutes and no graphics card picked it up. No audio was produced; startup time may still be billed. Try again.`;
           job.finishedAt = new Date().toISOString();
           saveJobs();
@@ -548,4 +555,4 @@ function attachScenema(app, d = {}) {
   }
 }
 
-module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, isZombie, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
+module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, isZombie, queueLimitMs, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
