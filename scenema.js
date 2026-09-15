@@ -417,7 +417,7 @@ async function pump() {
           job.state = 'failed';
           job.gaveUp = true;
           job.error = job.kickedAt
-            ? `A graphics card took the job and froze, twice. I stopped after ${mins} minutes. Nothing was charged for the render itself. Try again in a few minutes; if it happens again, the card provider is having a bad night.`
+            ? `A graphics card took the job and froze, twice. I stopped after ${mins} minutes. No usable audio was produced; startup time may still be billed. Try again in a few minutes; if it happens again, the card provider is having a bad night.`
             : cap.ok && cap.throttled > 0
               ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. No audio was produced; startup time may still be billed. Try again in a few minutes.`
               : `This render waited ${mins} minutes and no graphics card picked it up. No audio was produced; startup time may still be billed. Try again.`;
