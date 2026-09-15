@@ -26,11 +26,11 @@ test('no card free is named as no card free, not as waking up', () => {
   assert.match(w.spoken, /nothing has started/);
 });
 
-test('a booting card says six minutes, because that is the measured number', () => {
+test('a booting card names loading without borrowing another model benchmark', () => {
   const w = waitInfo({ state: 'queued', submittedAt: agoS(60) }, CAP({ initializing: 1 }));
   assert.equal(w.phase, 'waking');
-  assert.match(w.spoken, /waking up/);
-  assert.match(w.spoken, /about six minutes/);
+  assert.match(w.spoken, /loading the audio model/);
+  assert.doesNotMatch(w.spoken, /about six minutes/);
 });
 
 test('every unfinished line carries elapsed time and a give-up promise', () => {

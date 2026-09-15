@@ -48,10 +48,11 @@ const RECEIPTS_FILE = path.join(DATA_DIR, 'scenema-receipts.jsonl');
 
 const ENABLED = process.env.SCENEMA_ENABLED !== '0';
 const RUNPOD_KEY = process.env.RUNPOD_API_KEY || '';
-const ENDPOINT_ID = process.env.SCENEMA_ENDPOINT_ID || '';
+const ENDPOINT_ID = process.env.AUK_ENDPOINT_ID || process.env.SCENEMA_ENDPOINT_ID || '';
+const IS_AUK = !!process.env.AUK_ENDPOINT_ID;
 const RUNPOD_BASE = `https://api.runpod.ai/v2/${ENDPOINT_ID}`;
-const RATE_PER_HR = parseFloat(process.env.SCENEMA_RATE_PER_HR || '1.75');
-const WAKE_USD = parseFloat(process.env.SCENEMA_WAKE_USD || '0.05');
+const RATE_PER_HR = parseFloat(IS_AUK ? (process.env.AUK_RATE_PER_HR || '1.22') : (process.env.SCENEMA_RATE_PER_HR || '1.75'));
+const WAKE_USD = parseFloat(IS_AUK ? (process.env.AUK_WAKE_USD || '0') : (process.env.SCENEMA_WAKE_USD || '0.05'));
 const DAILY_CAP = parseFloat(process.env.SCENEMA_DAILY_CAP_USD || '1.00');
 const MONTHLY_CAP = parseFloat(process.env.SCENEMA_MONTHLY_CAP_USD || '20');
 const MAX_PROMPT = 4000;
@@ -110,8 +111,8 @@ function capsExceeded() {
   const now = Date.now();
   const day = spendSince(now - 24 * 3600 * 1000);
   const month = spendSince(now - 30 * 24 * 3600 * 1000);
-  if (day >= DAILY_CAP) return `today's Scenema budget ($${DAILY_CAP.toFixed(2)}) is used up`;
-  if (month >= MONTHLY_CAP) return `this month's Scenema budget ($${MONTHLY_CAP.toFixed(2)}) is used up`;
+  if (day >= DAILY_CAP) return `today's speech GPU budget ($${DAILY_CAP.toFixed(2)}) is used up`;
+  if (month >= MONTHLY_CAP) return `this month's speech GPU budget ($${MONTHLY_CAP.toFixed(2)}) is used up`;
   return null;
 }
 
@@ -219,7 +220,7 @@ function waitInfo(job, cap) {
     return { phase: 'no-card', waitedS, spoken: `Still waiting for a graphics card. None are free right now, so nothing has started. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   if (cap.ok && cap.initializing > 0) {
-    return { phase: 'waking', waitedS, spoken: `Got a card. It is waking up, which takes about six minutes. ${saySeconds(waitedS)} so far.${giveUp}` };
+    return { phase: 'waking', waitedS, spoken: `Got a card. It is loading the audio model. ${saySeconds(waitedS)} so far.${giveUp}` };
   }
   return { phase: 'queued', waitedS, spoken: `Queued, waiting for a card. ${saySeconds(waitedS)} so far.${giveUp}` };
 }
@@ -230,7 +231,7 @@ async function postUsage({ userId, seconds, costUSD, metadata }) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await axios.post(`${FORK_URL}/api/kade/usage-event`, {
-        secret: USAGE_SECRET, userId, service: 'scenema_audio', quantity: Math.max(1, Math.round(seconds)), unit: 'seconds', costUSD, metadata,
+        secret: USAGE_SECRET, userId, service: IS_AUK ? 'auk_audio' : 'scenema_audio', quantity: Math.max(1, Math.round(seconds)), unit: 'seconds', costUSD, metadata,
       }, { headers: { 'User-Agent': UA }, timeout: 10000 });
       return;
     } catch (e) { if (attempt === 3) console.warn('[scenema] usage post failed:', e.message); else await new Promise((r) => setTimeout(r, 10000)); }
@@ -240,26 +241,33 @@ async function postAsset({ userId, url, prompt, costUSD, metadata }) {
   if (!USAGE_SECRET) return;
   try {
     await axios.post(`${FORK_URL}/api/kade/asset-event`, {
-      secret: USAGE_SECRET, userId, kind: 'audio', service: 'scenema_audio', url, prompt, model: 'scenema-audio', costUSD, metadata,
+      secret: USAGE_SECRET, userId, kind: 'audio', service: IS_AUK ? 'auk_audio' : 'scenema_audio', url, prompt, model: IS_AUK ? 'tencent/AuK' : 'scenema-audio', costUSD, metadata,
     }, { headers: { 'User-Agent': UA }, timeout: 15000 });
   } catch (e) { console.warn('[scenema] asset post failed:', e.message); }
 }
 
 /* ---------- job creation ---------- */
 function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
-  if (!ENABLED) return { error: 'Scenema is switched off right now.' };
-  if (!RUNPOD_KEY || !ENDPOINT_ID) return { error: 'Scenema is not configured on the bridge (RUNPOD_API_KEY / SCENEMA_ENDPOINT_ID).' };
+  if (!ENABLED) return { error: 'The speech worker is switched off right now.' };
+  if (!RUNPOD_KEY || !ENDPOINT_ID) return { error: 'The speech worker is not configured on the bridge.' };
   userId = String(userId || '').trim();
   prompt = String(prompt || '').trim();
   if (!userId) return { error: 'userId required' };
-  if (!prompt.includes('<speak')) return { error: 'prompt must be Scenema <speak voice="..." gender="...">...</speak> XML' };
+  if (options.auk_task !== 'edit' && !prompt.includes('<speak')) return { error: 'prompt must be Scenema <speak voice="..." gender="...">...</speak> XML' };
   if (prompt.length > MAX_PROMPT) return { error: `prompt is ${prompt.length} characters; the cap is ${MAX_PROMPT}` };
   const capMsg = capsExceeded();
   if (capMsg) return { error: capMsg };
   const open = jobs.find((j) => j.userId === userId && (j.state === 'queued' || j.state === 'running'));
   if (open) return { error: `one render at a time: ${open.id} is still ${open.state}`, jobId: open.id };
 
+  if (options.auk_task === 'edit' && (!options.reference_voice_url || !String(options.instruction || '').trim())) return { error: 'Import a recording and describe the edit first.' };
+  if (options.gen_seconds != null && (!Number.isFinite(options.gen_seconds) || options.gen_seconds <= 0)) return { error: 'Target seconds must be positive.' };
   const input = { prompt, out_prefix: userId };
+  if (IS_AUK) {
+    input.auk_task = options.auk_task === 'edit' ? 'edit' : 'speech';
+    input.instruction = String(options.instruction || '').slice(0, MAX_PROMPT);
+    if (options.gen_seconds != null) input.gen_seconds = options.gen_seconds;
+  }
   const ref = options.reference_voice_url;
   if (typeof ref === 'string' && /^https?:\/\/\S+$/i.test(ref) && ref.length < 2048) input.reference_voice_url = ref;
   if (options.background_sfx === true) input.background_sfx = true;
@@ -280,7 +288,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   const job = {
     id: `sc_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     userId, agentId: String(agentId || ''), agentName: String(agentName || 'Kade-AI').slice(0, 40),
-    prompt, promptChars: prompt.length, hasReference: !!input.reference_voice_url,
+    engine: IS_AUK ? 'auk' : 'scenema', prompt, promptChars: prompt.length, hasReference: !!input.reference_voice_url,
     state: 'queued', createdAt: new Date().toISOString(), runpodId: null, result: null, error: null, costUSD: null,
     /* Part 122. A long script is rendered in PARTS and joined by the fork into
      * one recording. A part is not a thing she made -- it is a slice of one --
@@ -328,6 +336,12 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     costUSD: Math.round((estWarmS / 3600 * RATE_PER_HR + (cardAwake ? 0 : WAKE_USD)) * 1000) / 1000,
     spokenWait,
   };
+  if (IS_AUK) {
+    Object.assign(job.estimate, {
+      renderSeconds: null, renderSecondsWarm: null, renderSecondsCold: null, costUSD: null,
+      spokenWait: `AuK HQ uses a sleeping GPU, billed at up to $${RATE_PER_HR.toFixed(2)} per hour while active. Startup and processing are billed. A reliable wait and total cost estimate is not available yet.`,
+    });
+  }
   saveJobs();
   submit(input).then(async (r) => {
     job.runpodId = r.id;
@@ -405,8 +419,8 @@ async function pump() {
           job.error = job.kickedAt
             ? `A graphics card took the job and froze, twice. I stopped after ${mins} minutes. Nothing was charged for the render itself. Try again in a few minutes; if it happens again, the card provider is having a bad night.`
             : cap.ok && cap.throttled > 0
-              ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. Nothing was charged. Try again in a few minutes.`
-              : `This render waited ${mins} minutes and no graphics card picked it up. Nothing was charged. Try again.`;
+              ? `No graphics card came free in ${mins} minutes — the datacentre is full right now. No audio was produced; startup time may still be billed. Try again in a few minutes.`
+              : `This render waited ${mins} minutes and no graphics card picked it up. No audio was produced; startup time may still be billed. Try again.`;
           job.finishedAt = new Date().toISOString();
           saveJobs();
           receipt({ jobId: job.id, userId: job.userId, state: 'gave-up', error: job.error, waitedS: Math.round(waitedMs / 1000), throttled: cap.throttled, kicked: !!job.kickedAt, costUSD: 0 });
@@ -427,13 +441,13 @@ async function pump() {
         const cold = delayS > 45; // a wake, not a warm worker
         const costUSD = Math.round((execS / 3600 * RATE_PER_HR + (cold ? WAKE_USD : 0)) * 1000) / 1000;
         job.state = 'done'; job.finishedAt = new Date().toISOString(); job.costUSD = costUSD;
-        job.result = { url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold };
+        job.result = { engine: out.engine || job.engine, wavKey: out.wav_key, wavUrl: out.wav_url, url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold };
         saveJobs();
         receipt({ jobId: job.id, userId: job.userId, state: 'done', durationS: out.duration_s, executionS: execS, delayS, cold, costUSD, words: job.estimate?.words });
         console.log(`[scenema] ${job.id} done: ${out.duration_s}s audio in ${execS.toFixed(0)}s (${cold ? 'cold' : 'warm'}), $${costUSD}`);
         await postUsage({ userId: job.userId, seconds: out.duration_s || execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, words: job.estimate?.words, agent: job.agentName } });
         if (!job.suppressAsset) {
-          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, agent: job.agentName, engine: 'scenema-audio' } });
+          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio' } });
         }
         /* A part does not buzz her phone -- the fork does that once, after the
          * parts are joined. Five pushes for one story is not five times the
@@ -454,7 +468,7 @@ async function pump() {
 }
 async function notifyFail(job) {
   try {
-    await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title: 'That narration did not render', body: `Scenema could not finish it: ${String(job.error).slice(0, 160)}. Nothing was charged beyond the attempt.`, urgent: false, userId: job.userId, category: 'KADE_RESEARCH' });
+    await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title: 'That narration did not render', body: `The speech worker could not finish it: ${String(job.error).slice(0, 160)}. Nothing was charged beyond the attempt.`, urgent: false, userId: job.userId, category: 'KADE_RESEARCH' });
   } catch (_) {}
 }
 
@@ -517,7 +531,7 @@ function attachScenema(app, d = {}) {
     if (!(d.bridgeSecretOk && d.bridgeSecretOk(req, req.query?.secret))) return res.status(403).json({ error: 'Unauthorized' });
     const now = Date.now();
     return res.json({
-      enabled: ENABLED, configured: !!(RUNPOD_KEY && ENDPOINT_ID), endpointId: ENDPOINT_ID, ratePerHr: RATE_PER_HR,
+      engine: IS_AUK ? 'auk' : 'scenema', enabled: ENABLED, configured: !!(RUNPOD_KEY && ENDPOINT_ID), endpointId: ENDPOINT_ID, ratePerHr: RATE_PER_HR,
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP }, spend: { dayUSD: spendSince(now - 86400000), monthUSD: spendSince(now - 30 * 86400000) },
       open: jobs.filter((j) => j.state === 'queued' || j.state === 'running').length,
       queueTimeoutS: Math.round(QUEUE_TIMEOUT_MS / 1000), coldWakeS: COLD_WAKE_S, zombieS: Math.round(ZOMBIE_MS / 1000),
