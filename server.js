@@ -1251,7 +1251,7 @@ app.post('/notify', async (req, res) => {
    * falling back to every registered phone. An admin caller that means someone
    * else still passes userId and still wins. */
   const isAdminAlert = bridgeSecretOk(req, b.secret) && b.adminAlert === true;
-  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, category, route: b.route, runId: b.runId });
+  const out = await runNotify({ agentId: b.agentId, agentName: b.agentName, title: b.title, body: b.body, urgent: b.urgent, userId: b.userId || (isAdminAlert ? CANARY_ADMIN_USER : undefined), broadcast: (bridgeSecretOk(req, b.secret) || broadcastSecretOk(req, b.secret)) && b.broadcast === true, adminAlert: isAdminAlert, requested: bridgeSecretOk(req, b.secret) && b.requested === true, category, route: b.route, runId: b.runId });
   if (out.error) return res.status(400).json({ error: out.error });
   res.json(out);
 });

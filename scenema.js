@@ -362,10 +362,11 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     }
     job.runpodId = r.id; job.state = r.status === 'IN_PROGRESS' ? 'running' : 'queued'; job.submittedAt = new Date().toISOString(); saveJobs();
     console.log(`[scenema] ${job.id} submitted → runpod ${r.id} (${words} words, ~${estAudioS}s of audio)`);
-  }).catch((e) => {
+  }).catch(async (e) => {
     if (job.state === 'cancelled') return;
     job.state = 'failed'; job.error = `submit: ${e.response?.data?.error || e.message}`; job.finishedAt = new Date().toISOString(); saveJobs();
     console.warn('[scenema] submit failed:', job.error);
+    await notifyFail(job);
   });
   return { ok: true, jobId: job.id, estimate: job.estimate };
 }
@@ -379,7 +380,24 @@ async function pump() {
     for (const job of jobs) {
       if (!(job.state === 'queued' || job.state === 'running') || !job.runpodId) continue;
       let s;
-      try { s = await status(job.runpodId); } catch (e) { console.warn(`[scenema] status ${job.id}:`, e.message); continue; }
+      try {
+        s = await status(job.runpodId);
+        if (job.missingStatusCount) { job.missingStatusCount = 0; saveJobs(); }
+      } catch (e) {
+        if (job.state === 'cancelled') continue;
+        job.missingStatusCount = e.response?.status === 404 ? (job.missingStatusCount || 0) + 1 : 0;
+        const ageMs = Date.now() - Date.parse(job.submittedAt || job.createdAt);
+        if (job.missingStatusCount >= 3 && ageMs >= 120000) {
+          job.state = 'failed';
+          job.finishedAt = new Date().toISOString();
+          job.error = 'The audio provider no longer has this job record. No finished recording could be confirmed. Check My Creations before trying again; the attempt may have been billed.';
+          receipt({ jobId: job.id, userId: job.userId, state: 'status-lost', error: job.error });
+          saveJobs();
+          await notifyFail(job);
+        } else { saveJobs(); }
+        console.warn(`[scenema] status ${job.id}:`, e.message);
+        continue;
+      }
       if (job.state === 'cancelled') continue;
       if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date().toISOString(); saveJobs(); }
       /* THE FLOOR. Still queued, no card has picked it up, and the clock has
@@ -463,7 +481,7 @@ async function pump() {
           if (job.suppressAsset) { continue; }
           const mins = Math.floor((out.duration_s || 0) / 60), secs = Math.round((out.duration_s || 0) % 60);
           const len = mins ? `${mins} minute${mins === 1 ? '' : 's'} ${secs} seconds` : `${secs} seconds`;
-          await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title: 'Your narration is ready', body: `${len} of audio is in My Creations. Ask ${job.agentName} to play it, or open the gallery.`, urgent: false, userId: job.userId, category: 'KADE_RESEARCH' });
+          await notifyResult(job, 'Your narration is ready', `${len} of audio is ready. Open the Sound Booth to play your take, or find it in My Creations.`);
         } catch (e) { console.warn('[scenema] notify failed:', e.message); }
       } else if (s.status === 'FAILED' || s.status === 'CANCELLED' || s.status === 'TIMED_OUT') {
         job.state = 'failed'; job.error = s.error || s.status; job.finishedAt = new Date().toISOString(); saveJobs();
@@ -474,9 +492,21 @@ async function pump() {
   } finally { pumping = false; }
 }
 async function notifyFail(job) {
+  console.warn(`[scenema] ${job.id} failed: ${String(job.error).slice(0, 200)}`);
+  await notifyResult(job, 'Sound Booth render failed', `Generation stopped. ${String(job.error).slice(0, 200)} Open the Sound Booth for the saved attempt.`);
+}
+async function notifyResult(job, title, body) {
   try {
-    await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title: 'That narration did not render', body: `The speech worker could not finish it: ${String(job.error).slice(0, 160)}. Nothing was charged beyond the attempt.`, urgent: false, userId: job.userId, category: 'KADE_RESEARCH' });
-  } catch (_) {}
+    const result = await deps.runNotify({ agentId: job.agentId || 'scenema', agentName: job.agentName, title, body,
+      urgent: false, userId: job.userId, requested: true, route: 'sound-booth' });
+    job.notification = { at: new Date().toISOString(), accepted: result?.sent || 0,
+      deferred: result?.deferred === true, blocked: result?.blocked || result?.error || result?.note || null };
+  } catch (error) {
+    job.notification = { at: new Date().toISOString(), accepted: 0, blocked: 'Notification service unavailable' };
+    console.warn(`[scenema] notify ${job.id} failed:`, error.message);
+  }
+  saveJobs();
+  receipt({ jobId: job.id, userId: job.userId, state: 'notification', ...job.notification });
 }
 
 /* ---------- routes ---------- */
@@ -555,4 +585,4 @@ function attachScenema(app, d = {}) {
   }
 }
 
-module.exports = { attachScenema, makeJob, _internals: { capsExceeded, spendSince, waitInfo, saySeconds, isZombie, queueLimitMs, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
+module.exports = { attachScenema, makeJob, _internals: { pump, capsExceeded, spendSince, waitInfo, saySeconds, isZombie, queueLimitMs, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
