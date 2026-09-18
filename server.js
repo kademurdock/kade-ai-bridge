@@ -1485,7 +1485,7 @@ async function fireBrief(userId, urgent = false) {
       memCtx = await fetchCallMemories({ userId, email: p.email || undefined }, agentId);
     } catch { /* a brief without notes is still a brief */ }
   }
-  const text = await askAgentRich(agentId, composeBriefPrompt(p, memCtx));
+  const text = await askAgentRich(agentId, composeBriefPrompt(p, memCtx), { toolPolicy: 'morning-brief' });
   if (!text || !String(text).trim()) return { ok: false, error: 'agent returned no text' };
   const body = sanitizePushBody(text);
   const delivery = await runNotify({
@@ -3810,10 +3810,10 @@ setInterval(async () => {
 }, 60 * 1000);
 
 /** Plain proxy chat call (NO phone-brevity suffix — summaries should be rich). */
-async function askAgentRich(agentId, userMessage) {
+async function askAgentRich(agentId, userMessage, { toolPolicy } = {}) {
   const r = await axios.post(
     `${PROXY_URL}/librechat/ask`,
-    { agentId, messages: [{ role: 'user', content: userMessage }] },
+    { agentId, messages: [{ role: 'user', content: userMessage }], ...(toolPolicy ? { toolPolicy } : {}) },
     { headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA }, timeout: 150000 },
   );
   return (r.data && r.data.text) || null;
