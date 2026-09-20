@@ -175,7 +175,34 @@ function parseJudge(text) {
   } catch { return null; }
 }
 
-function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
+/* Part 236 (Sep 20 2026) — THE THIRD CHAIR. Jev (jev.js) grades every reply
+ * beside the two LLM judges: one `score` question on a five-step rubric mapped
+ * to 0-100, and the seven flags as seven yes/no questions, all in one request
+ * (~300 ms, about three thousandths of a cent). It lands in the ledger as its
+ * own `jev` field on each probe and `jevScore` / `jevFlags` on each agent.
+ *
+ * It does NOT touch `scores`, `mean`, `agreement`, `flags` or the spoken line:
+ * the graph's whole value is that the same graders grade every night, and a
+ * third grader joining the mean would read as a step in Kiana's line that is
+ * really a step in the jury. After a few weeks of rows there will be data on
+ * whether Jev tracks the pair; THEN set BATTERY_JEV_COUNTS=1 and its score
+ * joins `scores` (agreement stays the LLM pair's). A Jev failure is a probe
+ * with no `jev` field and nothing else. Its cost is metered against the same
+ * daily cap. Kill: KADE_JEV_BATTERY=0. */
+let JEV = null;
+try { JEV = require('./jev'); } catch (e) { console.warn('[jev] not loaded (battery unaffected):', e.message); }
+const JEV_COUNTS = () => process.env.BATTERY_JEV_COUNTS === '1';
+
+async function jevChair(probe, readable, jev = JEV, log = console) {
+  if (!jev || !jev.enabled('KADE_JEV_BATTERY')) return null;
+  try {
+    const t0 = Date.now();
+    const j = await jev.batteryJudge(probe, readable);
+    return { score: j.score, confidence: j.confidence, flags: Object.keys(j.flags).filter((k) => j.flags[k]), cost: j.cost || 0, ms: Date.now() - t0 };
+  } catch (e) { log.warn(`[battery] jev chair failed on ${probe.id} (the two judges stand):`, e.message); return null; }
+}
+
+function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev = JEV }) {
   const state = { running: false, startedAt: null, lastError: null, spentTodayUsd: 0, spentDay: null };
 
   function enabled() {
@@ -340,7 +367,13 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
             } catch (e) { log.warn(`[battery] judge ${model} failed on ${probe.id}:`, e.message); }
           }
           const agreement = scores.length === 2 ? 100 - Math.abs(scores[0] - scores[1]) : null;
-          per.push({ id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' });
+          // Part 236: the third chair, AFTER agreement is taken from the LLM
+          // pair. Same cap check as the judges; never throws.
+          const jv = state.spentTodayUsd >= DAILY_CAP_USD ? null : await jevChair(probe, readable, jev, log);
+          if (jv) { row.judgeCostUsd += jv.cost; spend(jv.cost); if (JEV_COUNTS()) scores.push(jv.score); }
+          const perRow = { id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' };
+          if (jv) perRow.jev = { score: jv.score, confidence: jv.confidence, flags: jv.flags, ms: jv.ms };
+          per.push(perRow);
         }
         const scored = per.filter((p) => p.mean != null);
         const flagTotals = {};
@@ -356,6 +389,16 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console }) {
           flags: flagTotals,
           per,
         };
+        // Part 236: Jev's own line, beside the score and never inside it.
+        const jevRows = per.filter((p) => p.jev);
+        if (jevRows.length) {
+          const jf = {};
+          for (const p of jevRows) for (const k of p.jev.flags) jf[k] = (jf[k] || 0) + 1;
+          row.agents[name].jevScore = Math.round(jevRows.reduce((a, p) => a + p.jev.score, 0) / jevRows.length);
+          row.agents[name].jevScored = jevRows.length;
+          row.agents[name].jevFlags = jf;
+          row.agents[name].jevCounted = JEV_COUNTS();
+        }
       }
       if (before) {
         const after = await listSeatCards();
@@ -467,4 +510,4 @@ function attachBattery(app, { bridgeSecretOk, proxyUrl, proxySecret, openrouterK
   return battery;
 }
 
-module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt };
+module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt, jevChair };

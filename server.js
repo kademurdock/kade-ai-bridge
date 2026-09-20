@@ -4410,6 +4410,32 @@ function saveCanaryState() {
   try { fs.writeFileSync(CANARY_FILE, JSON.stringify(canaryState)); } catch (e) { console.warn('[canary] state save failed:', e.message); }
 }
 
+/* Part 236 (Sep 20 2026) — THE CANARY GETS A SECOND OPINION. Both false
+ * alarms above were a mechanical test failing a correct reply, and the fix
+ * each time was a better mechanical test. `expect` is still a regex: "The one
+ * where the leaves drop" is a right answer to the season probe and fails
+ * /fall|autumn/. So when the regex fails a non-empty reply, Jev (jev.js, a
+ * typed decision model, no prose) is asked whether the reply is CORRECT, and
+ * at p >= 0.9 the check is healthy with a note saying who decided. In the
+ * trial no wrong answer scored above 0.06.
+ *
+ * The other way round, for the three probes with no `expect` (they pass on
+ * ten characters of anything, an error apology included): when Jev is sure
+ * the reply is not even about the question (p <= 0.05) the check is recorded
+ * RED with a note — but a red that only Jev saw never counts toward the
+ * alert and never pages her. It shows on /platform-status until the next
+ * probe and that is all. Paging stays with the tests that were here before.
+ *
+ * The tool probe is never overruled (canaryDecide says why). Any Jev failure
+ * is today's verdict, unchanged. Kill: KADE_JEV_CANARY=0 or KADE_JEV=0. */
+let JEV = null;
+try { JEV = require('./jev'); } catch (e) { console.warn('[jev] not loaded (bridge unaffected):', e.message); }
+async function canaryJevOpinion(question, text) {
+  if (!JEV || !JEV.enabled('KADE_JEV_CANARY')) return null;
+  try { return await JEV.canaryOpinion(question, text); }
+  catch (e) { console.warn('[canary] jev second opinion failed (regex verdict stands):', e.message); return null; }
+}
+
 async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
   const nonce = Math.floor(100000 + Math.random() * 900000);
   const probeEntry = (Number.isInteger(probeIdx) && CANARY_PROBES[probeIdx])
@@ -4440,9 +4466,20 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
     const hash = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
     const minLen = probeEntry.expect ? 3 : 10;
     const cls = probeEntry.tool ? 'TOOL probe: ' : probeEntry.seat ? `SEAT probe (${probeEntry.seat}): ` : '';
+    // Part 236: Jev is asked only where it could change something — a failed
+    // fact check (not the tool probe's), or a probe with no fact check at all.
+    let factFailed = Boolean(text && text.length >= minLen && probeEntry.expect && !probeEntry.expect.test(text));
+    let jevNote = ''; let jevDoubt = false;
+    if (text && text.length >= minLen && ((factFailed && !probeEntry.tool) || !probeEntry.expect)) {
+      const op = await canaryJevOpinion(question, text);
+      const verdict = op && JEV.canaryDecide(probeEntry, factFailed, op);
+      if (verdict === 'overrule') { factFailed = false; jevNote = `jev overruled the fact check (p=${op.correct.toFixed(2)})`; }
+      if (verdict === 'doubt') jevDoubt = true;
+      if (jevDoubt) jevNote = `${cls}reply (${text.length} chars) passed on length but jev reads it as not about "${probe.slice(0, 40)}..." (p=${op.attempt.toFixed(2)}) — recorded, never paged on jev alone`;
+    }
     if (!text || text.length < minLen) {
       result.note = `${cls}reply too short (${text.length} chars) — the wordless-turn class${probeEntry.tool ? ' (tool lane suspect — the Aug-21 role-shim outage looked exactly like this)' : ''}`;
-    } else if (probeEntry.expect && !probeEntry.expect.test(text)) {
+    } else if (factFailed) {
       result.note = `${cls}reply (${text.length} chars) did not contain the expected fact for "${probe.slice(0, 40)}..."`;
     } else if (
       canaryState.lastReplyHash && hash === canaryState.lastReplyHash &&
@@ -4458,11 +4495,17 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
       // answer — that is genuinely the repetition bug. Same question, same
       // answer is just arithmetic.
       result.note = 'a DIFFERENT probe returned a byte-identical reply — the repetition-bug signature';
+    } else if (jevDoubt) {
+      result.note = jevNote;
+      result.jevOnly = true;
     } else {
       result.ok = true;
       canaryState.lastReplyHash = hash;
       canaryState.lastProbe = probe;
-      if (result.ms >= CANARY_SLOW_MS) result.note = `slow (${(result.ms / 1000).toFixed(1)}s)`;
+      const notes = [];
+      if (result.ms >= CANARY_SLOW_MS) notes.push(`slow (${(result.ms / 1000).toFixed(1)}s)`);
+      if (jevNote) notes.push(jevNote);
+      result.note = notes.join('; ');
     }
   } catch (e) {
     result.ms = Date.now() - t0;
@@ -4485,6 +4528,13 @@ async function runCanaryProbe(trigger = 'tick', probeIdx = null) {
         urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
       }).catch(() => {});
     }
+  } else if (result.jevOnly) {
+    // Part 236: a red only Jev saw. On the record, in the log, and nowhere
+    // near the pager: the fail streak and the alert flag are left exactly as
+    // they were, so two of these in a row page nobody and one of these
+    // between two real failures does not hide them either.
+    console.warn(`[canary] JEV DOUBT (not counted toward the alert): ${result.note}`);
+    saveCanaryState();
   } else {
     canaryState.consecutiveFails += 1;
     console.warn(`[canary] FAIL #${canaryState.consecutiveFails}: ${result.note}`);
@@ -5769,7 +5819,12 @@ app.get('/platform-status', async (req, res) => {
         ? 'The canary has not flown yet this boot.'
         : canaryLast.ok
           ? `Canary: green, ${greenStreak} straight pass${greenStreak === 1 ? '' : 'es'}, last check ${(canaryLast.ms / 1000).toFixed(1)} seconds.`
-          : `Canary: RED — ${canaryLast.note}.`;
+          // Part 236: a red only Jev saw is said as a doubt, not an alarm, and
+          // (below) does not turn the whole platform's `ok` false — something
+          // outside this file may be watching that flag.
+          : canaryLast.jevOnly
+            ? `Canary: answering, but the last reply looked off-topic — not an alarm. ${canaryLast.note}.`
+            : `Canary: RED — ${canaryLast.note}.`;
     const upLine = down.length === 0
       ? `Everything is up: ${services.map((s) => s.name).join(', ')} all answering.`
       : `Trouble: ${down.map((s) => `${s.name} is not answering (${s.detail})`).join('; ')}. Up: ${services.filter((s) => s.ok).map((s) => s.name).join(', ') || 'nothing else checked'}.`;
@@ -5794,7 +5849,7 @@ app.get('/platform-status', async (req, res) => {
       if (BATTERY) { const b = BATTERY.summarize(); batteryS = { section: { enabled: b.enabled, latest: b.latest, weekMean: b.weekMean, running: b.running, lastError: b.lastError }, spoken: b.latest ? b.spoken : '' }; }
     } catch (_e) { /* a broken summary never breaks the status */ }
     res.json({
-      ok: down.length === 0 && !(canaryLast && !canaryLast.ok) && backups.section.ok !== false
+      ok: down.length === 0 && !(canaryLast && !canaryLast.ok && !canaryLast.jevOnly) && backups.section.ok !== false
         && !(balances.section.low && balances.section.low.length) && crash.okToday
         && memoryH.okForStatus,
       spokenSummary: [upLine, canarySpoken, crash.spoken, backups.spoken, memoryH.spoken, voiceR.spoken, balances.spoken, balances.quiet, spendSpoken, deploySpoken, slopS.spoken, batteryS.spoken].filter(Boolean).join(' '),
@@ -5807,6 +5862,8 @@ app.get('/platform-status', async (req, res) => {
       voice: voiceR.section,
       slop: slopS.section,
       battery: batteryS.section,
+      // Part 236: Jev's call counts since boot ({ok, failed}); null = not loaded.
+      jev: JEV ? { enabled: JEV.enabled(), model: JEV.MODEL, ...JEV.counts } : null,
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,

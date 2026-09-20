@@ -936,6 +936,24 @@ async function pump(deps) {
 }
 
 /* ---------- routes ---------- */
+/* Part 236 (Sep 20 2026): the consent second reader. True only when Jev is
+ * loaded, on, has not already re-asked THIS question, and reads the answer
+ * hard against the regex. Every other road — no key, killed, timeout, a
+ * malformed answer, an empty answer — is false, which is the regex alone.
+ * `jev` is a parameter so the tests never touch the network. */
+let JEV = null;
+try { JEV = require('./jev'); } catch (e) { console.warn('[jev] not loaded (errands unaffected):', e.message); }
+async function consentNeedsReask(errand, regexYes, answer, jev = JEV) {
+  const text = String(answer || '').trim();
+  if (!jev || !jev.enabled('KADE_JEV_CONSENT') || !errand || !errand.pending || errand.pending.reasked || !text) return false;
+  try {
+    const read = await jev.consentRead(errand.pending.ask, text);
+    const reask = jev.consentShouldReask(regexYes, read);
+    console.log(`[errand] ${errand.id} jev consent read: regex=${regexYes ? 'yes' : 'no'} consents=${read.consents.toFixed(2)} refuses=${read.refuses.toFixed(2)} -> ${reask ? 'ASK AGAIN' : 'regex stands'}`);
+    return reask;
+  } catch (e) { console.warn(`[errand] ${errand.id} jev consent read failed (regex stands):`, e.message); return false; }
+}
+
 function attachErrands(app, deps = {}) {
   const authOk = (req, provided) => {
     if (deps.bridgeSecretOk && deps.bridgeSecretOk(req, provided)) return true;
@@ -1039,7 +1057,10 @@ function attachErrands(app, deps = {}) {
   });
 
   /* POST /errand/:id/confirm {secret, userId, answer:"yes"|"no"} */
-  app.post('/errand/:id/confirm', express.json({ limit: '8kb' }), (req, res) => {
+  // Part 236: the body is async now (one awaited Jev read). Express 4 does not
+  // catch a rejected handler, so the wrapper hands any throw to next() — the
+  // same place a throw from the old synchronous handler went.
+  app.post('/errand/:id/confirm', express.json({ limit: '8kb' }), (req, res, next) => { (async () => {
     if (!authOk(req, req.body?.secret)) return res.status(403).json({ error: 'Unauthorized' });
     const userId = String(req.body?.userId || '').trim();
     const e = find(userId, req.params.id);
@@ -1058,6 +1079,36 @@ function attachErrands(app, deps = {}) {
       setStatus(e, 'cancelled', 'the question went stale');
       e.pending = null;
       return res.json({ ok: true, ...errandPublic(e), spokenSummary: spokenSummary(e) });
+    }
+
+    /* Part 236 (Sep 20 2026) — THE YES REGEX GETS A SECOND READER, AND THE
+     * SECOND READER CAN ONLY SAY "ASK AGAIN". The regex above is anchored at
+     * the front and reads the first word. That makes "okay no don't call",
+     * "sure, but not today" and "go away" a YES — and on a call_confirm a yes
+     * dials a phone. It also makes "absolutely" and "that works, call them" a
+     * NO, which quietly skips a call she asked for.
+     *
+     * Jev (jev.js) reads the answer against the question that was asked, two
+     * yes/no questions: does it clearly consent, does it clearly refuse. When
+     * its reading and the regex's disagree HARD, nothing is decided: the
+     * errand stays exactly where it was, still waiting, and the reply asks
+     * again in plain words. Jev never turns anything into a yes. Once per
+     * question — the second answer is the regex's alone, so nobody gets
+     * stuck in a loop with a model. Any Jev failure: the regex stands, as it
+     * always has. Kill: KADE_JEV_CONSENT=0. Trial numbers are in jev.js. */
+    const reask = await consentNeedsReask(e, yes, req.body?.answer);
+    // The await let other requests in. If a cancel or a second confirm moved
+    // this errand meanwhile, this answer is for a question no longer open.
+    if (e.status !== 'awaiting_confirm') return res.status(409).json({ error: `that errand isn't waiting on anything — it's ${e.status}`, ...errandPublic(e) });
+    if (reask && e.pending) {
+      e.pending.reasked = true;
+      saveStore();
+      const again = e.pending.kind === 'call_confirm'
+        ? (yes ? 'I heard a yes and a no in that, and I will not dial on a maybe. Say yes to place the call, or no to skip it.'
+               : 'I heard that as maybe. Say yes to place the call, or no to skip it.')
+        : (yes ? 'I heard a yes and a no in that. Say yes to keep going, or no to stop.'
+               : 'I heard that as maybe. Say yes to keep going, or no to stop.');
+      return res.json({ ok: true, reask: true, ...errandPublic(e), spokenSummary: again });
     }
 
     /* TWO KINDS OF YES, and conflating them would be the bug that dials a
@@ -1098,7 +1149,7 @@ function attachErrands(app, deps = {}) {
     setStatus(e, 'running', 'picking back up');
     setImmediate(() => pump(deps).catch((err) => console.error('[errand] pump:', err.message)));
     res.json({ ok: true, ...errandPublic(e), spokenSummary: 'Alright, picking it back up. I\'ll ping you when it\'s done.' });
-  });
+  })().catch(next); });
 
   /* POST /errand/:id/cancel {secret, userId} */
   app.post('/errand/:id/cancel', express.json({ limit: '8kb' }), (req, res) => {
@@ -1174,4 +1225,4 @@ function attachErrands(app, deps = {}) {
   console.log(`[errand] attached — ${enabled() ? `ENABLED (budget $${BUDGET_USD}/errand, ${OWNER_ONLY ? 'owner-only' : 'open'})` : `DISABLED (${disabledWhy()})`}`);
 }
 
-module.exports = { attachErrands, _internals: { store, spokenSummary, runErrand } };
+module.exports = { attachErrands, _internals: { store, spokenSummary, runErrand, consentNeedsReask } };

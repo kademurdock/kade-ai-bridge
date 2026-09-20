@@ -278,6 +278,26 @@ function distillPrompt(job, src, text) {
   ].join('\n');
 }
 
+/* Part 236 (Sep 20 2026) — SHADOW ONLY. `enough` decides whether a job stops
+ * or buys four more searches, and it is one model's say-so inside a JSON blob.
+ * Jev (jev.js) is asked the same yes/no over the same notes (cut to 24K
+ * chars) and its number is LOGGED beside the reflect model's answer. It
+ * decides nothing, is never awaited, and cannot slow or fail a job. After a
+ * few dozen lines there will be data on whether it is worth a vote.
+ * grep "[research] jev shadow". Kill: KADE_JEV_RESEARCH=0. */
+let JEV = null;
+try { JEV = require('./jev'); } catch (e) { console.warn('[jev] not loaded (research unaffected):', e.message); }
+function jevShadowEnough(job, ref, round, jev = JEV) {
+  try {
+    if (!jev || !jev.enabled('KADE_JEV_RESEARCH')) return null;
+    const notes = job.sources.filter((s) => s.note).map((s) => `SOURCE ${s.n} (${s.site}): ${s.note}`).join('\n\n');
+    const p = jev.researchEnough(job.question, (job.plan && job.plan.sub_questions) || [], notes)
+      .then((pe) => { console.log(`[research] jev shadow ${job.id} round=${round} reflect.enough=${Boolean(ref && ref.enough)} jev=${pe.toFixed(2)} notes=${notes.length}ch`); return pe; })
+      .catch((e) => { console.warn(`[research] jev shadow ${job.id} failed (nothing depends on it):`, e.message); return null; });
+    return p;
+  } catch (e) { return null; }
+}
+
 function reflectPrompt(job) {
   const notes = job.sources.filter((s) => s.note).map((s) => `SOURCE ${s.n} (${s.site}): ${s.note}`).join('\n\n');
   return [
@@ -423,6 +443,7 @@ async function runJob(job, deps) {
       const refRaw = await chat(job, MODEL_REFLECT, [{ role: 'user', content: reflectPrompt(job) }], { maxTokens: 700, json: true });
       const ref = jsonFrom(refRaw) || {};
       job.reflect = { gaps: ref.gaps || [], conflicts: ref.conflicts || [] };
+      jevShadowEnough(job, ref, round); // Part 236: one log line, never awaited
       const followups = (ref.enough ? [] : (ref.new_queries || [])).slice(0, 4).map(String);
       if (!followups.length) break;
       const room = Math.max(0, d.sources + 4 - job.sources.length); // follow-ups may stretch the budget slightly
@@ -660,5 +681,5 @@ function attachResearch(app, deps = {}) {
 module.exports = {
   attachResearch,
   researchDesk: { createJob, getJob, cancelJob, enabled, disabledWhy, DEPTHS },
-  _internals: { runJob, DEPTHS, jobPublic, store },
+  _internals: { runJob, DEPTHS, jobPublic, store, jevShadowEnough },
 };

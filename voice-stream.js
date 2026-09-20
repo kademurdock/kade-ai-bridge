@@ -1765,32 +1765,79 @@ function gateGreeting(session, agentName) {
   return `Hey — this is ${agentName} with Kade-AI. I don't recognize this number, and this line is for members — so tell me quick: are you calling somebody back, leaving a message, or asking about an account?`;
 }
 
+/* Part 236 (Sep 20 2026) — WHEN THE REGEX HEARD NOTHING. The four GATE_*_RE
+ * lists are the words somebody thought of in August. "I got a voicemail from
+ * this number" is a callback, "can you have her ring me" is a message, and
+ * neither is in a list — so a real caller with a real reason takes a strike,
+ * and the second strike hangs up on them. And at "anything to add, or are we
+ * good?", any unknown answer under twelve characters ("um one more", "oh
+ * hang on") reads as DONE and the line drops.
+ *
+ * So ONLY when no regex matched, Jev (jev.js) is asked one choice question
+ * over the utterance, with 700 ms to answer because a person is holding a
+ * phone. What it may do:
+ *   purpose:  callback / message / account -> the same branch the regex
+ *             would have taken. It can spare a strike; it cannot add one.
+ *   msg_done: `more` -> keeps the line open where the short-utterance rule
+ *             would have hung up. `done` -> the same deliver-and-goodbye the
+ *             done regex runs (no new hangup route), needs 0.95, and the words
+ *             are appended to the message FIRST, so if Jev is wrong the caller
+ *             loses nothing they said.
+ * `unclear`, low confidence, a timeout, no key: today's behaviour, exactly.
+ * Trial numbers sit beside the questions in jev.js. Kill: KADE_JEV_GATE=0. */
+let JEV = null;
+try { JEV = require('./jev'); } catch (e) { console.warn('[jev] not loaded (voice unaffected):', e.message); }
+async function gateJevRead(step, asked, t, jev = JEV) {
+  if (!jev || !jev.enabled('KADE_JEV_GATE') || t.length < 2) return null;
+  try {
+    const got = await jev.gateIntent(step, asked, t);
+    const act = jev.gateDecide(step, got);
+    console.log(`[gate] jev ${step}: ${got.choice} conf=${got.confidence.toFixed(2)} -> ${act || 'no change'}`);
+    return act;
+  } catch (e) { console.warn('[gate] jev read failed (regex verdict stands):', e.message); return null; }
+}
+
+// Part 236: the agent-pick flow's "is that even a name" read (used far below,
+// beside "Did you mean"). True ONLY on a confident not-a-name; every failure
+// is false, which is today's behaviour.
+async function jevSaysNotAName(text, jev = JEV) {
+  if (!jev || !jev.enabled('KADE_JEV_SWITCH')) return false;
+  try {
+    const p = await jev.namingSomeone(text);
+    console.log(`[voice-stream] jev agent-pick read: naming p=${p.toFixed(2)}`);
+    return p < jev.SWITCH_NOT_A_NAME_P;
+  } catch (e) { console.warn('[voice-stream] jev agent-pick read failed (asking "did you mean" as before):', e.message); return false; }
+}
+
 async function handleGateTurn(session, text) {
   const g = session.gate;
   const t = String(text || '').trim();
   console.log(`[gate] ${session.from} step=${g.step} "${t.slice(0, 60)}"`);
   switch (g.step) {
     case 'purpose': {
+      // Part 236: regex first, exactly as before. Jev only when all of them missed.
+      const rxHit = (g.cb && REG_YES_RE.test(t)) || GATE_CALLBACK_RE.test(t) || GATE_ACCOUNT_RE.test(t) || REG_INTENT_RE.test(t) || GATE_MESSAGE_RE.test(t);
+      const jv = rxHit ? null : await gateJevRead('purpose', 'Are you calling somebody back, leaving a message, or asking about an account?', t);
       // Callback-first: if we prematched their number to an outbound call,
       // a bare "yeah" on the greeting is them confirming exactly that.
-      if (g.cb && (GATE_CALLBACK_RE.test(t) || REG_YES_RE.test(t))) {
+      if (g.cb && (GATE_CALLBACK_RE.test(t) || REG_YES_RE.test(t) || jv === 'callback')) {
         g.step = 'msg_body';
         const who = g.cb.userName ? ` straight to ${g.cb.userName}` : ' along';
         await speak(session, `Perfect. Go ahead with the message whenever you're ready — I'll pass it${who}.`, session.voice);
         return;
       }
-      if (GATE_CALLBACK_RE.test(t)) {
+      if (GATE_CALLBACK_RE.test(t) || jv === 'callback') {
         // Claims a callback but the log has nothing for this number.
         g.step = 'msg_body';
         await speak(session, `Hm — I don't show an outgoing call to this number lately, but no matter. Go ahead with the message and who it's for, and I'll get it where it goes.`, session.voice);
         return;
       }
-      if (GATE_ACCOUNT_RE.test(t) || REG_INTENT_RE.test(t)) {
+      if (GATE_ACCOUNT_RE.test(t) || REG_INTENT_RE.test(t) || jv === 'account') {
         g.step = 'door_name';
         await speak(session, `Accounts here are personal invites — but I can ring the front door for you right now. What's your name?`, session.voice);
         return;
       }
-      if (GATE_MESSAGE_RE.test(t)) {
+      if (GATE_MESSAGE_RE.test(t) || jv === 'message') {
         g.step = 'msg_body';
         await speak(session, `Sure — go ahead with the message.`, session.voice);
         return;
@@ -1818,7 +1865,20 @@ async function handleGateTurn(session, text) {
       return;
     }
     case 'msg_done': {
-      if (GATE_DONE_RE.test(t) || (!GATE_MORE_RE.test(t) && t.length < 12)) {
+      // Part 236: Jev only when neither regex spoke. `more` can rescue a short
+      // "um one more" from the under-twelve rule; `done` can end a long
+      // "I think that covers everything, thank you" — and keeps the words.
+      const rxSpoke = GATE_DONE_RE.test(t) || GATE_MORE_RE.test(t);
+      const jv = rxSpoke ? null : await gateJevRead('msg_done', 'Anything to add, or are we good?', t);
+      if (jv === 'more' && t.length < 12) {
+        g.message = (g.message ? g.message + ' ' : '') + t.slice(0, 700 - (g.message ? g.message.length : 0));
+        await speak(session, `Go ahead — I'm listening.`, session.voice);
+        return;
+      }
+      if (jv === 'done' && t.length >= 12) {
+        g.message = (g.message ? g.message + ' ' : '') + t.slice(0, 700 - (g.message ? g.message.length : 0));
+      }
+      if (GATE_DONE_RE.test(t) || (!GATE_MORE_RE.test(t) && t.length < 12) || jv === 'done') {
         const ok = await gateDeliver(session);
         await gateHangup(session, ok
           ? `It's delivered — they'll see it on their end. Thanks for calling, take care now!`
@@ -2173,6 +2233,24 @@ async function handleUtterance(session, text) {
       const r = fuzzyFindAgent(agents, text);
       if (r && r.confidence >= 0.6) {
         await applySwitch(r.agent);
+        return;
+      }
+      /* Part 236 (Sep 20 2026) — the 0.4 band is "half the letters line up",
+       * and with 223 names on the roster half the letters of nearly anything
+       * line up with somebody — so a plain sentence said after "who would you
+       * like?" can come back as "Did you mean <a stranger>? Yes or no." (the
+       * Aug 11 stoplist above is the same disease on the bare-name path).
+       * Here, and only here, Jev (jev.js)
+       * is asked whether the person is naming anyone at all; when it is sure
+       * they are not (p < 0.08 — mangled names scored 0.26 and up in the
+       * trial) the guess is dropped and they hear the ordinary "couldn't
+       * match that" line instead. It can take a question away; it can never
+       * switch anybody. 600 ms, and any failure asks "did you mean" as before.
+       * (The 0.6 gate in extractSwitchTarget never asks "did you mean", so
+       * there is nothing for Jev to do there.) Kill: KADE_JEV_SWITCH=0. */
+      if (r && r.agent && await jevSaysNotAName(text)) {
+        await speak(session, "I couldn't match that name. Say just the name one more time, or say never mind.", session.voice);
+        session._awaitAgentPick = true;
         return;
       }
       if (r && r.agent) {
