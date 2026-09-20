@@ -67,13 +67,14 @@ const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const ERRANDS_FILE = path.join(DATA_DIR, 'errands.json');
 const RECEIPTS_FILE = path.join(DATA_DIR, 'errand-receipts.jsonl');
 
-const MOONSHOT_URL = (process.env.MOONSHOT_URL || 'https://api.moonshot.ai/v1').replace(/\/$/, '');
-const MOONSHOT_KEY = process.env.MOONSHOT_KEY || '';
-const MODEL_PLAN = process.env.ERRAND_PLAN_MODEL || 'kimi-k2.6';
-const MODEL_WRITE = process.env.ERRAND_WRITE_MODEL || 'kimi-k2.6';
+/* Sep 20 2026: both were kimi-k2.6 on Moonshot direct until that account ran
+ * dry; see llm.js. A kimi-* name in either env var still routes to Moonshot. */
+const llm = require('./llm');
+const MODEL_PLAN = process.env.ERRAND_PLAN_MODEL || llm.DEFAULT_MODEL;
+const MODEL_WRITE = process.env.ERRAND_WRITE_MODEL || llm.DEFAULT_MODEL;
 
 /* $/M tokens. Same table research.js carries; override with ERRAND_PRICES. */
-let PRICES = { 'kimi-k3': { in: 3, out: 15 }, 'kimi-k2.6': { in: 0.95, out: 4 } };
+let PRICES = { ...llm.PRICES };
 try { if (process.env.ERRAND_PRICES) PRICES = { ...PRICES, ...JSON.parse(process.env.ERRAND_PRICES) }; } catch { /* keep defaults */ }
 
 const BUDGET_USD = Math.max(0.02, parseFloat(process.env.ERRAND_BUDGET_USD) || 0.25);
@@ -113,10 +114,10 @@ const EXTRA_USERS = String(process.env.ERRAND_USERS || '').split(',').map((s) =>
 /* The statuses that mean "this errand is still someone's problem." */
 const ACTIVE = ['queued', 'running', 'awaiting_confirm'];
 
-function enabled() { return process.env.ERRANDS_ENABLED !== '0' && !!MOONSHOT_KEY; }
+function enabled() { return process.env.ERRANDS_ENABLED !== '0' && !llm.missingKey([MODEL_PLAN, MODEL_WRITE]); }
 function disabledWhy() {
   if (process.env.ERRANDS_ENABLED === '0') return 'errands are switched off (ERRANDS_ENABLED=0)';
-  if (!MOONSHOT_KEY) return 'MOONSHOT_KEY is not set on the bridge';
+  if (llm.missingKey([MODEL_PLAN, MODEL_WRITE])) return llm.missingKey([MODEL_PLAN, MODEL_WRITE]);
   return '';
 }
 function userAllowed(userId) {
@@ -188,20 +189,14 @@ function overBudget(errand) { return errand.costUsd >= errand.budgetUsd; }
  * token budget and content comes back EMPTY with finish_reason 'length'.
  * Both are load-bearing — do not "tidy" them away. */
 async function askModel(errand, model, messages, { maxTokens = 900, json = false } = {}) {
-  const mk = (budget) => {
-    const body = { model, messages, max_tokens: budget, reasoning_effort: 'none' };
-    if (json) body.response_format = { type: 'json_object' };
-    return body;
-  };
+  const mk = (budget) => llm.request(model, messages, { maxTokens: budget, json, effort: 'none' });
   let budget = maxTokens;
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await sleep([2000, 8000][attempt - 1] || 8000);
     try {
-      const r = await axios.post(`${MOONSHOT_URL}/chat/completions`, mk(budget), {
-        timeout: 120000,
-        headers: { Authorization: `Bearer ${MOONSHOT_KEY}`, 'Content-Type': 'application/json' },
-      });
+      const call = mk(budget);
+      const r = await axios.post(call.url, call.body, { timeout: 120000, headers: call.headers });
       const usage = r.data?.usage || {};
       const cost = tally(errand, model, usage.prompt_tokens || 0, usage.completion_tokens || 0);
       const choice = r.data?.choices?.[0] || {};

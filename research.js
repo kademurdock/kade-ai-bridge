@@ -55,18 +55,21 @@ const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const JOBS_FILE = path.join(DATA_DIR, 'research-jobs.json');
 const RECEIPTS_FILE = path.join(DATA_DIR, 'research-receipts.jsonl');
 
-const MOONSHOT_URL = (process.env.MOONSHOT_URL || 'https://api.moonshot.ai/v1').replace(/\/$/, '');
-const MOONSHOT_KEY = process.env.MOONSHOT_KEY || '';
+const llm = require('./llm');
 const TAVILY_KEY = process.env.TAVILY_API_KEY || '';
 
-const MODEL_PLAN = process.env.RESEARCH_PLAN_MODEL || 'kimi-k2.6';
-const MODEL_DISTILL = process.env.RESEARCH_DISTILL_MODEL || 'kimi-k2.6';
-const MODEL_REFLECT = process.env.RESEARCH_REFLECT_MODEL || 'kimi-k3';
-const MODEL_SYNTH = process.env.RESEARCH_SYNTH_MODEL || 'kimi-k3';
-const MODEL_SYNTH_QUICK = process.env.RESEARCH_SYNTH_QUICK_MODEL || 'kimi-k2.6';
+/* Sep 20 2026: all five were kimi-k2.6 / kimi-k3 on Moonshot direct until that
+ * account ran dry; see llm.js. A kimi-* name in any of these env vars still
+ * routes to Moonshot. */
+const MODEL_PLAN = process.env.RESEARCH_PLAN_MODEL || llm.DEFAULT_MODEL;
+const MODEL_DISTILL = process.env.RESEARCH_DISTILL_MODEL || llm.DEFAULT_MODEL;
+const MODEL_REFLECT = process.env.RESEARCH_REFLECT_MODEL || llm.DEFAULT_MODEL;
+const MODEL_SYNTH = process.env.RESEARCH_SYNTH_MODEL || llm.DEFAULT_MODEL;
+const MODEL_SYNTH_QUICK = process.env.RESEARCH_SYNTH_QUICK_MODEL || llm.DEFAULT_MODEL;
+const MODELS = [MODEL_PLAN, MODEL_DISTILL, MODEL_REFLECT, MODEL_SYNTH, MODEL_SYNTH_QUICK];
 
 /* $/M tokens — env RESEARCH_PRICES ({"model":{"in":x,"out":y}}) overrides. */
-let PRICES = { 'kimi-k3': { in: 3, out: 15 }, 'kimi-k2.6': { in: 0.95, out: 4 } };
+let PRICES = { ...llm.PRICES };
 try { if (process.env.RESEARCH_PRICES) PRICES = { ...PRICES, ...JSON.parse(process.env.RESEARCH_PRICES) }; } catch { /* keep defaults */ }
 
 const DAILY_CAP = Math.max(1, parseInt(process.env.RESEARCH_DAILY_CAP, 10) || 8);
@@ -81,10 +84,10 @@ const DEPTHS = {
   deep:     { queries: 10, advanced: 4, sources: 18, reflectRounds: 2, words: 1600, perSourceChars: 9000,  synthModel: MODEL_SYNTH,       etaMin: 8 },
 };
 
-function enabled() { return process.env.RESEARCH_ENABLED !== '0' && !!MOONSHOT_KEY && !!TAVILY_KEY; }
+function enabled() { return process.env.RESEARCH_ENABLED !== '0' && !llm.missingKey(MODELS) && !!TAVILY_KEY; }
 function disabledWhy() {
   if (process.env.RESEARCH_ENABLED === '0') return 'research is switched off (RESEARCH_ENABLED=0)';
-  if (!MOONSHOT_KEY) return 'MOONSHOT_KEY is not set on the bridge';
+  if (llm.missingKey(MODELS)) return llm.missingKey(MODELS);
   if (!TAVILY_KEY) return 'TAVILY_API_KEY is not set on the bridge';
   return '';
 }
@@ -123,20 +126,14 @@ function centralDateSpoken() {
  * future Moonshot default shifts under us. */
 const SYNTH_EFFORT = process.env.RESEARCH_SYNTH_EFFORT || 'none';
 async function chat(job, model, messages, { maxTokens = 1200, json = false, effort = 'none' } = {}) {
-  const mk = (budget) => {
-    const body = { model, messages, max_tokens: budget, reasoning_effort: effort };
-    if (json) body.response_format = { type: 'json_object' };
-    return body;
-  };
+  const mk = (budget) => llm.request(model, messages, { maxTokens: budget, json, effort });
   let lastErr;
   let budget = effort === 'none' ? maxTokens : maxTokens + 4000; // reasoning rides the same budget
   for (let attempt = 0; attempt < 4; attempt++) {
     if (attempt) await sleep([2000, 8000, 20000][attempt - 1] || 20000); // the armadillo lesson: patience beats a dead turn
     try {
-      const r = await axios.post(`${MOONSHOT_URL}/chat/completions`, mk(budget), {
-        timeout: 240000,
-        headers: { Authorization: `Bearer ${MOONSHOT_KEY}`, 'Content-Type': 'application/json' },
-      });
+      const call = mk(budget);
+      const r = await axios.post(call.url, call.body, { timeout: 240000, headers: call.headers });
       const usage = r.data?.usage || {};
       tallyTokens(job, model, usage.prompt_tokens || 0, usage.completion_tokens || 0);
       const choice = r.data?.choices?.[0] || {};

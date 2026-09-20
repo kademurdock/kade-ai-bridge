@@ -36,6 +36,27 @@ const PROVIDERS = {
     keyEnv: 'DEEPSEEK_API_KEY',
     shape(body) { return { ...body, temperature: body.temperature != null ? body.temperature : 0.3 }; },
   },
+  /* Sep 20 2026: the Moonshot pot ran dry and Kade moved everything that used
+   * it to DeepSeek V4.1 Flash. deepseek/* models are held to hosts that keep no
+   * copy of her data, fast ones first: the chat gateway's rule and order
+   * (reframe-proxy deepseek.js), because a driving step can carry what is on
+   * her screen. Other models (the vision tier) get no host pin. */
+  openrouter: {
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    keyEnv: 'OPENROUTER_KEY',
+    shape(body, effort) {
+      const shaped = {
+        ...body,
+        temperature: body.temperature != null ? body.temperature : 0.3,
+        reasoning: !effort || effort === 'none' ? { enabled: false } : { enabled: true, effort, exclude: true },
+      };
+      if (effort && effort !== 'none') shaped.max_tokens = Math.max(body.max_tokens || 0, 3000);
+      if (/^deepseek\//i.test(String(body.model))) {
+        shaped.provider = { zdr: true, data_collection: 'deny', order: ['together', 'parasail', 'modal', 'makora'], ignore: ['morph', 'relace', 'deepinfra', 'digitalocean'], allow_fallbacks: true };
+      }
+      return shaped;
+    },
+  },
   // Generic OpenAI-compatible (e.g. the reframe-proxy) — pass a url explicitly.
   openai: {
     url: null,
@@ -51,11 +72,19 @@ const PROVIDERS = {
 // Chosen with Kade Aug 14: k3 plans, DeepSeek runs the cheap text steps, k2.6
 // handles vision — verified live (DeepSeek's chat API rejects image input, so
 // vision must be k2.6). k2.6 is the always-funded fallback for every tier.
+//
+// Sep 20 2026: Moonshot is unfunded and so is the direct DeepSeek account, so
+// plan, step and the fallback all run deepseek/deepseek-v4.1-flash through
+// OpenRouter (the funded pot). That model takes no image input, so the vision
+// tier moved to the platform's existing Gemini flash-lite on the same pot. The
+// moonshot and deepseek-direct providers stay defined; KADE_NVDA_TIERS can
+// point a tier back at them.
+const FLASH = 'deepseek/deepseek-v4.1-flash';
 const DEFAULT_TIERS = {
-  plan: { provider: 'moonshot', model: 'kimi-k3', effort: 'medium', fallback: 'step_fb' },
-  step: { provider: 'deepseek', model: 'deepseek-v4-pro', fallback: 'step_fb' },
-  vision: { provider: 'moonshot', model: 'kimi-k2.6', effort: 'none' },
-  step_fb: { provider: 'moonshot', model: 'kimi-k2.6', effort: 'none' }, // funded pot
+  plan: { provider: 'openrouter', model: FLASH, effort: 'medium', fallback: 'step_fb' },
+  step: { provider: 'openrouter', model: FLASH, effort: 'none', fallback: 'step_fb' },
+  vision: { provider: 'openrouter', model: 'google/gemini-3.1-flash-lite', effort: 'none' },
+  step_fb: { provider: 'openrouter', model: FLASH, effort: 'none' }, // funded pot
 };
 
 function loadTierOverrides() {

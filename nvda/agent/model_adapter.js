@@ -71,9 +71,11 @@ function makeModelBrain(opts = {}) {
   const router = opts.router || new ModelRouter(opts.routerOpts || {});
   // Fail fast if nothing can answer, so the co-listener default never silently
   // becomes a paid path.
-  const probeKey = router.getKey('MOONSHOT_KEY');
+  // Sep 20 2026: probes the key the step tier actually uses (was MOONSHOT_KEY).
+  const probeEnv = (router.providers[router.pick('step').provider] || {}).keyEnv;
+  const probeKey = probeEnv ? router.getKey(probeEnv) : null;
   if (!probeKey && !opts.allowUnkeyed) {
-    throw new Error('model brain not configured: set MOONSHOT_KEY (k3/k2.6) or pass a configured router. Off by design until Kade says go.');
+    throw new Error(`model brain not configured: set ${probeEnv || 'a provider key'} or pass a configured router. Off by design until Kade says go.`);
   }
   const chooseTier = opts.tierFor || tierFor;
   const maxTokens = opts.maxTokens || 400;
