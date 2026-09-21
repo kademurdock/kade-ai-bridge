@@ -371,7 +371,33 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
           // pair. Same cap check as the judges; never throws.
           const jv = state.spentTodayUsd >= DAILY_CAP_USD ? null : await jevChair(probe, readable, jev, log);
           if (jv) { row.judgeCostUsd += jv.cost; spend(jv.cost); if (JEV_COUNTS()) scores.push(jv.score); }
-          const perRow = { id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' };
+          /* Part 239 (Sep 21 2026) — JEV COVERS A JUDGE THAT DID NOT SPEAK.
+           * Kade approved the whole Jev ideas list, and this was the concrete
+           * complaint in it: the nightly spoken line has been ending "1 judge
+           * answers could not be read, so the score is thinner than it looks".
+           * When a flash judge returns unreadable content its FLAGS are lost
+           * too, so a probe's flag counts come out of one judge instead of
+           * two and the flag totals quietly undercount.
+           *
+           * Jev has already read the same reply and answers the same seven
+           * yes/no questions natively, with nothing to parse and so nothing
+           * to fail to parse. So when a judge could not be read, Jev's flags
+           * stand in for the missing one — and ONLY the flags.
+           *
+           * NOT the score. The score stays the LLM pair's, and `agreement`
+           * stays null, because the whole worth of the nightly graph is that
+           * the same graders grade every night: a third grader joining the
+           * mean would read as a step in Kiana's line that is really a step
+           * in the jury. That hold stands until BATTERY_JEV_COUNTS=1 is set
+           * deliberately, on a few weeks of rows. `jevFilled` records that
+           * this happened so the ledger never hides it. */
+          let jevFilled = 0;
+          if (jv && unparsed > 0) {
+            for (const k of jv.flags) flags[k] = (flags[k] || 0) + 1;
+            jevFilled = unparsed;
+            log.warn(`[battery] ${probe.id}: ${unparsed} judge answer(s) unreadable — Jev's flags stood in (score untouched)`);
+          }
+          const perRow = { id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, jevFilled, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' };
           if (jv) perRow.jev = { score: jv.score, confidence: jv.confidence, flags: jv.flags, ms: jv.ms };
           per.push(perRow);
         }
@@ -384,6 +410,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
           score: scored.length ? Math.round(scored.reduce((a, p) => a + p.mean, 0) / scored.length) : null,
           scored: scored.length,
           unparsed: per.reduce((a, p) => a + (p.unparsed || 0), 0),
+          jevFilled: per.reduce((a, p) => a + (p.jevFilled || 0), 0),
           errors: per.filter((p) => p.error).length,
           agreement: agreements.length ? Math.round(agreements.reduce((a, b) => a + b, 0) / agreements.length) : null,
           flags: flagTotals,
