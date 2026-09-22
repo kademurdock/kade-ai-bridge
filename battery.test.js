@@ -1,7 +1,33 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { PROBES, FLAG_KEYS, parseJudge, judgePrompt } = require('./battery');
+const { PROBES, FLAG_KEYS, parseJudge, judgePrompt, judgeWithRetry } = require('./battery');
+
+/* ── Sep 22 2026: a judge that thinks past its budget gets one bigger try ── */
+const quiet = { warn() {} };
+test('a judge that ran out of budget thinking is retried once with a bigger budget', async () => {
+  const budgets = [];
+  const replies = [
+    { choices: [{ message: { content: null }, finish_reason: 'length' }], usage: { completion_tokens: 2500, cost: 0.0006 } },
+    { choices: [{ message: { content: '{"score": 80, "flags": {}}' }, finish_reason: 'stop' }], usage: { completion_tokens: 3100, cost: 0.0008 } },
+  ];
+  const out = await judgeWithRetry(async (b) => { budgets.push(b); return replies.shift(); }, 'm', quiet);
+  assert.deepEqual(budgets, [2500, 6000]);
+  assert.equal(out.attempts, 2);
+  assert.equal(parseJudge(out.content).score, 80);
+  assert.ok(Math.abs(out.cost - 0.0014) < 1e-9, 'both calls count against the cap');
+});
+test('an answer on the first try, or an empty answer for any other reason, is not retried', async () => {
+  let calls = 0;
+  const ok = await judgeWithRetry(async () => { calls++; return { choices: [{ message: { content: '{"score": 90}' }, finish_reason: 'stop' }], usage: {} }; }, 'm', quiet);
+  assert.equal(calls, 1); assert.equal(ok.attempts, 1); assert.equal(ok.estimated, true);
+  calls = 0;
+  const filtered = await judgeWithRetry(async () => { calls++; return { choices: [{ message: { content: null }, finish_reason: 'content_filter' }], usage: {} }; }, 'm', quiet);
+  assert.equal(calls, 1); assert.equal(filtered.content, null);
+  calls = 0;
+  const twice = await judgeWithRetry(async () => { calls++; return { choices: [{ message: { content: null }, finish_reason: 'length' }], usage: {} }; }, 'm', quiet);
+  assert.equal(calls, 2, 'never more than one retry'); assert.equal(twice.content, null);
+});
 
 test('twelve probes, each with id, rule, want, since', () => {
   assert.equal(PROBES.length, 12);

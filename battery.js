@@ -162,6 +162,37 @@ function judgePrompt(probe, reply) {
   ].join('\n');
 }
 
+/* Sep 22 2026: deepseek-v4-flash reasons whether asked to or not, and on
+ * about one call in four it spent all 2,500 tokens thinking and answered
+ * nothing (finish=length, content null): six probes on the Sep 22 07:00Z run,
+ * which is why the spoken line kept saying the score was thinner than it
+ * looked. Swapping the judge would break the graph's comparability, so the
+ * same judge gets ONE retry with a bigger budget, only for that exact failure.
+ * Both calls are costed, so the daily cap still sees them. */
+const JUDGE_BUDGET = 2500;
+const JUDGE_RETRY_BUDGET = 6000;
+function judgeCost(usage) {
+  const u = usage || {};
+  return Number.isFinite(Number(u.cost)) ? Number(u.cost)
+    : ((u.prompt_tokens || 600) * 0.10 + (u.completion_tokens || 80) * 0.40) / 1e6;
+}
+async function judgeWithRetry(post, model, log = console) {
+  let cost = 0; let estimated = false; let attempts = 0; let content = null;
+  for (const budget of [JUDGE_BUDGET, JUDGE_RETRY_BUDGET]) {
+    attempts++;
+    const data = await post(budget);
+    const choice = data && data.choices && data.choices[0];
+    const usage = (data && data.usage) || {};
+    cost += judgeCost(usage);
+    if (!Number.isFinite(Number(usage.cost))) estimated = true;
+    content = choice && choice.message && choice.message.content;
+    if (content) break;
+    log.warn(`[battery] judge ${model} returned no content (finish=${choice && choice.finish_reason}, completion_tokens=${usage.completion_tokens}, budget=${budget})`);
+    if (!choice || choice.finish_reason !== 'length') break;
+  }
+  return { content: content || null, cost, estimated, attempts };
+}
+
 function parseJudge(text) {
   const m = String(text || '').match(/\{[\s\S]*\}/);
   if (!m) return null;
@@ -235,7 +266,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
   }
 
   async function judge(model, probe, reply) {
-    const r = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    const post = (maxTokens) => axios.post('https://openrouter.ai/api/v1/chat/completions', {
       model,
       messages: [{ role: 'user', content: judgePrompt(probe, reply) }],
       temperature: 0,
@@ -247,20 +278,16 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
        * tokens ($0.00007), deepseek ~1100 ($0.0005). ~1.5 cents a night. */
       /* Run 2 (00:04Z): deepseek still hit finish=length at 1200 on 5 of 24
        * calls (glm once). 2500 is the budget; a thin score still says so. */
-      max_tokens: 2500,
+      max_tokens: maxTokens,
       reasoning: { effort: 'low' },
     }, {
       headers: { Authorization: `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'User-Agent': UA,
         'HTTP-Referer': 'https://kademurdock.com', 'X-Title': 'kade-ai persona battery' },
-      timeout: 60000,
-    });
-    const content = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
-    const usage = (r.data && r.data.usage) || {};
-    if (!content) log.warn(`[battery] judge ${model} returned no content (finish=${r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].finish_reason}, completion_tokens=${usage.completion_tokens})`);
-    // OpenRouter reports cost when usage accounting is on; otherwise estimate flash-class ($0.10/M in, $0.40/M out).
-    const cost = Number.isFinite(Number(usage.cost)) ? Number(usage.cost)
-      : ((usage.prompt_tokens || 600) * 0.10 + (usage.completion_tokens || 80) * 0.40) / 1e6;
-    return { parsed: parseJudge(content), cost, estimated: !Number.isFinite(Number(usage.cost)) };
+      timeout: 90000,
+    }).then((r) => r.data);
+    const { content, cost, estimated, attempts } = await judgeWithRetry(post, model, log);
+    if (attempts > 1) log.warn(`[battery] judge ${model} thought past its budget; the retry ${content ? 'answered' : 'was empty too'}`);
+    return { parsed: parseJudge(content), cost, estimated };
   }
 
   async function listSeatCards() {
@@ -537,4 +564,4 @@ function attachBattery(app, { bridgeSecretOk, proxyUrl, proxySecret, openrouterK
   return battery;
 }
 
-module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt, jevChair };
+module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt, jevChair, judgeWithRetry };
