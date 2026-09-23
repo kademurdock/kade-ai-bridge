@@ -94,7 +94,7 @@ function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, pro
       agentId: kianaAgentId, agentName: kianaName, title: kianaName,
       body: text, userId: u.userId, category: null, route: null,
     });
-    return { text, sent: !!(out && out.ok), notify: out };
+    return { text, sent: !!(out && out.ok && out.sent > 0), notify: out };
   }
 
   async function tick(force = false, onlyUserId = null) {

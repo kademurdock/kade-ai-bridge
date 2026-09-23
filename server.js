@@ -21,6 +21,7 @@ const crypto   = require('crypto');
 const fs       = require('fs');
 const path     = require('path');
 const os       = require('os');
+const testSeatPolicy = require('./test-seat-policy');
 
 const app  = express();
 const port = process.env.PORT || 3000;
@@ -939,6 +940,10 @@ function sendApnsPush(deviceToken, title, body, opts = {}) {
 const fcm = require('./fcm');
 function sendPush(deviceToken, title, body, opts = {}) {
   const meta = pushTokens.get(deviceToken);
+  // Final boundary also covers broadcasts, direct-token sends and call rings.
+  if (testSeatPolicy.isTestUser(meta && meta.userId)) {
+    return Promise.resolve({ status: 0, ...testSeatPolicy.blockedResult() });
+  }
   const platform = (meta && meta.platform) || (fcm.looksLikeFcmToken(deviceToken) ? 'android' : 'ios');
   if (platform === 'android') return fcm.sendFcmPush(deviceToken, title, body, opts);
   return sendApnsPush(deviceToken, title, body, opts);
@@ -1122,6 +1127,8 @@ function recordBroadcast(entry) {
  * dropped, both silent. A result someone requested is not outreach and must
  * not compete with outreach for budget. */
 async function runNotify({ agentId, agentName, title, body, urgent, userId, broadcast, adminAlert, category, route, requested, runId }) {
+  // Before quiet-hour queuing or urgency handling: tests never reach phones.
+  if (testSeatPolicy.isTestUser(userId)) return testSeatPolicy.blockedResult();
   /* Part 83 (her report: tapping the bug-report push opened a NEW
    * CONVERSATION — the app's launch default — instead of the bug window):
    * pushes with a real home now carry one. `route` is a short screen name
@@ -3322,6 +3329,7 @@ app.post('/reminders', (req, res) => {
   if (!notifySecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' });
   const userId = String(b.userId || '').slice(0, 64);
   if (!userId) return res.status(400).json({ error: 'userId required' });
+  if (testSeatPolicy.isTestUser(userId)) return res.json(testSeatPolicy.blockedResult());
   const text = String(b.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required -- the reminder message itself' });
 
@@ -5983,4 +5991,3 @@ server.listen(port, () => {
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
   if (!twilioClient) console.warn('[bridge] Twilio not configured -- set env vars');
 });
-
