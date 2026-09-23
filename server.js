@@ -2256,6 +2256,7 @@ app.post('/outbound-call', async (req, res) => {
   if (!bridgeSecretOk(req, secret)) return res.status(403).json({ error: 'Unauthorized' });
   if (!twilioClient) return res.status(500).json({ error: 'Twilio not configured' });
   if (!userId) return res.status(400).json({ error: 'userId required — whose spend page does this call bill to?' });
+  if (testSeatPolicy.isTestUser(userId)) return res.status(403).json({ error: 'Outbound calls are disabled for this test account', ...testSeatPolicy.blockedResult() });
   if (!purpose || String(purpose).trim().length < 3) {
     return res.status(400).json({ error: 'purpose required — a short plain-language reason for the call' });
   }
@@ -3404,23 +3405,32 @@ app.delete('/reminders', (req, res) => {
 });
 
 // Minute tick -- fire each due reminder through the guardrailed notify path,
-// then delete it. urgent:true so a reminder actually fires at the moment the
+// retain failures until a next-chat receipt is saved. urgent:true so a reminder fires at the moment the
 // user picked even inside quiet hours -- unlike outreach check-ins
 // (agent-initiated, optional timing), a reminder is a specific ask for a
 // specific moment, so quiet hours shouldn't silently eat it. Cooldown and
 // daily caps still apply (shared runNotify) -- only the quiet-hours window is
 // bypassed.
+const remindersInFlight = new Set();
 setInterval(() => {
   if (reminders.size === 0) return;
   try {
     const now = Date.now();
     for (const sub of reminders.values()) {
-      if (new Date(sub.fireAt).getTime() <= now) {
-        reminders.delete(sub.id);
-        saveReminders();
-        runNotify({ agentId: sub.agentId, agentName: sub.agentName, title: sub.title || sub.agentName, body: sub.text, urgent: true, userId: sub.userId })
-          .then((r) => console.log(`[reminders] fired ${sub.id}: ${r.ok ? ('sent=' + r.sent) : ('err=' + r.error)}`))
-          .catch((e) => console.error(`[reminders] fire failed ${sub.id}: ${e.message}`));
+      if (new Date(sub.fireAt).getTime() <= now && !remindersInFlight.has(sub.id)) {
+        remindersInFlight.add(sub.id);
+        require('./reminder-delivery').deliverReminder(sub, {
+          notify: r => runNotify({ agentId: r.agentId, agentName: r.agentName, title: r.title || r.agentName, body: r.text, urgent: true, userId: r.userId }),
+          queueMissed: r => axios.post(`${LIBRECHAT_URL}/api/kade/clock/reminder-missed`, {
+            userId: r.userId, reminderId: r.id, text: r.text, fireAt: r.fireAt,
+          }, { headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }, timeout: 15000 })
+            .then(r => { if (!r.data?.ok) throw new Error('Chat receipt was not accepted'); }),
+          save: saveReminders,
+          remove: id => { reminders.delete(id); saveReminders(); },
+          isTestUser: testSeatPolicy.isTestUser,
+        }).then(r => console.log(`[reminders] completed ${sub.id}: sent=${r.sent} chat=${!!r.queuedForChat}`))
+          .catch(e => console.error(`[reminders] receipt pending ${sub.id}: ${e.message}`))
+          .finally(() => remindersInFlight.delete(sub.id));
       }
     }
   } catch (e) {
