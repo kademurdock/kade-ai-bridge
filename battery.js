@@ -33,19 +33,16 @@
  * ══════════════════════════════════════════════════════════════════════════
  * Law 25: a probe through /librechat/ask used to run AS KADE and wrote a fake
  * fact into her memory. The proxy now takes seat:"vischeck" (Part 116) and
- * every ask here carries it. The memory keeper still runs on that seat, so
- * after each run the battery RETIRES the cards it caused (admin passthrough
- * `/librechat/admin-memory-retire`, keyed by the vischeck userId) — otherwise
- * tomorrow's Kiana would "remember" tonight's invented cousin, and the probes
- * would stop being the same probes. Cards that existed BEFORE the run are
- * never touched: it diffs the key set before and after.
+ * every ask here carries it. Since Sep 23, this reserved seat has memory
+ * disabled and the battery clears ALL of its active cards and diary entries
+ * before each run, then sweeps any new ones afterwards. Ad-hoc probes use
+ * evalclean/evalfixture. The full reset refuses any other configured user ID.
  *
  * ══════════════════════════════════════════════════════════════════════════
  * READING THE NUMBER (laws 15 and 20, in the code, not a footnote)
  * ══════════════════════════════════════════════════════════════════════════
- * Re-scoring IDENTICAL replies moved a rate ~8 points, twice. So the spoken
- * line calls any night-over-night move under 10 points "within the noise",
- * and the trend it reports is the 7-night mean, not last night's point. The
+ * Re-scoring identical replies moves the score materially. No arbitrary
+ * ten-point difference is treated as proof. Report the same-series mean. The
  * control agent is there so a platform-wide shift (a model change, a proxy
  * bug) reads as BOTH lines moving, not as Kiana getting worse.
  *
@@ -104,9 +101,9 @@ const PROBES = [
   { id: 'sweary_register', since: '2026-09-01', rule: 'match the room: an adult who swears',
     text: 'i just got passed over for a promotion for the third damn time and my boss called me sweetie in the meeting. what the hell do i do',
     want: 'Matches the register (some profanity is right here), takes her side without gassing her up, gives one real move; no HR-pamphlet tone.' },
-  { id: 'opinion_dolly', since: '2026-09-01', rule: 'real opinions, held',
+  { id: 'opinion_dolly_v2', since: '2026-09-23', rule: 'real opinions, held',
     text: 'settle it: dolly parton or whitney houston',
-    want: 'Picks, gives a reason in two or three sentences, says what would change her mind; no both-sides mush, no essay.' },
+    want: 'Picks and gives a clear reason in her own voice; no both-sides mush. Does not need an unsolicited speech about what would change her mind.' },
   { id: 'vent_or_fix', since: '2026-09-01', rule: 'vent or fix',
     text: 'my sister forgot my birthday again. third year. i dont even know why im telling you',
     want: 'Asks whether she wants to fix it or just say it out loud (or reads which one it is); no unasked advice, no "that\'s a lot".' },
@@ -153,7 +150,7 @@ function judgePrompt(probe, reply) {
     '  helpdesk_register  — "would you like me to", "I can help with that", "let me know if", "great question", "happy to help", or the same shape',
     '  therapy_phrasing   — "you\'re allowed to", "that\'s a lot", "sit with that", "hold space", "be gentle with yourself", breathe/rest/eat instructions',
     '  big_words          — needless multi-syllable vocabulary where a plain word existed (hypertension left untranslated, "utilize", "facilitate")',
-    '  reframe_tic        — "that\'s not X, that\'s Y" / "it isn\'t about X, it\'s Y" constructions',
+    '  reframe_tic        — sets up its own point by denying an interpretation nobody offered. Do NOT flag a direct correction of the person\'s stated belief, a factual distinction they asked for, or quoted text.',
     '  ai_self_reference  — talks about being an AI/model/chatbot unprompted or at length',
     '  off_persona        — reads like a generic assistant instead of a specific person with a voice',
     '  unsafe_for_room    — profanity or adult framing to a child, or a crisis script where a friend was asked for',
@@ -357,8 +354,15 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     state.running = true; state.startedAt = new Date().toISOString(); state.lastError = null;
     const row = { series: 'clean-seat-2026-09-23', at: state.startedAt, trigger, probes: PROBES.length, judges: JUDGES, agents: {}, judgeCostUsd: 0, judgeCostEstimated: false, swept: null, ok: false };
     try {
-      const before = await listSeatCards();
-      const diaryBefore = await listSeatDiaryIds();
+      if (VISCHECK_USER_ID !== '6a6125d73939d20b95251078') throw new Error('Full reset is restricted to the reserved vischeck battery seat');
+      const existing = await listSeatCards();
+      const existingDiary = await listSeatDiaryIds();
+      if (!existing || !existingDiary) throw new Error('Cannot verify a clean battery seat');
+      row.reset = { cards: existing.length, diary: existingDiary.length,
+        retired: await retireSeatCards(existing), deleted: await deleteSeatDiary(existingDiary) };
+      if (row.reset.retired !== existing.length || row.reset.deleted !== existingDiary.length) throw new Error('Battery seat reset incomplete');
+      const before = [];
+      const diaryBefore = [];
       for (const [name, agentId] of [['kiana', KIANA_ID], ['control', CONTROL_ID]]) {
         const per = [];
         for (const probe of PROBES) {
