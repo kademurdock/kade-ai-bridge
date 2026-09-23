@@ -65,3 +65,17 @@ test('explicit sign-out removes a token, while legacy omitted IDs preserve it', 
   assert.equal(ctx.pushTokens.has(token),false);
   assert.equal(out.unregistered,true);
 });
+
+test('a reminder cannot be confirmed when no phone is registered', () => {
+  const handlers = new Map();
+  const ctx = { app: {post:(route,fn)=>handlers.set(route,fn)}, testSeatPolicy:policy,
+    notifySecretOk:()=>true, tokensForUser:()=>[] };
+  vm.createContext(ctx);
+  const start=src.indexOf("app.post('/reminders'");
+  vm.runInContext(src.slice(start,src.indexOf("app.get('/reminders'",start)),ctx);
+  let out;
+  const res={json(v){out=v;return this;},status(){return this;}};
+  handlers.get('/reminders')({body:{userId:'unregistered-user',text:'test',in_minutes:2}},res);
+  assert.equal(out.ok,false);
+  assert.match(out.blocked,/No phone is registered/);
+});

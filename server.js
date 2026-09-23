@@ -3338,6 +3338,9 @@ app.post('/reminders', (req, res) => {
   const userId = String(b.userId || '').slice(0, 64);
   if (!userId) return res.status(400).json({ error: 'userId required' });
   if (testSeatPolicy.isTestUser(userId)) return res.json(testSeatPolicy.blockedResult());
+  if (tokensForUser(userId).length === 0) {
+    return res.json({ ok: false, sent: 0, blocked: 'No phone is registered for notifications. Open the Kade-AI app, sign in, and enable notifications before setting a phone reminder.' });
+  }
   const text = String(b.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required -- the reminder message itself' });
 

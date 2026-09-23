@@ -355,7 +355,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     if (!enabled()) return { started: false, reason: 'battery disabled or not configured' };
     if (state.running) return { started: false, reason: 'already running', startedAt: state.startedAt };
     state.running = true; state.startedAt = new Date().toISOString(); state.lastError = null;
-    const row = { at: state.startedAt, trigger, probes: PROBES.length, judges: JUDGES, agents: {}, judgeCostUsd: 0, judgeCostEstimated: false, swept: null, ok: false };
+    const row = { series: 'clean-seat-2026-09-23', at: state.startedAt, trigger, probes: PROBES.length, judges: JUDGES, agents: {}, judgeCostUsd: 0, judgeCostEstimated: false, swept: null, ok: false };
     try {
       const before = await listSeatCards();
       const diaryBefore = await listSeatDiaryIds();
@@ -425,6 +425,8 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
             log.warn(`[battery] ${probe.id}: ${unparsed} judge answer(s) unreadable — Jev's flags stood in (score untouched)`);
           }
           const perRow = { id: probe.id, ms: reply.ms, chars: reply.text.length, scores, unparsed, jevFilled, mean: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null, agreement, flags, quote: quotes[0] || '' };
+          perRow.reply = reply.text;
+          perRow.prompt = probe.text;
           if (jv) perRow.jev = { score: jv.score, confidence: jv.confidence, flags: jv.flags, ms: jv.ms };
           per.push(perRow);
         }
@@ -489,8 +491,9 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     // Run 1 scored 6 of 12 and the second run read as "UP 16, a real move"
     // against it -- a half-run is not a baseline.
     const full = (r) => r && r.agents && r.agents.kiana && (r.agents.kiana.scored || 0) >= 10;
-    const prev = runs.slice(0, -1).reverse().find(full) || null;
-    const week = runs.filter(full).slice(-7);
+    const comparable = runs.filter(r => (r.series || 'legacy') === (latest?.series || 'legacy'));
+    const prev = comparable.slice(0, -1).reverse().find(full) || null;
+    const week = comparable.filter(full).slice(-7);
     const mean = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null);
     const kWeek = mean(week.map((r) => r.agents.kiana && r.agents.kiana.score).filter((x) => x != null));
     const cWeek = mean(week.map((r) => r.agents.control && r.agents.control.score).filter((x) => x != null));
@@ -503,7 +506,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
       const bits = [`Persona battery, ${ageH < 30 ? 'last run' : `${Math.round(ageH / 24)} days ago`}: Kiana ${k.score} of 100 against the control's ${c.score}`];
       if (prev && prev.agents.kiana && prev.agents.kiana.score != null && k.score != null) {
         const d = k.score - prev.agents.kiana.score;
-        bits.push(Math.abs(d) < 10 ? `${d >= 0 ? 'up' : 'down'} ${Math.abs(d)} from the run before, which is within the noise` : `${d >= 0 ? 'UP' : 'DOWN'} ${Math.abs(d)} from the run before, which is a real move`);
+        bits.push(`${d >= 0 ? 'up' : 'down'} ${Math.abs(d)} from the preceding comparable run; a score change alone does not establish an improvement`);
       }
       if (kWeek != null && week.length >= 3) bits.push(`seven-night mean ${kWeek} against ${cWeek}`);
       const flagged = Object.entries(k.flags || {}).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 3)
@@ -517,6 +520,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     }
     return {
       enabled: enabled(), running: state.running, lastError: state.lastError, hourUtc: HOUR_UTC, judges: JUDGES,
+      series: latest?.series || 'legacy',
       probes: PROBES.map((p) => ({ id: p.id, rule: p.rule, since: p.since })),
       latest: latest && { at: latest.at, finishedAt: latest.finishedAt, kiana: latest.agents.kiana && { score: latest.agents.kiana.score, scored: latest.agents.kiana.scored, unparsed: latest.agents.kiana.unparsed, agreement: latest.agents.kiana.agreement, flags: latest.agents.kiana.flags, errors: latest.agents.kiana.errors }, control: latest.agents.control && { score: latest.agents.control.score, agreement: latest.agents.control.agreement, flags: latest.agents.control.flags }, judgeCostUsd: latest.judgeCostUsd, swept: latest.swept },
       trend: runs.slice(-14).map((r) => ({ at: r.at.slice(0, 10), kiana: r.agents.kiana && r.agents.kiana.score, control: r.agents.control && r.agents.control.score })),
