@@ -484,8 +484,16 @@ async function buildListenTwiml(message, voice, callSid) {
 // evidence, and today shipped two redeploys). Persisted to the volume like
 // every other bridge store; loaded at boot; capped the same 20.
 const DIAG_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'diagnostics-ring.json');
-const diagRing = (() => { try { if (fs.existsSync(DIAG_FILE)) return JSON.parse(fs.readFileSync(DIAG_FILE, 'utf8')).slice(-20); } catch {} return []; })();
+// Sep 23 2026: the ring's rules live in diagnostics.js (tested). The boot load used to slice -20
+// while the live cap was 40, so every restart threw away up to half the ring by position.
+const diag = require('./diagnostics');
+const diagRing = (() => { try { if (fs.existsSync(DIAG_FILE)) return diag.loadRing(JSON.parse(fs.readFileSync(DIAG_FILE, 'utf8'))); } catch {} return []; })();
 function saveDiagRing() { try { fs.writeFileSync(DIAG_FILE, JSON.stringify(diagRing)); } catch (e) { console.warn('[diag] ring save failed:', e.message); } }
+// Seats: one row per person per platform, from check-ins, so a friend who opens the app every few
+// days is still visible after the ring has moved on.
+const DIAG_SEATS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'diagnostics-seats.json');
+const diagSeats = (() => { try { if (fs.existsSync(DIAG_SEATS_FILE)) return JSON.parse(fs.readFileSync(DIAG_SEATS_FILE, 'utf8')) || {}; } catch {} return {}; })();
+function saveDiagSeats() { try { fs.writeFileSync(DIAG_SEATS_FILE, JSON.stringify(diagSeats)); } catch (e) { console.warn('[diag] seats save failed:', e.message); } }
 let diagDayStamp = ''; let diagDayCount = 0; let crashPushDay = '';
 /* Aug 13 2026 — STORM DETECTION. One push per Central day was the old rule,
  * and even had it been able to fire, Amber's FIVE crashes in 55 minutes would
@@ -504,23 +512,7 @@ let crashStormAlertedAt = 0;
  * hears these pushes rather than reads them, so the alert speaks the cause
  * instead of reciting 0x8BADF00D at her. Codes per Apple's own docs; the
  * fallthrough still carries the raw numbers so nothing is lost. */
-function crashCausePlain(rawPayload) {
-  try {
-    const p = typeof rawPayload === 'string' ? JSON.parse(rawPayload) : rawPayload;
-    const d = p && p.crashDiagnostics && p.crashDiagnostics[0];
-    const meta = d && d.diagnosticMetaData;
-    if (!meta) return 'Cause unknown';
-    const reason = String(meta.terminationReason || '');
-    if (/8BADF00D/i.test(reason)) return 'The watchdog killed it — the app stopped answering';
-    if (/c00010ff/i.test(reason)) return 'Killed for running too hot';
-    if (/dead10cc/i.test(reason)) return 'Killed for holding a file open in the background';
-    if (/baddcafe/i.test(reason)) return 'A background task ran out of time';
-    if (meta.signal === 6) return 'The app tripped its own assertion and aborted';
-    if (meta.signal === 11) return 'A memory fault';
-    if (meta.signal === 9) return 'The system force-quit it';
-    return `Exception type ${meta.exceptionType ?? '?'}, signal ${meta.signal ?? '?'}`;
-  } catch (_) { return 'Cause unknown'; }
-}
+function crashCausePlain(rawPayload, platform) { return diag.crashCausePlain(rawPayload, platform); }
 
 /* Names, not addresses — she is hearing this. The email stays in the ring for
  * the session that has to go look; the push says "Amber A". */
@@ -562,28 +554,18 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
       return res.status(429).json({ ok: false, reason: 'daily cap' });
     }
     const b = req.body || {};
-    const entry = {
-      at: new Date().toISOString(),
-      build: String(b.build || '?').slice(0, 24),
-      device: String(b.device || '?').slice(0, 64),
-      kind: String(b.kind || 'crash').slice(0, 24),
-      // Build 199: the app now names the signed-in account on its own crash
-      // reports. Absent on anything older, so every read stays optional.
-      who: String(b.who || '').slice(0, 80),
-      payload: b.payload,
-      breadcrumbs: String(b.breadcrumbs || '').slice(0, 4000),
-    };
+    // Build 199: the app names the signed-in account on its own reports (who). Sep 23 2026:
+    // platform, appVersion and a random install id are optional; iPhone rows need no change.
+    const entry = diag.normalizeEntry(b, new Date().toISOString());
     diagRing.push(entry);
+    if (diag.updateSeats(diagSeats, entry)) saveDiagSeats();
     /* ⭐ Aug 18 2026: the ring was 20 entries, evicted oldest-first. Because a
      * single freeze writes ~3 cheap `abnormal` sentinels alongside its ONE
      * expensive `crash` payload, a busy day pushed the payloads carrying the
      * actual stack traces out of the ring while the sentinels survived. Now
      * 40 deep, and eviction takes the oldest ABNORMAL first — a crash entry
      * is only dropped when there is nothing cheaper left to drop. */
-    while (diagRing.length > 40) {
-      const i = diagRing.findIndex((e) => e.kind !== 'crash');
-      diagRing.splice(i >= 0 ? i : 0, 1);
-    }
+    diag.trimRing(diagRing); // Sep 23 2026: freezes ('anr') are kept like crashes
     saveDiagRing();
     // The durable copy: a summary line in the deploy logs. Pull the crash
     // signature out of MetricKit's shape when parseable.
@@ -594,7 +576,7 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
       const meta = d && d.diagnosticMetaData;
       if (meta) sig = `type=${meta.exceptionType ?? '?'} code=${meta.exceptionCode ?? '?'} signal=${meta.signal ?? '?'} reason=${String(meta.terminationReason ?? '').slice(0, 120)}`;
     } catch (_) { /* summary only */ }
-    console.log(`DIAGNOSTICS RECEIVED — build ${entry.build} device ${entry.device} kind ${entry.kind} ${sig}`);
+    console.log(`DIAGNOSTICS RECEIVED — ${entry.platform} build ${entry.build} device ${entry.device} kind ${entry.kind} ${sig}`);
     const tail = entry.breadcrumbs.split('\n').slice(-8).join(' | ');
     if (tail) console.log(`DIAGNOSTICS BREADCRUMB TAIL — ${tail}`);
     /* Aug 10 2026 — THE MISSING HALF of the Aug 4 crash catcher, found by
@@ -605,7 +587,7 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
      * fires ONE admin push per Central day (quiet-hours respected, never
      * urgent) with the parsed signature, and the ring keeps the stacks for
      * the next session. The push is the feature; everything else existed. */
-    if (entry.kind === 'crash') {
+    if (diag.ALERT_KINDS.has(entry.kind)) {
       const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago' }).format(new Date());
       /* ⚠️ THE BUG THIS REPLACES, so nobody re-introduces it: the original
        * call passed NO userId and NO broadcast. runNotify resolves those to
@@ -615,7 +597,7 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
        * watcher and a decoration. Every other watcher in this file already
        * had it — this was the only orphan (swept and confirmed Aug 13). */
       const windowMs = CRASH_STORM_WINDOW_MIN * 60000;
-      const burst = diagRing.filter((e) => e.kind === 'crash' && Date.parse(e.at) >= Date.now() - windowMs);
+      const burst = diagRing.filter((e) => diag.ALERT_KINDS.has(e.kind) && Date.parse(e.at) >= Date.now() - windowMs);
       const isStorm = burst.length >= CRASH_STORM_COUNT;
       // Re-arm once the window has rolled clean past the last storm alert, so
       // a long bad afternoon reports again instead of going quiet after one.
@@ -642,13 +624,15 @@ app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
       }
       if (lane) {
         const who = crashWhoPhrase(lane === 'storm' ? burst : [entry]);
-        const cause = crashCausePlain(entry.payload);
+        const cause = crashCausePlain(entry.payload, entry.platform);
+        const app = diag.platformPhrase(entry);
         const body = lane === 'storm'
-          ? `${burst.length} crashes in the last ${CRASH_STORM_WINDOW_MIN} minutes${who}, all on build ${entry.build}. ${cause}. That's a pattern, not a blip — the stacks are in the crash ring.`
-          : `Build ${entry.build} on ${entry.device}${who}. ${cause}. Stack and breadcrumbs saved — ask me to read the crash ring.`;
+          ? `${burst.length} crashes in the last ${CRASH_STORM_WINDOW_MIN} minutes${who}, all on ${app ? app.replace(/^The /, 'the ') + ' ' : ''}build ${entry.build}. ${cause}. That's a pattern, not a blip — the stacks are in the crash ring.`
+          : `${app ? app + ', build ' : 'Build '}${entry.build} on ${entry.device}${who}. ${cause}. Stack and breadcrumbs saved — ask me to read the crash ring.`;
         runNotify({
           agentId: 'kade-crash-alert', agentName: 'The app itself',
-          title: lane === 'storm' ? 'The app is crashing over and over' : 'The app crashed and told on itself',
+          title: entry.kind === 'anr' ? `${app || 'The app'} stopped responding`
+            : lane === 'storm' ? 'The app is crashing over and over' : 'The app crashed and told on itself',
           body,
           urgent: false, userId: CRASH_ALERT_USER, adminAlert: true,
         })
@@ -729,7 +713,17 @@ app.get('/diagnostics', (req, res) => {
   // until Kade asked to read the ring). Same auth shape as /clock/status.
   const h = req.get('x-kade-secret') || req.query.secret;
   if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
-  res.json({ count: diagRing.length, entries: diagRing });
+  res.json({ count: diagRing.length, entries: diagRing, seats: diagSeats });
+});
+// Forget one seat (admin): DELETE /diagnostics/seat?key=android|Name <email>
+app.delete('/diagnostics/seat', (req, res) => {
+  const h = req.get('x-kade-secret') || req.query.secret;
+  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  const key = String(req.query.key || '');
+  if (!Object.prototype.hasOwnProperty.call(diagSeats, key)) return res.status(404).json({ ok: false });
+  delete diagSeats[key];
+  saveDiagSeats();
+  res.json({ ok: true });
 });
 
 /* Part 89: the deploy watcher fills this in when it attaches (further down the
@@ -748,7 +742,7 @@ const DEPLOY_READER = {};
  * flip the endpoint's ok, because "is everything okay?" deserves a "no" on a
  * day the app is dying on someone's phone. */
 function crashStatusForSpeech() {
-  const crashes = diagRing.filter((e) => e.kind === 'crash');
+  const crashes = diagRing.filter((e) => diag.ALERT_KINDS.has(e.kind));
   const todayKey = bridgeCentralDateKey();
   const yesterKey = bridgeCentralDateKey(new Date(Date.now() - 24 * 3600 * 1000));
   const dayOf = (iso) => { try { return bridgeCentralDateKey(new Date(iso)); } catch { return ''; } };
@@ -773,7 +767,7 @@ function crashStatusForSpeech() {
   const newest = todayList[todayList.length - 1] || yesterList[yesterList.length - 1];
   return {
     section,
-    spoken: `Crashes: the app crashed ${parts.join(', and ')}${who}. ${crashCausePlain(newest.payload)}. Stacks are in the crash ring.`,
+    spoken: `Crashes: the ${newest.platform === 'android' ? 'Android ' : ''}app crashed ${parts.join(', and ')}${who}. ${crashCausePlain(newest.payload, newest.platform)}. Stacks are in the crash ring.`,
     okToday: todayList.length === 0,
   };
 }
