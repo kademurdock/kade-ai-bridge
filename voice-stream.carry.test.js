@@ -23,7 +23,7 @@ function grab(anchor, endAnchor) {
 const ctx = { String, Set, Boolean, parseInt, process: { env: {} }, Array };
 vm.createContext(ctx);
 vm.runInContext(
-  grab('const CANONICAL_SOUNDS = [', 'return sentence;\n}') +
+  grab('const CANONICAL_SOUNDS = [', '// SHARED voice-command brain') +
     '\nthis.applyDirectionCarry = applyDirectionCarry; this.isSoundTag = isSoundTag;',
   ctx,
 );
@@ -51,6 +51,13 @@ function runReply(sentences) {
   const dirState = { active: null };
   return sentences.map((s) => applyDirectionCarry(s, dirState));
 }
+
+test('inline direction changes and resets govern later call pieces', () => {
+  assert.match(runReply(['%%%amused%%% Funny, %%%concerned%%% but are you okay?', 'Tell me.'])[1], /^%%%concerned%%%/);
+  assert.equal(runReply(['%%%amused%%% Funny. %%%reset%%% Anyway.', 'Tell me.'])[1], 'Tell me.');
+  assert.match(runReply(['%%%amused%%% Funny, %%%sigh%%% anyway.', 'Tell me.'])[1], /^%%%amused%%%/);
+  assert.match(runReply(['%%%warm%%% Hi.', 'Well, %%%wry%%% here we are.', 'Tell me.'])[2], /^%%%wry%%%/);
+});
 
 test('HER BUG ON THE PHONE: one opening tag no longer steers the whole call', () => {
   const out = runReply([

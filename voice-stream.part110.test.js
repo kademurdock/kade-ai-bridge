@@ -259,7 +259,7 @@ test('but pure punctuation is still never handed to the synthesiser', () => {
 const carryCtx = { String, Set, Boolean, parseInt, parseFloat, Array, process: { env: {} } };
 vm.createContext(carryCtx);
 vm.runInContext(
-  grab('const CANONICAL_SOUNDS = [', 'return sentence;\n}') +
+  grab('const CANONICAL_SOUNDS = [', '// SHARED voice-command brain') +
     '\nthis.applyDirectionCarry = applyDirectionCarry;',
   carryCtx,
 );

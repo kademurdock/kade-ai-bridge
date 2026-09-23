@@ -144,6 +144,9 @@ const PHONE_TAG_CARRY = parseInt(process.env.PHONE_TAG_CARRY || '2', 10);
 const PHONE_TAG_CARRY_CHARS = parseInt(process.env.PHONE_TAG_CARRY_CHARS || '600', 10);
 
 function applyDirectionCarry(sentence, dirState) {
+  const authoredLast = [...sentence.matchAll(/%%%([\s\S]*?)%%%/g)]
+    .map(m => m[1].trim()).filter(tag => tag && !isSoundTag(tag)).at(-1);
+  try {
   const m = sentence.match(STEERING_LEAD_RE);
   if (m) {
     const dir = m[1].trim();
@@ -204,6 +207,15 @@ function applyDirectionCarry(sentence, dirState) {
     return `%%%${dirState.active}%%% ${sentence}`;
   }
   return sentence;
+  } finally {
+    // The next piece starts in the delivery left by the last authored cue,
+    // including an inline reset. Sounds never replace the speaking style.
+    if (authoredLast) {
+      dirState.active = normalizeTag(authoredLast) === 'reset' ? null : authoredLast;
+      dirState.carried = 0;
+      dirState.chars = 0;
+    }
+  }
 }
 
 // SHARED voice-command brain (July 13 2026): one copy for both engines.
