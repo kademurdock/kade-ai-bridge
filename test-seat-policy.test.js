@@ -47,3 +47,21 @@ test('urgent and deferred test sends stop before any delivery state is accessed'
     assert.equal(result.ok, false);
   }
 });
+
+test('explicit sign-out removes a token, while legacy omitted IDs preserve it', () => {
+  const handlers = new Map();
+  const token = 'a'.repeat(64);
+  const ctx = { app: {post:(route,fn)=>handlers.set(route,fn)},
+    pushTokens:new Map([[token,{userId:'family',platform:'ios'}]]),
+    fcm:{looksLikeFcmToken:()=>false}, savePushTokens:()=>{}, CALL_RINGTONES:{}, console:{log() {}} };
+  vm.createContext(ctx);
+  const start=src.indexOf("app.post('/push-register'");
+  vm.runInContext(src.slice(start,src.indexOf('// Admin: send a push',start)),ctx);
+  let out;
+  const res={set(){},json(v){out=v;return this;},status(){return this;}};
+  handlers.get('/push-register')({body:{token,platform:'ios'}},res);
+  assert.equal(ctx.pushTokens.get(token).userId,'family');
+  handlers.get('/push-register')({body:{token,platform:'ios',userId:null}},res);
+  assert.equal(ctx.pushTokens.has(token),false);
+  assert.equal(out.unregistered,true);
+});

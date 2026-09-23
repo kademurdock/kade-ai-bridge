@@ -973,6 +973,14 @@ app.post('/push-register', (req, res) => {
   const token = isAndroid ? rawToken : rawToken.toLowerCase();
   if (isAndroid ? !fcm.looksLikeFcmToken(token) : !/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
   const userId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
+  // An explicit null/empty userId means sign-out. Legacy callers that omit
+  // the field still preserve their link. Remove signed-out tokens entirely
+  // so neither personal messages nor broadcasts reach a logged-out device.
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'userId') && !userId) {
+    pushTokens.delete(token);
+    savePushTokens();
+    return res.json({ ok: true, count: pushTokens.size, linked: false, unregistered: true });
+  }
   const platform = isAndroid ? 'android' : platformIn;
   const existing = pushTokens.get(token);
   // Part 75 (Aug 21 2026): the app's Settings ringtone picker rides the same
