@@ -2202,6 +2202,17 @@ function ingestVoicePref(identity, agentId, voice) {
 const OUR_NUMBER         = process.env.TWILIO_PHONE_NUMBER || '+18335300313';
 const RECORDING_USD_PER_MIN = 0.0025; // Twilio recording rate; call-leg price comes from Twilio itself
 
+// Sep 22 2026: password reset codes read aloud for accounts that sign in with a
+// phone number (fork kadePhoneReset.js asks; see account-code-call.js). BRIDGE_SECRET only.
+app.post('/account-code-call', require('./account-code-call').accountCodeCallHandler({
+  secretOk: bridgeSecretOk,
+  placeCall: async (to, twiml) => {
+    if (!twilioClient) throw new Error('Twilio is not configured');
+    const call = await twilioClient.calls.create({ to, from: OUR_NUMBER, twiml, timeLimit: 90 });
+    return call.sid;
+  },
+}));
+
 const OUTBOUND_LOG_FILE   = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outbound-calls.json');
 const OUTBOUND_DAILY_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outbound-daily.json');
 
