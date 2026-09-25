@@ -3533,6 +3533,9 @@ function attachMediaStreams(server, users, cfg) {
             : null;
           if (outboundCtx) {
             session.outbound  = true;
+            // Part 291: an outbound call's estimate belongs to whoever asked for the call
+            // (Kade's own wellness check-ins land on her exempt seat), never the person answering.
+            session.outboundRequesterId = outboundCtx.userId ? String(outboundCtx.userId) : null;
             session.agentId   = outboundCtx.agentId   || session.agentId;
             session.agentName = outboundCtx.agentName || session.agentName;
             if (outboundCtx.voice) session.voice = outboundCtx.voice;
@@ -4060,8 +4063,10 @@ async function postVoiceChatUsage(session) {
     session._voiceChatPosted = true;
     const secret = process.env.KADE_USAGE_EVENT_SECRET;
     if (!secret) return;
-    const userId = session.userId || null;
-    const userEmail = session.lcEmail || null;
+    // Part 291: outbound calls bill the person who asked for the call; with nobody on record the
+    // platform absorbs it (the callee never pays for a call someone else started).
+    const userId = session.outbound ? (session.outboundRequesterId || null) : (session.userId || null);
+    const userEmail = session.outbound ? null : (session.lcEmail || null);
     if (!userId && !userEmail) return;
     const hist = (session.history || []).filter((m) => m && m.content && String(m.content).trim());
     if (!hist.length) return;

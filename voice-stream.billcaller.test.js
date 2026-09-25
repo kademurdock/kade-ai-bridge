@@ -142,3 +142,24 @@ test('the voice_chat estimate says viaFork exactly for a billed call (F40)', asy
     assert.strictEqual(p.body.metadata.estimated, true);
   }
 });
+
+test('an outbound call bills the person who asked for it, never the person answering', async () => {
+  const posted = [];
+  const ctx = context({
+    BROWSER_UA: 'ua',
+    process: { env: { KADE_USAGE_EVENT_SECRET: 'offline' } },
+    require: () => ({ post: async (url, body) => posted.push({ url, body }) }),
+  });
+  vm.runInContext(grab('async function postVoiceChatUsage(session) {', '\nasync function postWebVoiceUsage', { inclusive: false }) + '\nthis.post = postVoiceChatUsage;', ctx);
+  const history = [
+    { role: 'user', content: 'Hello?' },
+    { role: 'assistant', content: 'Hi, this is Kiana calling for Amber.' },
+  ];
+  // Amber asked Kiana to call her mom: the answering mom is session.lcEmail, Amber is the requester.
+  await ctx.post({ outbound: true, outboundRequesterId: 'amber-id', userId: 'mom-id', lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
+  // An outbound call with nobody on record as asking: the platform absorbs it.
+  await ctx.post({ outbound: true, outboundRequesterId: null, userId: 'mom-id', lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
+  assert.strictEqual(posted.length, 1);
+  assert.strictEqual(posted[0].body.userId, 'amber-id');
+  assert.strictEqual(posted[0].body.userEmail, undefined);
+});
