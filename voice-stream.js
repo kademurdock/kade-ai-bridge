@@ -1025,6 +1025,23 @@ function streamPost(urlStr, headers, body) {
   });
 }
 
+// ── Who pays for a call's model turns (Sep 25 2026, Part 291 review F11/F12/F40) ─
+// Kade: "Yes, I do want double on voice." Behind the fork's KADE_VOICE_BILL_REAL
+// switch, the fork bills a call's model turns to the person on the line only
+// when the turn says billCaller: true (the proxy's call lane forwards it as
+// kadeBillCaller). Only a call the CALLER started sets it: an inbound phone
+// call, or an app/web voice session. Outbound calls (a call someone asked a
+// character to place, wellness check-ins, agent calls that ring a phone) and
+// direct Spotter (Gemini Live) sessions never do; their turns stay on Kade's
+// seat and their voice_chat estimate is charged exactly as before.
+// session.billCaller is decided once, when the session starts, and every
+// ask-stream body goes through askStreamBody, so postVoiceChatUsage's
+// metadata.viaFork (true only for these sessions) is exact: the fork zeroes
+// that call's estimate because the real turns already billed the caller.
+function askStreamBody(session, fields) {
+  return session && session.billCaller === true ? { ...fields, billCaller: true } : fields;
+}
+
 // ── Per-call session ──────────────────────────────────────────────────────────
 class CallSession {
   constructor(streamSid, callSid, from, user, ws, cfg) {
@@ -1058,6 +1075,9 @@ class CallSession {
       : (typeof agentTts?.rate === 'number' ? agentTts.rate : null);
     this.history     = [];
     this.lcEmail     = user?.lcEmail || null;   // KADE Jul5: for Calls-history attribution
+    // Part 291 review F12: false until the start handler knows this is a call
+    // the caller started (see askStreamBody). Never billed by default.
+    this.billCaller  = false;
     this.startedAt   = new Date().toISOString(); // KADE Jul5: call start for duration
     this.isSpeaking     = false;
     this.speakStartedAt = 0;
@@ -2736,7 +2756,8 @@ async function streamReply(session, userText) {
       // the line (registration + web-voice ticket both set it). Proxy forwards
       // it as kadeOnBehalfOf; fork honors it admin-only for per-user Kade
       // tools — Amber's bug reports file as Amber now, not the service account.
-      { agentId: session.agentId, messages: outgoing, userEmail: session.lcEmail || undefined }
+      // Part 291 review F11/F12: askStreamBody adds billCaller only on a call the caller started.
+      askStreamBody(session, { agentId: session.agentId, messages: outgoing, userEmail: session.lcEmail || undefined })
     );
     await new Promise((resolve, reject) => {
       let buf = '';
@@ -3076,7 +3097,7 @@ async function fetchLlmOpener(session, user) {
         'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
-      { agentId: session.agentId, messages: [{ role: 'user', content: instruction }], userEmail: session.lcEmail || undefined }
+      askStreamBody(session, { agentId: session.agentId, messages: [{ role: 'user', content: instruction }], userEmail: session.lcEmail || undefined })
     );
     let text = '';
     await new Promise((resolve, reject) => {
@@ -3518,6 +3539,9 @@ function attachMediaStreams(server, users, cfg) {
             if (typeof outboundCtx.rate === 'number') session.rate = outboundCtx.rate;
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }
+          // Part 291 review F12: only an inbound call is the caller's own. Twilio's
+          // outbound=1 wins even when the outbound context has expired.
+          session.billCaller = params.outbound !== '1' && !outboundCtx;
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
 
           // July 12 2026: register by callSid so async callbacks (AMD) can
@@ -4074,6 +4098,11 @@ async function postVoiceChatUsage(session) {
         inTok,
         outTok,
         turns: hist.length,
+        // Part 291 review F40: this call's turns went to the fork with
+        // billCaller: true (askStreamBody), so with the fork's switch on the real
+        // turns already billed the caller and the fork writes this estimate at $0.
+        // Every other call keeps its estimate.
+        ...(session.billCaller === true ? { viaFork: true } : {}),
       },
     }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
   } catch (e) { console.log('[voice-chat] usage post failed:', e && e.message); }
@@ -4220,6 +4249,9 @@ function attachWebVoice(server) {
         // Direct Spotter call (July 18 2026): the client asked for the Spotter
         // from the first tap — the character never speaks on this call.
         session._spotterDirect = msg.spotterDirect === true;
+        // Part 291 review F12: an app/web voice session is the caller's own call;
+        // a direct Spotter (Gemini Live) session is not billed this way.
+        session.billCaller = !session._spotterDirect;
         // Barge mode override (July 24 2026): web/app sessions default to
         // 'push' (Stop-button-only interrupts); a client that WANTS the old
         // voice-activated cutting can say so in its hello.
