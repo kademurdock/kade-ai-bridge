@@ -376,6 +376,10 @@ const AI_TELL_LEAD_BANS = [
   /^\s*(?:that['’]s|what)\s+(?:a\s+)?(?:great|excellent|fascinating|wonderful|brilliant|interesting)\b[^.!?]*[.!?]\s*/i,
   /^\s*you['’]re\s+(?:absolutely\s+)?right[^.!?]*[.!?]\s*/i,
   /^\s*i\s+love\s+(?:that|how)\b[^.!?]*[.!?]\s*/i,
+  // Sep 21 2026 (fork stripAiTells, ported Sep 25 2026 Part 292): the two
+  // assistant openers with no person left in them. "Of course" and "Sure" stay.
+  /^\s*certainly[!.,:]\s*/i,
+  /^\s*i['’]d\s+be\s+happy\s+to\s+(?:help\s+(?:you\s+)?)?(?:with\s+that\s*)?[!.,:]\s*/i,
 ];
 const AI_TELL_SENTENCE_BANS = [
   /\bas an ai(?:\s+language model)?\b[^.!?]*[.!?]/gi,
@@ -386,6 +390,14 @@ const AI_TELL_SENTENCE_BANS = [
   /\bi\s+(?:can(?:'|no)?t|am unable to)\s+browse[^.!?]*[.!?]/gi,
   /\bi\s+(?:sincerely\s+|deeply\s+)?apologize(?:\s+for[^.!?]*)?[.!?]/gi,
   /\b(?:my\s+apologies|i'?m\s+(?:so\s+|really\s+)?sorry\s+for\s+(?:the\s+)?(?:confusion|any confusion|the mix-?up))[^.!?]*[.!?]/gi,
+  // Part 292 (Sep 25 2026, the fork's b04dadc9a, same rules so calls match
+  // chat): a label sentence standing alone ("That's the trap.", "That's the
+  // whole design.") and a "Same X, different Y." fragment only name what was
+  // already said. Whole sentences with a period only. On a call the speech
+  // path scrubs sentence by sentence, so a label sentence is simply not said.
+  /(?:^|(?<=[.!?]["”’)]?\s+)|(?<=%{3}\s?))that['’]s\s+the\s+(?:whole|entire)\s+[a-z]+(?:\s+[a-z]+)?\.[ \t]*/gi,
+  /(?:^|(?<=[.!?]["”’)]?\s+)|(?<=%{3}\s?))that['’]s\s+the\s+(?:real\s+|actual\s+|exact\s+)?(?:trick|trap|loop|move|register|design|game|catch|tell|pattern|kicker|magic|genius|beauty|hook|engine|mechanism|math|whole\s+thing)\.[ \t]*/gi,
+  /(?:^|(?<=[.!?]["”’)]?\s+)|(?<=%{3}\s?))same\s+[a-z]+(?:\s+[a-z]+)?,\s+(?:different|opposite|new|other)\s+[a-z]+(?:\s+[a-z]+)?\.[ \t]*/gi,
 ];
 const AI_TELL_PHRASE_BANS = [
   /\bit['’]s\s+(?:worth\s+noting|important\s+to\s+(?:note|remember|mention|consider))\s+that\s+/gi,
@@ -394,6 +406,12 @@ const AI_TELL_PHRASE_BANS = [
   /\bneedless\s+to\s+say,?\s+/gi,
   /\bit\s+goes\s+without\s+saying\s+that\s+/gi,
   /\bat\s+the\s+end\s+of\s+the\s+day,?\s+/gi,
+  // Sep 21 2026 essay connectives and Part 292 build-up lead-ins (fork copy).
+  /\bin\s+(?:conclusion|summary),?\s+/gi,
+  /\bto\s+sum\s+up,?\s+/gi,
+  /\bin\s+today['’]s\s+(?:world|fast-?paced\s+world|digital\s+age),?\s+/gi,
+  /\bhere['’]s\s+(?:the\s+thing|the\s+deal|the\s+kicker|the\s+catch|my\s+(?:read|take)|what\s+(?:i\s+think|gets\s+me|kills\s+me|matters))\s*(?::|\s[—–-]{1,2})\s*/gi,
+  /\b(?:so\s+)?the\s+(?:whole\s+|real\s+)?(?:trick|thing|point|secret|deal|key)\s+is\s+this\s*(?::|\s[—–-]{1,2})\s*/gi,
 ];
 const AI_TELL_TRAIL_BANS = [
   /\s*(?:i\s+)?hope\s+(?:this|that)\s+helps?!?\s*$/i,
