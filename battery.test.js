@@ -28,6 +28,15 @@ test('an answer on the first try, or an empty answer for any other reason, is no
   const twice = await judgeWithRetry(async () => { calls++; return { choices: [{ message: { content: null }, finish_reason: 'length' }], usage: {} }; }, 'm', quiet);
   assert.equal(calls, 2, 'never more than one retry'); assert.equal(twice.content, null);
 });
+/* ── Part 295: a BYOK judge call costs its fee PLUS the upstream charge ── */
+test('a BYOK judge reply is costed at fee + upstream, not the $0 fee alone', async () => {
+  const out = await judgeWithRetry(async () => ({
+    choices: [{ message: { content: '{"score": 70}' }, finish_reason: 'stop' }],
+    usage: { cost: 0, cost_details: { upstream_inference_cost: 0.0009 } },
+  }), 'm', quiet);
+  assert.ok(Math.abs(out.cost - 0.0009) < 1e-12, String(out.cost));
+  assert.equal(out.estimated, false, 'a reported upstream cost is a real number, not an estimate');
+});
 
 test('twelve probes, each with id, rule, want, since', () => {
   assert.equal(PROBES.length, 12);

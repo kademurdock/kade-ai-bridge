@@ -22,6 +22,9 @@ const fs       = require('fs');
 const path     = require('path');
 const os       = require('os');
 const testSeatPolicy = require('./test-seat-policy');
+// Part 295 (Sep 26 2026): BYOK-safe OpenRouter cost, and the Google key's alarm + spend ledger.
+const { openRouterCost, upstreamCost } = require('./or-cost');
+const googleWatch = require('./google-watch');
 
 const app  = express();
 const port = process.env.PORT || 3000;
@@ -4769,10 +4772,16 @@ app.post('/media/describe', async (req, res) => {
           );
           const txt = (((g.data || {}).choices || [])[0] || {}).message && g.data.choices[0].message.content;
           const clean = typeof txt === 'string' ? txt.trim() : '';
+          /* Part 295: still free to the family by design (KadeMedia.js), but
+           * the real cost is logged, fee + BYOK upstream (or-cost.js), and the
+           * Google share joins the bridge's Google ledger for the books. */
+          const orUsage = (g.data || {}).usage || {};
+          const orCost = openRouterCost(orUsage);
+          if (/^google\//i.test(MEDIA_OR_MODEL)) googleWatch.addGoogleSpend(upstreamCost(orUsage));
           if (clean) {
             mediaDaily.counts.set(userId, used + 1);
             const secsOr = Math.round((Date.now() - tOr) / 1000);
-            console.log(`[media] described ${yt ? 'youtube' : 'file'} via OPENROUTER (${MEDIA_OR_MODEL}) for user=${userId.slice(0, 8)} in ${secsOr}s (${((g.data || {}).usage || {}).prompt_tokens || '?'} prompt tokens)`);
+            console.log(`[media] described ${yt ? 'youtube' : 'file'} via OPENROUTER (${MEDIA_OR_MODEL}) for user=${userId.slice(0, 8)} in ${secsOr}s (${orUsage.prompt_tokens || '?'} prompt tokens, ${orCost != null ? '$' + orCost.toFixed(4) : 'cost not reported'})`);
             return res.json({ ok: true, description: (metaPrefix + clean).slice(0, 12000), title: meta && meta.title, channel: meta && meta.channel, model: MEDIA_OR_MODEL, pot: 'openrouter', seconds: secsOr });
           }
           console.warn('[media] OpenRouter answered empty — falling through to the Google-native path');
@@ -4796,7 +4805,7 @@ app.post('/media/describe', async (req, res) => {
       { model: MEDIA_MODEL, waitMs: 2500 },
       { model: process.env.MEDIA_MODEL_FALLBACK || 'gemini-flash-latest', waitMs: 1500 },
     ];
-    let out; let lastDetail = '';
+    let out; let lastDetail = ''; let trouble = null;
     for (const a of attempts) {
       if (a.waitMs) await new Promise((r2) => setTimeout(r2, a.waitMs));
       try {
@@ -4809,11 +4818,26 @@ app.post('/media/describe', async (req, res) => {
         if (a.model !== MEDIA_MODEL) console.warn(`[media] fallback model ${a.model} answered after ${MEDIA_MODEL} failed`);
         break;
       } catch (e) {
-        lastDetail = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message);
+        const gErr = (e.response && e.response.data && e.response.data.error) || {};
+        lastDetail = String(gErr.message || e.message);
         console.error(`[media] ${a.model} failed for ${url.slice(0, 60)}: ${lastDetail.slice(0, 140)}`);
+        /* Part 295: an empty prepaid balance is not "busy for a minute".
+         * Classified on Google's status + message; 'credit' stops retrying. */
+        const kind = googleWatch.classifyGoogleTrouble(`${(e.response && e.response.status) || ''} ${gErr.status || ''} ${lastDetail}`);
+        trouble = kind === 'credit' ? 'credit' : (trouble || kind);
+        if (trouble === 'credit') break;
         const transient = /high demand|overloaded|429|resource has been exhausted|unavailable/i.test(lastDetail);
         if (!transient) break;
       }
+    }
+    if (!out && trouble) {
+      googleWatch.alarmGoogleKey({ where: 'the media listener', kind: trouble, detail: lastDetail });
+      return res.json({
+        ok: false,
+        description: trouble === 'credit'
+          ? "The media listener is out of credit right now — that's on our end, and Kade's been told. Try again once it's topped up."
+          : "The media listener just hit Google's limit — that's on our end, and Kade's been told. Try again in a little while.",
+      });
     }
     if (!out) {
       return res.json({ ok: false, description: `I tried to take that in and the listen failed (${lastDetail.slice(0, 120)}). Private, age-restricted, or region-locked videos do that — and sometimes the listener is just busy for a minute; try once more.` });
@@ -5538,6 +5562,17 @@ if (BALANCE_WATCH) {
   console.log('[balance-watch] off (BALANCE_WATCH=0)');
 }
 
+/* Part 295 (Sep 26 2026) — THE GOOGLE KEY GETS A VOICE. GOOGLE_LIVE_API_KEY
+ * (Spotter + the media listener's fallback) is a prepaid AI Studio key with no
+ * balance API, so it cannot sit in BALANCE_FLOORS. Instead the lanes that use
+ * it report Google's own "out of credit" / RESOURCE_EXHAUSTED errors to
+ * google-watch.js, which pushes her through this same Estate watch lane, at
+ * most once per GOOGLE_ALARM_HOURS (default 4). Kill: GOOGLE_ALARM=0. */
+googleWatch.setNotifier((body) => runNotify({
+  agentId: 'kade-balance-watch', agentName: 'Estate watch', title: 'Money',
+  body, urgent: false, userId: CANARY_ADMIN_USER, adminAlert: true,
+}));
+
 /** The balances section + spoken line for /platform-status. */
 function balanceStatusForSpeech() {
   if (!BALANCE_WATCH) return { section: { enabled: false }, spoken: '' };
@@ -5983,6 +6018,7 @@ try {
     proxySecret: PROXY_SECRET,
     readBalanceHistory,
     readZaiDays,
+    readGoogleDays: googleWatch.readGoogleDays,
     runNotify,
     adminUserId: process.env.ADMIN_USER_ID || '6a3cba4d0b0afa92194e42f7',
   });

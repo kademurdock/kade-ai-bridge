@@ -48,3 +48,19 @@ test('Z.AI metered days join real spend for the month', () => {
   assert.equal(r.zai, 2);
   assert.equal(r.models, 36.3);
 });
+
+test('Part 295: the bridge\'s Google ledger joins real spend and is named in the line', async () => {
+  const hist = [{ dateKey: '2026-09-01', moonshot: 9, openrouter_usage: 52 }, { dateKey: '2026-09-05', moonshot: 4.12, openrouter_usage: 81.42 }];
+  const r = realSpend(hist, '2026-09', {}, { '2026-08-31': 9, '2026-09-02': 1.5, '2026-09-04': 0.75 });
+  assert.equal(r.google, 2.25);
+  assert.equal(r.models, 36.55);
+  assert.equal(realSpend([], '2026-09', {}, { '2026-09-03': 1 }).models, 1, 'counted even before two snapshots exist');
+  const fetchImpl = async (url) => String(url).includes('/my-cost')
+    ? ({ ok: true, json: async () => ({ multiplier: 2 }) })
+    : ({ ok: true, json: async () => ({ totals: { llmSpendUSD: { window: 10 }, extraSpendUSD: { window: 0 } }, users: [] }) });
+  const m = makeMonthly({ proxyUrl: 'x', proxySecret: 'y', readBalanceHistory: () => hist, readGoogleDays: () => ({ '2026-09-02': 1.5 }), runNotify: async () => ({}), adminUserId: 'u', fetchImpl, log: { warn() {} } });
+  const rep = await m.report({ monthKey: '2026-09', days: 5 });
+  assert.match(rep.spoken, /Google \$1\.50 metered by the bridge/);
+  const none = makeMonthly({ proxyUrl: 'x', proxySecret: 'y', readBalanceHistory: () => hist, runNotify: async () => ({}), adminUserId: 'u', fetchImpl, log: { warn() {} } });
+  assert.doesNotMatch((await none.report({ monthKey: '2026-09', days: 5 })).spoken, /Google/, 'silent when the ledger is empty');
+});

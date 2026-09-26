@@ -21,6 +21,9 @@
  *   audio out ~25 tok/s at ~$12/M output tokens
  *   ≈ $0.05–0.06/min continuous ≈ $3.30/hour — roughly 8× the HQ snapshot
  *   lane. Hence its own SMALL daily cap, separate from video minutes.
+ *   Superseded Sep 26 2026 (Part 295): Live bills every turn for the whole
+ *   context window, so the real cost is metered from Google's usageMetadata
+ *   (live-billing.js) and the window is capped by a compression trigger.
  *
  * Design decisions already made (so the tuning session doesn't relitigate):
  *  - The Live session BECOMES the voice for that call segment (Google's TTS,
@@ -42,6 +45,9 @@ const os = require('os');
 // misspelled-on-purpose respelling is the only lever. Background-only text,
 // never the transcript, so this can't touch what's actually logged.
 const { fixPronunciation } = require('./voice-commands');
+// Part 295 (Sep 26 2026): billed from Google's own usageMetadata, and the key watched.
+const liveBilling = require('./live-billing');
+const googleWatch = require('./google-watch');
 let WebSocketClient = null;
 try { WebSocketClient = require('ws'); } catch { /* ws is a bridge dep already */ }
 
@@ -163,6 +169,37 @@ const SPOTTER_PLATFORM_PROTOCOL =
   '- Bystanders in frame get discretion; the user\'s own documents, screens, and belongings get read matter-of-factly, verbatim, without commentary.\n' +
   '- Speak to a competent adult: no infantilizing, no cheerleading, no safety lectures beyond the flag itself.';
 
+/* CONTEXT WINDOW TRIM (Sep 26 2026, Part 295 — Kade: "Spotter: fix both").
+ * Google's Live best-practices page (updated 2026-09-15): the API "charges you
+ * per turn for all tokens present in the session context window", audio history
+ * at the audio input rate, so a call's cost per minute climbs the longer it runs.
+ * The July 19 `slidingWindow: {}` had no trigger, which means Google's default
+ * of 80% of the model's context window: history kept piling up for the whole
+ * ~10-minute connection. The same page's fix is a compression trigger around
+ * 25,000 tokens and a sliding window around 8,000; after that each turn bills
+ * only the kept history plus the new tokens. Field names per the v1alpha/v1beta
+ * reference (ai.google.dev/api/live, updated 2026-09-04):
+ * ContextWindowCompressionConfig.triggerTokens and SlidingWindow.targetTokens,
+ * both int64, sent as strings (proto JSON's form for int64). The target keeps
+ * the system instruction too (it always stays at the front), so with Scout's
+ * full briefing and memories the kept conversation is roughly the last 4,000
+ * tokens: about 15 seconds of camera, or a couple of minutes of voice.
+ * Env: LIVE_COMPRESSION_TRIGGER_TOKENS (default 25000; 0 = Google's defaults,
+ * the old behaviour), LIVE_COMPRESSION_TARGET_TOKENS (default 8000; must be
+ * under the trigger, else half of it). */
+function liveCompression(env = process.env) {
+  const int = (v, d) => {
+    if (v == null || String(v).trim() === '') return d;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : d;
+  };
+  const trigger = int(env.LIVE_COMPRESSION_TRIGGER_TOKENS, 25000);
+  if (trigger <= 0) return { slidingWindow: {} };
+  const target = int(env.LIVE_COMPRESSION_TARGET_TOKENS, 8000);
+  const keep = target > 0 && target < trigger ? target : Math.floor(trigger / 2);
+  return { triggerTokens: String(trigger), slidingWindow: { targetTokens: String(keep) } };
+}
+
 function buildSetupMessage(session) {
   // SPOTTER model (July 16 2026, Kade's design): the live lane is NOT the
   // character wearing a different voice — it's the caller's own SPOTTER, a
@@ -248,7 +285,9 @@ function buildSetupMessage(session) {
       // for a couple of minutes) stop dropping at all, and even if a rarer
       // long call still eventually drops, the July 19 stopLive fix now
       // guarantees that drop is always audible instead of silent.
-      contextWindowCompression: { slidingWindow: {} },
+      // Sep 26 2026 (Part 295): now with a trigger and a target; see
+      // liveCompression above for why the window must stay small.
+      contextWindowCompression: liveCompression(),
       // OUTPUT TRANSCRIPTION (July 18 2026, Kade: "after a voice chat I can
       // only see my half"): ask Google for a text transcript of the model's
       // OWN spoken audio so the Spotter/live side lands in session.history too.
@@ -293,6 +332,23 @@ function shouldWarnLiveSilence({ liveOn, armedAt, firstAudioAt, warned, now, ms 
   return now - armedAt >= ms;
 }
 
+/* GOOGLE KEY TROUBLE (Sep 26 2026, Part 295). The Live key is prepaid; when it
+ * runs dry Google closes the socket (or refuses the upgrade) with a
+ * RESOURCE_EXHAUSTED / quota / prepayment reason. Same law as the watchdog: the
+ * caller hears WHY, in the character's voice, instead of a bare handback, and
+ * Kade gets one push (google-watch.js, at most every few hours). */
+const LIVE_CREDIT_LINE =
+  "The live eyes are out of credit right now — that's on our end, not you, and Kade's been told.";
+const LIVE_QUOTA_LINE =
+  "The live eyes just hit Google's limit — nothing you did, and Kade's been told.";
+function noteGoogleTrouble(session, text) {
+  const kind = googleWatch.classifyGoogleTrouble(text);
+  if (!kind) return null;
+  session._liveTrouble = kind;
+  googleWatch.alarmGoogleKey({ where: 'a Spotter call', kind, detail: text });
+  return kind;
+}
+
 function startLive(session, speak) {
   session._liveSpeak = speak || null;
   if (!enabled()) {
@@ -313,8 +369,24 @@ function startLive(session, speak) {
       try { gws.send(JSON.stringify(buildSetupMessage(session))); } catch (e) { console.log('[video-live] setup send failed:', e.message); }
     });
     gws.on('message', (raw) => handleGoogleMessage(session, raw));
-    gws.on('close', (code) => { console.log('[video-live] google ws closed', code); stopLive(session, 'closed'); });
-    gws.on('error', (e) => { console.log('[video-live] google ws error:', e && e.message); stopLive(session, 'error'); });
+    // Part 295: a socket this session already let go of (our own stopLive, or an
+    // old connection after a new one started) no longer speaks for the call.
+    // Before, closing it ourselves fired stopLive a second time, and the
+    // handback line could be said twice. Google's close reason is logged now:
+    // it is where RESOURCE_EXHAUSTED and friends arrive.
+    gws.on('close', (code, reason) => {
+      if (session._liveWs !== gws) return;
+      const why = String(reason || '');
+      console.log('[video-live] google ws closed', code, why.slice(0, 200));
+      noteGoogleTrouble(session, why);
+      stopLive(session, 'closed');
+    });
+    gws.on('error', (e) => {
+      if (session._liveWs !== gws) return;
+      console.log('[video-live] google ws error:', e && e.message);
+      noteGoogleTrouble(session, e && e.message);
+      stopLive(session, 'error');
+    });
   } catch (e) {
     console.log('[video-live] start failed (call continues normally):', e && e.message);
   }
@@ -323,10 +395,20 @@ function startLive(session, speak) {
 function handleGoogleMessage(session, raw) {
   let msg;
   try { msg = JSON.parse(raw.toString()); } catch { return; }
+  // Part 295: Google's own meter. Any server message may carry usageMetadata
+  // beside its one real field (ai.google.dev/api/live), so read it first. A
+  // report that lands after the connection stopped is posted straight away.
+  if (msg.usageMetadata) {
+    try {
+      liveBilling.addUsage(session, msg.usageMetadata, liveModel());
+      if (!session.liveOn) liveBilling.flush(session, 'late').catch(() => {});
+    } catch { /* metering trouble never touches the call */ }
+  }
   if (msg.setupComplete) {
     session.liveOn = true;
     session._liveStartedAt = Date.now(); // greeting-grace anchor, see sc.interrupted below
     session._liveTickAt = Date.now();
+    try { liveBilling.startSegment(session); } catch {}
     session._liveTick = setInterval(() => {
       if (!session.liveOn) return;
       const now = Date.now();
@@ -334,6 +416,8 @@ function handleGoogleMessage(session, raw) {
       addSeconds(session.userId, secs);
       session.liveSecondsTotal = Number(session.liveSecondsTotal || 0) + secs;
       session._liveTickAt = now;
+      // Part 295: post the metered cost as the call goes (see live-billing.js).
+      liveBilling.maybeFlush(session, now);
       if (!capExempt(session) && minutesLeft(session.userId) <= 0) stopLive(session, 'cap');
     }, 15000);
     try {
@@ -377,7 +461,7 @@ function handleGoogleMessage(session, raw) {
           })) {
             session._liveSilenceWarned = true;
             console.warn(`[video-live] WATCHDOG: no model audio ${LIVE_SILENCE_MS()}ms after setup (user=${session.userId}) — speaking the silence notice`);
-            try { session.history.push({ role: 'assistant', content: LIVE_SILENT_LINE }); } catch {}
+            try { session.history.push({ role: 'assistant', content: LIVE_SILENT_LINE, lane: 'live' }); } catch {}
             const sp = session._liveSpeak;
             if (sp) sp(session, LIVE_SILENT_LINE, session.voice).catch(() => {});
           }
@@ -424,12 +508,15 @@ function handleGoogleMessage(session, raw) {
       // transcript/mint credits it to the Spotter (e.g. Whitney), not the base
       // agent the call started on. effectiveSpotter always resolves a name
       // (custom Spotter, or the Scout default).
+      // lane 'live' (Part 295): Gemini Live said this, not the text model, so
+      // voice-stream's voice_chat estimate never bills it as a model reply.
       if (t) {
         try {
           session.history.push({
             role: 'assistant',
             content: t,
             agentName: effectiveSpotter(session).name,
+            lane: 'live',
           });
         } catch {}
       }
@@ -480,7 +567,7 @@ function stopLive(session, reason) {
   // Commit any half-finished model turn so a hangup mid-sentence still lands
   // the Spotter's last words in the post-call transcript. Fail-soft.
   if (session._liveModelText && session._liveModelText.trim()) {
-    try { session.history.push({ role: 'assistant', content: session._liveModelText.trim() }); } catch {}
+    try { session.history.push({ role: 'assistant', content: session._liveModelText.trim(), lane: 'live' }); } catch {}
   }
   session._liveModelText = '';
   if (session.liveOn && session._liveTickAt) {
@@ -489,12 +576,22 @@ function stopLive(session, reason) {
     session.liveSecondsTotal = Number(session.liveSecondsTotal || 0) + secs;
   }
   session.liveOn = false;
+  // Part 295: every stop settles this connection's cost now (hang-up, "live
+  // off", Google's reconnect, an error), so a restart cannot lose it.
+  try { liveBilling.endSegment(session); liveBilling.flush(session, 'stop').catch(() => {}); } catch {}
   // Flush any Live audio still queued in the browser so "live off" is instant.
   try { session.sendClear && session.sendClear(); } catch {}
   const gws = session._liveWs;
   session._liveWs = null;
   if (gws) { try { gws.close(); } catch {} }
-  try { session.jsonSend({ type: 'live-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) }); } catch {}
+  const trouble = session._liveTrouble === 'credit' ? LIVE_CREDIT_LINE
+    : session._liveTrouble === 'quota' ? LIVE_QUOTA_LINE : '';
+  session._liveTrouble = null;
+  try {
+    const st = { type: 'live-state', on: false, reason: reason || 'off', minutesLeft: Math.round(minutesLeft(session.userId)) };
+    if (trouble) st.message = trouble;
+    session.jsonSend(st);
+  } catch {}
   // The RETURN, in the character's own voice — closes the handoff fiction.
   // Skipped ONLY on a real hangup (the browser call socket itself is going
   // away — nobody's listening, speak would race the teardown). 'closed' and
@@ -510,7 +607,7 @@ function stopLive(session, reason) {
   if (session._liveSpeak && String(reason) !== 'hangup') {
     const back = reason === 'cap'
       ? `${OUT_OF_LIVE_LINE} It's ${session.agentName || 'me'} again — I've got you from here.`
-      : `It's ${session.agentName || 'me'} again — I've got you.`;
+      : `${trouble ? trouble + ' ' : ''}It's ${session.agentName || 'me'} again — I've got you.`;
     try { session._liveSpeak(session, back, session.voice).catch(() => {}); } catch {}
   }
 }
@@ -559,4 +656,4 @@ module.exports = {
   shouldWarnLiveSilence,
   LIVE_SILENT_LINE, enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
 // Exported for the pre-push test harness only — not called across modules.
-module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl };
+module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE };

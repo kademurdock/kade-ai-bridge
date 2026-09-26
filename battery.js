@@ -55,6 +55,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const axios = require('axios');
+const { openRouterCost } = require('./or-cost');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -168,9 +169,11 @@ function judgePrompt(probe, reply) {
  * Both calls are costed, so the daily cap still sees them. */
 const JUDGE_BUDGET = 2500;
 const JUDGE_RETRY_BUDGET = 6000;
+// Part 295: fee + BYOK upstream (or-cost.js); usage.cost alone reads $0 on a BYOK call.
 function judgeCost(usage) {
   const u = usage || {};
-  return Number.isFinite(Number(u.cost)) ? Number(u.cost)
+  const real = openRouterCost(u);
+  return real != null ? real
     : ((u.prompt_tokens || 600) * 0.10 + (u.completion_tokens || 80) * 0.40) / 1e6;
 }
 async function judgeWithRetry(post, model, log = console) {
@@ -181,7 +184,7 @@ async function judgeWithRetry(post, model, log = console) {
     const choice = data && data.choices && data.choices[0];
     const usage = (data && data.usage) || {};
     cost += judgeCost(usage);
-    if (!Number.isFinite(Number(usage.cost))) estimated = true;
+    if (openRouterCost(usage) == null) estimated = true;
     content = choice && choice.message && choice.message.content;
     if (content) break;
     log.warn(`[battery] judge ${model} returned no content (finish=${choice && choice.finish_reason}, completion_tokens=${usage.completion_tokens}, budget=${budget})`);

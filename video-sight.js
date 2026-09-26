@@ -22,6 +22,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const axios = require('axios');
+const { openRouterCost, upstreamCost } = require('./or-cost');
+const googleWatch = require('./google-watch');
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const MINUTES_FILE = path.join(DATA_DIR, 'video-minutes.json');
@@ -146,6 +148,16 @@ function pruneSceneLog(session) {
   session.sceneLog = session.sceneLog.filter((e) => e.at >= cutoff).slice(-SCENE_LOG_MAX_ENTRIES);
 }
 
+/* Part 295 (Sep 26 2026): with her Google key inside OpenRouter (BYOK),
+ * usage.cost is only OpenRouter's fee and Google's charge rides in
+ * usage.cost_details.upstream_inference_cost. The call's real cost is the sum
+ * (or-cost.js); the Google share also lands in the bridge's Google ledger. */
+function addLookCost(session, model, usage) {
+  const cost = openRouterCost(usage);
+  if (cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
+  if (/^google\//i.test(String(model || ''))) googleWatch.addGoogleSpend(upstreamCost(usage));
+}
+
 function describeFrame(session) {
   // One describe at a time per session; callers can AWAIT the in-flight one
   // (fixes the first-turn race: frame arrival kicks off the first look, and
@@ -193,8 +205,7 @@ async function _describeFrame(session) {
       }
       pruneSceneLog(session);
     }
-    const cost = r.data?.usage?.cost;
-    if (typeof cost === 'number' && cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
+    addLookCost(session, model, r.data?.usage);
   } catch (e) {
     console.log('[video-sight] describe failed (call continues blind):', e && e.message);
   }
@@ -258,8 +269,7 @@ async function checkWatch(session) {
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-Title': 'Kade-AI Video Watch' },
       timeout: 15000,
     });
-    const cost = r.data?.usage?.cost;
-    if (typeof cost === 'number' && cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;
+    addLookCost(session, body.model, r.data?.usage);
     const answer = String(r.data?.choices?.[0]?.message?.content || '').trim();
     if (!/^YES\b/i.test(answer)) return;
     // Condition is TRUE. Take one fresh, full look (best available detail for
@@ -426,3 +436,5 @@ function usageSummary(session) {
 }
 
 module.exports = { handleVideoMsg, handleFrameMsg, visionLine, onTurn, stopVideo, usageSummary, enabled, armWatch, disarmWatch, onAlert };
+// Exported for the unit harness only.
+module.exports._test = { addLookCost };

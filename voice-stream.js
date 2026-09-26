@@ -234,6 +234,7 @@ const videoSight = require('./video-sight'); // caller camera -> agent vision (J
 // It never talks over anyone: it waits for busy/isSpeaking to clear first.
 videoSight.onAlert((session, alertText) => { watchAlertTurn(session, alertText).catch(() => {}); });
 const videoLive = require('./video-live'); // EXPERIMENTAL Gemini Live lane (July 16 2026) — hard-inert unless LIVE_ENABLED=true + GOOGLE_LIVE_API_KEY set
+const liveBilling = require('./live-billing'); // Part 295: the Spotter's real cost, from Google's usageMetadata
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1033,7 +1034,9 @@ function streamPost(urlStr, headers, body) {
 // call, or an app/web voice session. Outbound calls (a call someone asked a
 // character to place, wellness check-ins, agent calls that ring a phone) and
 // direct Spotter (Gemini Live) sessions never do; their turns stay on Kade's
-// seat and their voice_chat estimate is charged exactly as before.
+// seat and their voice_chat estimate is charged exactly as before. (Part 295:
+// on a direct Spotter call that estimate now counts only character turns; the
+// Spotter's own turns are billed as video_live from Google's meter.)
 // session.billCaller is decided once, when the session starts, and every
 // ask-stream body goes through askStreamBody, so postVoiceChatUsage's
 // metadata.viaFork (true only for these sessions) is exact: the fork zeroes
@@ -1978,8 +1981,9 @@ async function handleUtterance(session, text) {
     // the post-call transcript ingest + memory writer see it — telling the
     // Spotter "that cat is Kasper" is remembered exactly like telling the
     // character. (The Spotter's own replies are audio-only; the caller's words
-    // are where the durable facts live.)
-    try { session.history.push({ role: 'user', content: text }); } catch {}
+    // are where the durable facts live.) lane 'live' (Part 295) marks it as a
+    // turn the Spotter heard, not one the text model answered.
+    try { session.history.push({ role: 'user', content: text, lane: 'live' }); } catch {}
     if (/\b(?:live\s*(?:mode\s*)?(?:off|stop|end|quit|done)|(?:stop|end|turn\s+off|kill)\s+live(?:\s+mode)?)\b/i.test(text)) {
       try { videoLive.stopLive(session, 'voice-off'); } catch {}
     }
@@ -4057,6 +4061,14 @@ function verifyWebTicket(ticket) {
 // userId) have no wallet to bill -- skipped, same boundary as transcripts.
 // Kade's own calls post normally: the fork's deductKadeCredits is
 // ADMIN-exempt, so hers are logged (visible) but never docked.
+//
+// Part 295 (Sep 26 2026, Kade: "Spotter: fix both"): a reply the Spotter
+// (Gemini Live) spoke, or a notice the live lane said itself, carries
+// lane: 'live' and is no text-model reply, so it is never billed here. It
+// still counts as context for a later character turn, because that turn is
+// sent the whole history. A direct Spotter call that never handed back to
+// the character therefore posts no voice_chat estimate at all: the phantom
+// charge the review found, for text turns that never ran.
 async function postVoiceChatUsage(session) {
   try {
     if (!session || session._voiceChatPosted) return;
@@ -4076,7 +4088,7 @@ async function postVoiceChatUsage(session) {
     let prior = 0;
     for (const m of hist) {
       const len = String(m.content).length;
-      if (m.role !== 'user') { inChars += OVERHEAD + prior; outChars += len; }
+      if (m.role !== 'user' && m.lane !== 'live') { inChars += OVERHEAD + prior; outChars += len; }
       prior += len;
     }
     const inTok = Math.ceil(inChars / 4);
@@ -4155,26 +4167,14 @@ async function postVideoUsage(session) {
   } catch (e) { console.log('[video-sight] usage post failed:', e && e.message); }
 }
 
+// Part 295 (Sep 26 2026): the Spotter is no longer minutes x
+// LIVE_COST_PER_MIN_USD at hang-up. live-billing.js prices Google's own
+// usageMetadata and posts the real cost as the call goes (every Live stop and
+// the live tick); this hang-up post only settles what is left, plus any
+// leftover minutes. The per-minute rate survives as the fallback for a Live
+// connection that sent no usageMetadata at all.
 async function postLiveUsage(session) {
-  try {
-    const secs = Number(session.liveSecondsTotal || 0);
-    if (!(secs > 0)) return;
-    const minutes = Math.round((secs / 60) * 100) / 100;
-    const costUSD = Math.round(minutes * Number(process.env.LIVE_COST_PER_MIN_USD || '0.055') * 10000) / 10000;
-    const secret = process.env.KADE_USAGE_EVENT_SECRET;
-    if (!secret || !session.userId) return;
-    const base = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
-    const axios = require('axios');
-    await axios.post(`${base}/api/kade/usage-event`, {
-      secret,
-      userId: session.userId,
-      service: 'video_live',
-      quantity: minutes,
-      unit: 'minutes',
-      costUSD,
-      metadata: { agent: session.agentName, surface: 'web', mode: 'live' },
-    }, { timeout: 8000, headers: { 'User-Agent': BROWSER_UA } });
-  } catch (e) { console.log('[video-live] usage post failed:', e && e.message); }
+  return liveBilling.flush(session, 'final');
 }
 
 function attachWebVoice(server) {

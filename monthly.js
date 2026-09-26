@@ -16,6 +16,16 @@
  * pot since Aug 21) has no balance watch, so its spend is not in "real"; and
  * the fixed bills (Inworld founder $25, Railway ~$32, Codemagic) are an env
  * number, MONTHLY_FIXED_USD, default 70, not a live read.
+ *
+ * Part 295 (Sep 26 2026): Google joins "real" the way Z.AI did, from a ledger
+ * the bridge keeps itself (/data/google-days.json, google-watch.js): the
+ * Spotter's metered cost and the BYOK share of the bridge's own OpenRouter
+ * calls. The line says "metered by the bridge" because it is only that part:
+ * the fork's direct Google calls (memory embeddings, Lyria, the lyric
+ * transcriber) and its BYOK describe lanes are not in it. Once her key sits in
+ * OpenRouter as BYOK, OpenRouter's usage counter stops carrying Gemini's cost
+ * too, so those fork lanes would need their own ledger (or a Google Cloud
+ * billing export) before "real" is whole again.
  */
 const fs = require('fs');
 const path = require('path');
@@ -39,19 +49,21 @@ function daysInto(now = new Date()) { return centralParts(now).d; }
 /* Real provider spend across a month from the bridge's daily snapshots.
  * A snapshot row: {dateKey:'YYYY-MM-DD', moonshot, openrouter_usage, openrouter, fish, twilio, ...}.
  * balance-kind pots go DOWN as they are spent; usage-kind go UP. */
-function realSpend(history, monthKey, zaiDays = {}) {
+function realSpend(history, monthKey, zaiDays = {}, googleDays = {}) {
   const rows = history.filter((h) => h && typeof h.dateKey === 'string' && h.dateKey.startsWith(monthKey)).sort((a, b) => a.dateKey < b.dateKey ? -1 : 1);
-  const zai = round(Object.entries(zaiDays || {}).filter(([k]) => k.startsWith(monthKey)).reduce((s, [, v]) => s + (Number(v) || 0), 0));
-  if (rows.length < 2) return { models: zai, zai, days: rows.length, note: 'fewer than two snapshots this month' };
+  const ledger = (days) => round(Object.entries(days || {}).filter(([k]) => k.startsWith(monthKey)).reduce((s, [, v]) => s + (Number(v) || 0), 0));
+  const zai = ledger(zaiDays);
+  const google = ledger(googleDays);
+  if (rows.length < 2) return { models: round(zai + google), zai, google, days: rows.length, note: 'fewer than two snapshots this month' };
   const first = rows[0], last = rows[rows.length - 1];
   const delta = (key, kind) => (first[key] == null || last[key] == null) ? 0 : Math.max(0, kind === 'usage' ? last[key] - first[key] : first[key] - last[key]);
   const moonshot = delta('moonshot', 'balance');
   const openrouter = last.openrouter_usage != null ? delta('openrouter_usage', 'usage') : delta('openrouter', 'balance');
-  return { models: round(moonshot + openrouter + zai), moonshot: round(moonshot), openrouter: round(openrouter), zai, days: rows.length, from: first.dateKey, to: last.dateKey };
+  return { models: round(moonshot + openrouter + zai + google), moonshot: round(moonshot), openrouter: round(openrouter), zai, google, days: rows.length, from: first.dateKey, to: last.dateKey };
 }
 function round(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
-function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = () => ({}), runNotify, adminUserId, log = console, fetchImpl = global.fetch }) {
+function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = () => ({}), readGoogleDays = () => ({}), runNotify, adminUserId, log = console, fetchImpl = global.fetch }) {
   async function chargedFromFork(days) {
     const r = await fetchImpl(`${proxyUrl}/librechat/usage?days=${Math.max(1, days)}`, {
       headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
@@ -79,7 +91,7 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = 
     const mk = monthKey || monthKeyOf(now);
     const nDays = days != null ? days : daysInto(now);
     const [forkRes, hist] = await Promise.all([chargedFromFork(nDays).catch((e) => ({ error: e.message })), Promise.resolve(readBalanceHistory())]);
-    const real = realSpend(hist, mk, readZaiDays());
+    const real = realSpend(hist, mk, readZaiDays(), readGoogleDays());
     const charged = forkRes.charged || 0;
     const mult = await multiplierInForce();
     const realModels = real.models || 0;
@@ -93,7 +105,8 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = 
     const ratio = realModels > 0 ? round(charged / realModels) : null;
     const spoken =
       `${closing ? 'Books for ' : 'So far in '}${mk}: the family was charged $${charged.toFixed(2)} for models; the models really cost $${realModels.toFixed(2)}` +
-      ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}, Z.AI $${(real.zai || 0).toFixed(2)} metered by the proxy)` +
+      ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}, Z.AI $${(real.zai || 0).toFixed(2)} metered by the proxy` +
+      `${real.google ? `, Google $${real.google.toFixed(2)} metered by the bridge` : ''})` +
       `; metered extras $${(forkRes.extras || 0).toFixed(2)}; fixed bills about $${FIXED_USD} a month${closing ? '' : ` ($${fixedSoFar.toFixed(2)} so far)`}. The multiplier is ${mult}` +
       (needed != null ? `; this month needed about ${needed}.` : '.') +
       (ratio != null ? ` Charged over real: ${ratio}x.` : '') + (forkRes.error ? ` (fork usage read failed: ${forkRes.error})` : '');
@@ -120,8 +133,8 @@ function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = 
   return { report, close, lastClosed, monthKeyOf, realSpend };
 }
 
-function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalanceHistory, readZaiDays, runNotify, adminUserId }) {
-  const monthly = makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays, runNotify, adminUserId });
+function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalanceHistory, readZaiDays, readGoogleDays, runNotify, adminUserId }) {
+  const monthly = makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays, readGoogleDays, runNotify, adminUserId });
   const adminOk = (req) => bridgeSecretOk(req, req.get('x-kade-secret') || req.get('x-bridge-secret') || req.query.secret || (req.body && req.body.secret));
   app.get('/monthly', async (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'Unauthorized' });
