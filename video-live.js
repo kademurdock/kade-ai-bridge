@@ -368,7 +368,7 @@ function startLive(session, speak) {
     gws.on('open', () => {
       try { gws.send(JSON.stringify(buildSetupMessage(session))); } catch (e) { console.log('[video-live] setup send failed:', e.message); }
     });
-    gws.on('message', (raw) => handleGoogleMessage(session, raw));
+    gws.on('message', (raw) => handleGoogleMessage(session, raw, gws));
     // Part 295: a socket this session already let go of (our own stopLive, or an
     // old connection after a new one started) no longer speaks for the call.
     // Before, closing it ourselves fired stopLive a second time, and the
@@ -392,7 +392,7 @@ function startLive(session, speak) {
   }
 }
 
-function handleGoogleMessage(session, raw) {
+function handleGoogleMessage(session, raw, gws) {
   let msg;
   try { msg = JSON.parse(raw.toString()); } catch { return; }
   // Part 295: Google's own meter. Any server message may carry usageMetadata
@@ -404,6 +404,11 @@ function handleGoogleMessage(session, raw) {
       if (!session.liveOn) liveBilling.flush(session, 'late').catch(() => {});
     } catch { /* metering trouble never touches the call */ }
   }
+  // Part 295: past the meter, a socket this session let go of says nothing. A
+  // setupComplete landing after a hang-up or "live off" during setup would
+  // otherwise turn live on for nobody: its tick would bill idle minutes, and
+  // with the socket released no close would ever stop it.
+  if (gws && session._liveWs !== gws) return;
   if (msg.setupComplete) {
     session.liveOn = true;
     session._liveStartedAt = Date.now(); // greeting-grace anchor, see sc.interrupted below

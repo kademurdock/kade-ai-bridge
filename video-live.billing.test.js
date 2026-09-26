@@ -162,3 +162,51 @@ test('a report that arrives after the stop is still metered (and posted on its o
   assert.ok(Math.abs(session._liveBill.totals.metered - 0.02375) < 1e-9);
   assert.equal(session._liveBill.pend.metered, 0, 'taken for posting straight away');
 }));
+
+/* Review finding: a caller who hangs up while Google's setup is still in flight.
+ * voice-stream's hang-up now stops a socket that is not live yet, and a
+ * setupComplete that still lands on a released socket never turns live on, so
+ * no idle minutes are billed for nobody. */
+for (const reason of ['hangup', 'off']) {
+  test(`${reason} during setup: a late setupComplete turns nothing on and bills nothing`, withLive(async () => {
+    const { session, speak, out } = caller();
+    await quiet(async () => {
+      startLive(session, speak);
+      const g = FakeGoogle.sockets.at(-1);
+      assert.equal(session.liveOn, false, 'setup still in flight');
+      vl.stopLive(session, reason);
+      assert.equal(g.closedByUs, true, 'the in-flight socket is closed');
+      g.emit('message', Buffer.from(JSON.stringify({ setupComplete: {} })));
+      assert.equal(session.liveOn, false, 'a released socket never turns live on');
+      assert.equal(session._liveTick || null, null, 'no meter tick for nobody');
+      await tick(); await tick();
+      g.emit('close', 1000, Buffer.from(''));
+      await tick();
+    });
+    const bill = session._liveBill;
+    assert.equal(bill.totals.est, 0, 'no per-minute estimate');
+    assert.equal(bill.totals.metered, 0);
+    assert.equal(Number(session.liveSecondsTotal || 0), 0);
+    assert.equal(out.states.filter((m) => m.type === 'live-state' && m.on === true).length, 0);
+    assert.equal(out.speaks.length, reason === 'hangup' ? 0 : 1, 'a hang-up says nothing; live off hands back once');
+  }));
+}
+
+test('an old socket a newer connection replaced cannot turn live on or speak, but its meter still counts', withLive(async () => {
+  const { session, speak } = caller();
+  await quiet(async () => {
+    startLive(session, speak);
+    const old = FakeGoogle.sockets.at(-1);
+    startLive(session, speak);
+    const now = FakeGoogle.sockets.at(-1);
+    old.emit('message', Buffer.from(JSON.stringify({ setupComplete: {} })));
+    assert.equal(session.liveOn, false);
+    old.emit('message', Buffer.from(JSON.stringify({ serverContent: { outputTranscription: { text: 'stale words' }, turnComplete: true }, usageMetadata: USAGE })));
+    assert.equal(session.history.length, 0, 'nothing said on a released socket lands in the transcript');
+    assert.ok(Math.abs(session._liveBill.totals.metered - 0.02375) < 1e-9, 'Google billed it, so it is metered');
+    now.emit('message', Buffer.from(JSON.stringify({ setupComplete: {} })));
+    assert.equal(session.liveOn, true, 'the current socket still comes up');
+    vl.stopLive(session, 'hangup');
+    await tick();
+  });
+}));

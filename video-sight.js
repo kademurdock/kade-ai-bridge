@@ -150,8 +150,9 @@ function pruneSceneLog(session) {
 
 /* Part 295 (Sep 26 2026): with her Google key inside OpenRouter (BYOK),
  * usage.cost is only OpenRouter's fee and Google's charge rides in
- * usage.cost_details.upstream_inference_cost. The call's real cost is the sum
- * (or-cost.js); the Google share also lands in the bridge's Google ledger. */
+ * usage.cost_details.upstream_inference_cost. A BYOK call's real cost is the
+ * sum and its Google share lands in the bridge's Google ledger; a normal reply
+ * restates cost in that field, so it costs usage.cost alone (or-cost.js). */
 function addLookCost(session, model, usage) {
   const cost = openRouterCost(usage);
   if (cost > 0) session.videoCostUSD = (session.videoCostUSD || 0) + cost;

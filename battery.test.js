@@ -32,10 +32,18 @@ test('an answer on the first try, or an empty answer for any other reason, is no
 test('a BYOK judge reply is costed at fee + upstream, not the $0 fee alone', async () => {
   const out = await judgeWithRetry(async () => ({
     choices: [{ message: { content: '{"score": 70}' }, finish_reason: 'stop' }],
-    usage: { cost: 0, cost_details: { upstream_inference_cost: 0.0009 } },
+    usage: { cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 0.0009 } },
   }), 'm', quiet);
   assert.ok(Math.abs(out.cost - 0.0009) < 1e-12, String(out.cost));
   assert.equal(out.estimated, false, 'a reported upstream cost is a real number, not an estimate');
+});
+test('a normal judge reply restates cost as upstream and is costed once, so the cap trips at real spend', async () => {
+  const out = await judgeWithRetry(async () => ({
+    choices: [{ message: { content: '{"score": 70}' }, finish_reason: 'stop' }],
+    usage: { cost: 0.0009, is_byok: false, cost_details: { upstream_inference_cost: 0.0009 } },
+  }), 'm', quiet);
+  assert.ok(Math.abs(out.cost - 0.0009) < 1e-12, String(out.cost));
+  assert.equal(out.estimated, false);
 });
 
 test('twelve probes, each with id, rule, want, since', () => {

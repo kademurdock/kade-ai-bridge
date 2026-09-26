@@ -82,6 +82,67 @@ test('an ordinary voice call is estimated exactly as before', async () => {
   assert.strictEqual(posted[0].metadata.outTok, Math.ceil('Hey Amber, good to hear you.'.length / 4));
 });
 
+/* Review finding: a call started inside an open conversation is seeded with up to
+ * 12 earlier messages. Those replies were written before the call, so they are
+ * context, never this call's text-model replies. */
+function seedMap(turns) {
+  const ctx = { String, turns };
+  vm.createContext(ctx);
+  vm.runInContext(grab('const seeded = turns.map((tn) => ({', 'session.history.unshift(...seeded);') + '\nthis.out = seeded;', ctx);
+  return ctx.out;
+}
+
+test('the shipped seeding marks earlier conversation turns seeded: true', () => {
+  const out = seedMap([{ role: 'user', text: 'Hi' }, { role: 'assistant', text: 'Hello there.' }]);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(out)), [
+    { role: 'user', content: 'Hi', seeded: true },
+    { role: 'assistant', content: 'Hello there.', seeded: true },
+  ]);
+});
+
+test('HER SPOTTER CALL FROM AN OPEN CONVERSATION: seeded replies are not billed, so no voice_chat charge', async () => {
+  const { post, posted } = estimator();
+  const seeded = [];
+  for (let i = 0; i < 6; i++) seeded.push({ role: 'user', text: 'u'.repeat(200) }, { role: 'assistant', text: 'a'.repeat(1200) });
+  await post({
+    billCaller: false, _spotterDirect: true, userId: 'u-amber', lcEmail: 'amber@example.invalid', agentName: 'Kiana', surface: 'web',
+    history: [
+      ...seedMap(seeded),
+      { role: 'user', content: 'Can you read this label for me?', lane: 'live' },
+      { role: 'assistant', content: 'It says two tablets every six hours.', agentName: 'Scout', lane: 'live' },
+    ],
+  });
+  assert.strictEqual(posted.length, 0);
+});
+
+test('seeded turns still count as the context a real character reply on the call was sent', async () => {
+  const { post, posted } = estimator();
+  const seeded = seedMap([{ role: 'user', text: 'Earlier question' }, { role: 'assistant', text: 'Earlier answer from before the call.' }]);
+  const mine = [{ role: 'user', content: 'Kiana, you there?' }, { role: 'assistant', content: 'Right here.' }];
+  await post({ billCaller: false, userId: 'u-amber', lcEmail: 'amber@example.invalid', agentName: 'Kiana', surface: 'web', history: [...seeded, ...mine] });
+  assert.strictEqual(posted.length, 1);
+  const prior = [...seeded, mine[0]].reduce((n, t) => n + t.content.length, 0);
+  assert.strictEqual(posted[0].metadata.inTok, Math.ceil((4000 + prior) / 4), 'one reply billed, with the seeded turns as its context');
+  assert.strictEqual(posted[0].metadata.outTok, Math.ceil('Right here.'.length / 4));
+});
+
+/* Review finding: hanging up while Google's setup is in flight left the socket
+ * open, and Google later brought it up for nobody. The shipped hang-up line is
+ * run against a session that has a socket but is not live yet. */
+test('hang-up stops a Live socket whose setup is still in flight', () => {
+  const line = grab("        try { if (session.liveOn || session._liveWs) videoLive.stopLive(session, 'hangup'); } catch {}", '\n');
+  const run = (session) => {
+    const calls = [];
+    const ctx = { session, videoLive: { stopLive: (s, why) => calls.push(why) } };
+    vm.createContext(ctx);
+    vm.runInContext(line, ctx);
+    return calls;
+  };
+  assert.deepStrictEqual(run({ liveOn: false, _liveWs: {} }), ['hangup'], 'setup in flight');
+  assert.deepStrictEqual(run({ liveOn: true, _liveWs: {} }), ['hangup'], 'live');
+  assert.deepStrictEqual(run({ liveOn: false, _liveWs: null }), [], 'no Live at all: nothing to stop');
+});
+
 test('the caller\'s words while the Spotter has the call are pushed with lane: live', () => {
   const gate = grab('  if (session.liveOn) {\n    // July 18 2026', '    if (/\\b(?:live');
   assert.match(gate, /session\.history\.push\(\{ role: 'user', content: text, lane: 'live' \}\)/);

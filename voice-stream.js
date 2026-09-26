@@ -4068,7 +4068,9 @@ function verifyWebTicket(ticket) {
 // still counts as context for a later character turn, because that turn is
 // sent the whole history. A direct Spotter call that never handed back to
 // the character therefore posts no voice_chat estimate at all: the phantom
-// charge the review found, for text turns that never ran.
+// charge the review found, for text turns that never ran. The same goes for
+// the earlier turns seeded from the open conversation (seeded: true): they
+// were written before the call, so they count only as context.
 async function postVoiceChatUsage(session) {
   try {
     if (!session || session._voiceChatPosted) return;
@@ -4088,7 +4090,7 @@ async function postVoiceChatUsage(session) {
     let prior = 0;
     for (const m of hist) {
       const len = String(m.content).length;
-      if (m.role !== 'user' && m.lane !== 'live') { inChars += OVERHEAD + prior; outChars += len; }
+      if (m.role !== 'user' && m.lane !== 'live' && !m.seeded) { inChars += OVERHEAD + prior; outChars += len; }
       prior += len;
     }
     const inTok = Math.ceil(inChars / 4);
@@ -4278,9 +4280,12 @@ function attachWebVoice(server) {
                 // Seed BEFORE the greeting's own history entry if possible;
                 // order within history is what matters, and unshift keeps
                 // prior conversation turns ahead of anything this call adds.
+                // Part 295: seeded: true marks a reply written BEFORE this call,
+                // so the voice_chat estimate never bills it as one of this call's.
                 const seeded = turns.map((tn) => ({
                   role: tn.role === 'user' ? 'user' : 'assistant',
                   content: String(tn.text || '').slice(0, 2000),
+                  seeded: true,
                 }));
                 session.history.unshift(...seeded);
                 console.log(`[web-voice] seeded ${seeded.length} prior turns from convo ${session.targetConversationId}`);
@@ -4471,7 +4476,10 @@ function attachWebVoice(server) {
       clearTimeout(helloTimer);
       if (session) {
         try { if (session.videoOn || session.videoSeconds) { videoSight.stopVideo(session, 'hangup'); postVideoUsage(session); } } catch {}
-        try { if (session.liveOn) videoLive.stopLive(session, 'hangup'); } catch {}
+        // Part 295: also while Google's setup is still in flight (a socket, not
+        // live yet). Left open, Google would bring it up after the hang-up and
+        // bill idle minutes nobody was on. stopLive before live adds no seconds.
+        try { if (session.liveOn || session._liveWs) videoLive.stopLive(session, 'hangup'); } catch {}
         try { postLiveUsage(session); } catch {}
         try { logCallTranscript(session); } catch {}
         try { postWebVoiceUsage(session); } catch {}
