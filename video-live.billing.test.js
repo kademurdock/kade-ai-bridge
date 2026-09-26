@@ -35,21 +35,34 @@ const quiet = async (fn) => {
   try { return await fn(); } finally { console.log = log; console.warn = warn; }
 };
 
-test('the trim Google asks for: trigger 25,000 tokens, keep 8,000, int64 sent as strings', () => {
-  assert.deepEqual(liveCompression({}), { triggerTokens: '25000', slidingWindow: { targetTokens: '8000' } });
+/* Kade chose "about a minute" of Spotter memory: trigger 40,000 / keep 20,000
+ * (the first cut, 25,000 / 8,000, kept about 15 seconds of camera). */
+const MINUTE = { triggerTokens: '40000', slidingWindow: { targetTokens: '20000' } };
+
+test('about a minute of camera: trigger 40,000 tokens, keep 20,000, int64 sent as strings', () => {
+  assert.deepEqual(liveCompression({}), MINUTE);
   const setup = buildSetupMessage({ callerName: 'Amber', agentName: 'Kiana' }).setup;
-  assert.deepEqual(setup.contextWindowCompression, { triggerTokens: '25000', slidingWindow: { targetTokens: '8000' } });
+  assert.deepEqual(setup.contextWindowCompression, MINUTE);
+  assert.deepEqual(Object.keys(setup.contextWindowCompression), ['triggerTokens', 'slidingWindow'], 'Google\'s field names, nothing extra');
   assert.deepEqual(setup.proactivity, { proactiveAudio: true }, 'the rest of the setup is untouched');
   assert.deepEqual(setup.outputAudioTranscription, {});
 });
 
 test('env overrides; 0 restores Google\'s defaults; a target at or over the trigger becomes half', () => {
-  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '40000', LIVE_COMPRESSION_TARGET_TOKENS: '12000' }),
-    { triggerTokens: '40000', slidingWindow: { targetTokens: '12000' } });
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '60000', LIVE_COMPRESSION_TARGET_TOKENS: '30000' }),
+    { triggerTokens: '60000', slidingWindow: { targetTokens: '30000' } });
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '25000', LIVE_COMPRESSION_TARGET_TOKENS: '8000' }),
+    { triggerTokens: '25000', slidingWindow: { targetTokens: '8000' } }, 'the first cut is one env pair away');
   assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '0' }), { slidingWindow: {} });
   assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '20000', LIVE_COMPRESSION_TARGET_TOKENS: '20000' }),
     { triggerTokens: '20000', slidingWindow: { targetTokens: '10000' } });
-  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: 'lots' }), { triggerTokens: '25000', slidingWindow: { targetTokens: '8000' } });
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TARGET_TOKENS: '12000' }),
+    { triggerTokens: '40000', slidingWindow: { targetTokens: '12000' } }, 'a target alone rides the default trigger');
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '30000' }),
+    { triggerTokens: '30000', slidingWindow: { targetTokens: '20000' } }, 'a trigger alone keeps the default target when it fits');
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: '15000' }),
+    { triggerTokens: '15000', slidingWindow: { targetTokens: '7500' } }, 'a trigger under the default target keeps half');
+  assert.deepEqual(liveCompression({ LIVE_COMPRESSION_TRIGGER_TOKENS: 'lots' }), MINUTE);
 });
 
 function caller() {

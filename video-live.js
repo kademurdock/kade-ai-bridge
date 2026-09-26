@@ -175,17 +175,25 @@ const SPOTTER_PLATFORM_PROTOCOL =
  * at the audio input rate, so a call's cost per minute climbs the longer it runs.
  * The July 19 `slidingWindow: {}` had no trigger, which means Google's default
  * of 80% of the model's context window: history kept piling up for the whole
- * ~10-minute connection. The same page's fix is a compression trigger around
- * 25,000 tokens and a sliding window around 8,000; after that each turn bills
- * only the kept history plus the new tokens. Field names per the v1alpha/v1beta
- * reference (ai.google.dev/api/live, updated 2026-09-04):
+ * ~10-minute connection. The same page's fix is a compression trigger plus a
+ * sliding-window target; after each trim a turn bills only the kept history
+ * plus the new tokens. Field names per the v1alpha/v1beta reference
+ * (ai.google.dev/api/live, updated 2026-09-04):
  * ContextWindowCompressionConfig.triggerTokens and SlidingWindow.targetTokens,
- * both int64, sent as strings (proto JSON's form for int64). The target keeps
- * the system instruction too (it always stays at the front), so with Scout's
- * full briefing and memories the kept conversation is roughly the last 4,000
- * tokens: about 15 seconds of camera, or a couple of minutes of voice.
- * Env: LIVE_COMPRESSION_TRIGGER_TOKENS (default 25000; 0 = Google's defaults,
- * the old behaviour), LIVE_COMPRESSION_TARGET_TOKENS (default 8000; must be
+ * both int64, sent as strings (proto JSON's form for int64).
+ * HOW MUCH IT REMEMBERS (Sep 26 2026, Kade chose "about a minute"): the first
+ * cut used the page's example sizes, trigger 25,000 / keep 8,000. The target
+ * keeps the system instruction too (it always stays at the front), and Scout's
+ * full briefing and memories take about 4,000 of it, so keep 8,000 left roughly
+ * 15 seconds of camera: a Spotter that forgot what it saw a moment ago. Camera
+ * plus mic runs near 290 tokens a second (about 258 of video at medium
+ * resolution, 32 of audio), so keep 20,000 holds about a minute of camera right
+ * after a trim, and trigger 40,000 lets it grow to about two minutes before the
+ * next one. The review measured that at roughly 12-13 cents a minute real cost
+ * on camera calls. Voice alone fills the window far slower, so a call with the
+ * camera off remembers several minutes.
+ * Env: LIVE_COMPRESSION_TRIGGER_TOKENS (default 40000; 0 = Google's defaults,
+ * the old behaviour), LIVE_COMPRESSION_TARGET_TOKENS (default 20000; must be
  * under the trigger, else half of it). */
 function liveCompression(env = process.env) {
   const int = (v, d) => {
@@ -193,9 +201,9 @@ function liveCompression(env = process.env) {
     const n = parseInt(v, 10);
     return Number.isFinite(n) ? n : d;
   };
-  const trigger = int(env.LIVE_COMPRESSION_TRIGGER_TOKENS, 25000);
+  const trigger = int(env.LIVE_COMPRESSION_TRIGGER_TOKENS, 40000);
   if (trigger <= 0) return { slidingWindow: {} };
-  const target = int(env.LIVE_COMPRESSION_TARGET_TOKENS, 8000);
+  const target = int(env.LIVE_COMPRESSION_TARGET_TOKENS, 20000);
   const keep = target > 0 && target < trigger ? target : Math.floor(trigger / 2);
   return { triggerTokens: String(trigger), slidingWindow: { targetTokens: String(keep) } };
 }
@@ -285,8 +293,9 @@ function buildSetupMessage(session) {
       // for a couple of minutes) stop dropping at all, and even if a rarer
       // long call still eventually drops, the July 19 stopLive fix now
       // guarantees that drop is always audible instead of silent.
-      // Sep 26 2026 (Part 295): now with a trigger and a target; see
-      // liveCompression above for why the window must stay small.
+      // Sep 26 2026 (Part 295): now with a trigger and a target, sized to
+      // about a minute of camera; see liveCompression above for the sizes
+      // and why the window must stay bounded.
       contextWindowCompression: liveCompression(),
       // OUTPUT TRANSCRIPTION (July 18 2026, Kade: "after a voice chat I can
       // only see my half"): ask Google for a text transcript of the model's
