@@ -36,7 +36,7 @@ const axios = require('axios');
 
 const FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'bridge-spontaneous.json');
 
-function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, proxyUrl, proxySecret, browserUA, siteBase, kianaAgentId, kianaName }) {
+function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, proxyUrl, proxySecret, browserUA, siteBase, kianaAgentId, kianaName, hasDevice }) {
   const enabled = () => process.env.SPONTANEOUS !== '0';
   const IDLE_DAYS = Math.max(1, parseInt(process.env.SPONTANEOUS_IDLE_DAYS, 10) || 3);
   const GAP_DAYS = Math.max(2, parseInt(process.env.SPONTANEOUS_GAP_DAYS, 10) || 6);
@@ -111,6 +111,12 @@ function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, pro
       const acts = await lastActivity();
       const now = Date.now();
       let sentCount = 0;
+      /* Sep 29 2026: a text can only reach a linked phone. The tick used to
+       * compose first (a full Kiana turn) and learn afterwards that there
+       * was nobody to send to ("ZERO TARGETS"); an unsent text leaves no
+       * lastSentAt, so the same people were composed for every day at 11.
+       * Checked before composing now. Without the check wired in, as before. */
+      const noPhone = [];
       for (const a of acts) {
         if (onlyUserId && a.userId !== onlyUserId) continue;
         if (!allowed.has(a.userId)) continue;
@@ -121,6 +127,7 @@ function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, pro
         const gap = st.nextGapDays || GAP_DAYS;
         if (st.lastSentAt && (now - new Date(st.lastSentAt).getTime()) / 864e5 < gap) continue;
         if (!onlyUserId && sentCount >= MAX_PER_TICK) break;
+        if (typeof hasDevice === 'function' && !hasDevice(a.userId)) { noPhone.push(a.userId); continue; }
         try {
           const out = await composeAndSend(a, daysQuiet, false);
           results.push({ userId: a.userId, name: a.name, daysQuiet, ...out });
@@ -135,8 +142,8 @@ function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, pro
           results.push({ userId: a.userId, error: e.message });
         }
       }
-      console.log(`[spontaneous] tick ${day}: ${sentCount} sent, ${results.length} considered`);
-      return { ok: true, sent: sentCount, results };
+      console.log(`[spontaneous] tick ${day}: ${sentCount} sent, ${results.length} considered${noPhone.length ? `, ${noPhone.length} skipped with no linked phone` : ''}`);
+      return { ok: true, sent: sentCount, results, skippedNoPhone: noPhone.length };
     } catch (e) {
       console.error('[spontaneous] tick failed:', e.message);
       return { ok: false, error: e.message, results };

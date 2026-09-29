@@ -6040,6 +6040,7 @@ try {
     proxyUrl: PROXY_URL, proxySecret: PROXY_SECRET,
     browserUA: BROWSER_UA, siteBase: LIBRECHAT_URL,
     kianaAgentId: DEFAULT_AGENT, kianaName: DEFAULT_AGENT_NAME,
+    hasDevice: (userId) => tokensForUser(userId).length > 0,
   });
 } catch (e) { console.warn('[spontaneous] attach failed (bridge unaffected):', e.message); }
 
