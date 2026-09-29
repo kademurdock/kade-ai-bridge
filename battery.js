@@ -75,6 +75,28 @@ const JUDGES = String(process.env.BATTERY_JUDGES || 'z-ai/glm-5.3-flash,deepseek
 const HOUR_UTC = parseInt(process.env.BATTERY_HOUR || '7', 10); // 2 a.m. Central, after the day is done
 const DAILY_CAP_USD = parseFloat(process.env.BATTERY_DAILY_CAP_USD || '0.25');
 const ASK_TIMEOUT_MS = 120000;
+/* Sep 29 2026: THE SEAT RAN DRY. Twenty-four nightly asks on Kiana's big
+ * prompt draw about $7 a month of the seat's own site credit, and on Sep 27
+ * the vischeck seat hit $0 mid-run: 9 of Kiana's 12 probes and all 12 of the
+ * control's came back "empty reply from agent", and Sep 28 scored nothing.
+ * The same seat is the App Store review seat, so a dry seat is also what an
+ * Apple reviewer would have met. When a probe is refused for credit, the
+ * battery adds this much SITE credit to that one seat (no real money moves;
+ * the asks were always a platform expense) and retries once. At most once a
+ * run. 0 turns it off, and a dry seat then stops the run with a plain reason. */
+const SEAT_TOPUP_USD = Math.min(10, Math.max(0, parseFloat(process.env.BATTERY_SEAT_TOPUP_USD || '5') || 0));
+const SEAT_DRY_RE = /prepaid credit has run dry|credit left, but this turn needed more|token_balance/i;
+
+/** Plain words for why a run could not score, for the spoken line. */
+function runFailureReason(row) {
+  if (!row) return '';
+  const k = (row.agents && row.agents.kiana) || {};
+  const firstErr = row.error || ((k.per || []).find((p) => p.error) || {}).error || '';
+  if (SEAT_DRY_RE.test(firstErr) || /out of site credit/.test(firstErr)) return 'the vischeck test seat was out of site credit';
+  if (/403|forbidden/i.test(firstErr)) return 'the site refused the test seat (a 403), so the run stopped';
+  if (!firstErr) return '';
+  return String(firstErr).replace(/\s+/g, ' ').slice(0, 140);
+}
 
 /* ── THE TWELVE PROBES ────────────────────────────────────────────────────
  * All invented. None borrowed from a real person's conversation (law 25's
@@ -344,6 +366,20 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     return deleted;
   }
 
+  async function topUpSeat() {
+    if (!(SEAT_TOPUP_USD > 0)) return { ok: false, why: 'automatic top-up is off (BATTERY_SEAT_TOPUP_USD=0)' };
+    try {
+      const r = await axios.post(`${proxyUrl}/librechat/add-credits`, { userId: VISCHECK_USER_ID, amountUSD: SEAT_TOPUP_USD },
+        { headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA }, timeout: 60000 });
+      const balanceUSD = r.data && Number(r.data.balanceUSD);
+      log.warn(`[battery] the vischeck seat was out of site credit; added $${SEAT_TOPUP_USD} (balance now $${Number.isFinite(balanceUSD) ? balanceUSD.toFixed(2) : '?'})`);
+      return { ok: true, addedUSD: SEAT_TOPUP_USD, balanceUSD: Number.isFinite(balanceUSD) ? balanceUSD : null };
+    } catch (e) {
+      log.warn('[battery] could not top up the dry vischeck seat:', e.message);
+      return { ok: false, why: e.message };
+    }
+  }
+
   function dayKey(d = new Date()) { return d.toISOString().slice(0, 10); }
   function spend(usd) {
     const today = dayKey();
@@ -370,9 +406,27 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
         const per = [];
         for (const probe of PROBES) {
           let reply;
-          try { reply = await ask(agentId, probe.text); }
+          try {
+            try { reply = await ask(agentId, probe.text); }
+            catch (e) {
+              if (!SEAT_DRY_RE.test(e.message)) throw e;
+              // One top-up per run; a seat that is dry again after it (or a
+              // top-up that failed) stops the run instead of burning 23 more.
+              if (!row.seatTopUp) row.seatTopUp = await topUpSeat();
+              if (!row.seatTopUp.ok || row.seatTopUp.retried) {
+                const stop = new Error(`the vischeck seat is out of site credit (${row.seatTopUp.ok ? 'dry again after one top-up' : row.seatTopUp.why}) — run stopped`);
+                stop.seatDry = true;
+                throw stop;
+              }
+              row.seatTopUp.retried = true;
+              reply = await ask(agentId, probe.text);
+            }
+          }
           catch (e) {
-            if (/refusing to probe on the admin seat/.test(e.message)) throw e;
+            if (/refusing to probe on the admin seat/.test(e.message) || e.seatDry || SEAT_DRY_RE.test(e.message)) {
+              if (!e.seatDry) e.message = `the vischeck seat is out of site credit — run stopped (${e.message.slice(0, 160)})`;
+              throw e;
+            }
             per.push({ id: probe.id, error: e.message });
             // Standing rule: stop DEAD on the first 403. Whether it is the
             // ACL (this seat cannot see the agent) or the anti-abuse gate,
@@ -505,7 +559,17 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
     const kWeek = mean(week.map((r) => r.agents.kiana && r.agents.kiana.score).filter((x) => x != null));
     const cWeek = mean(week.map((r) => r.agents.control && r.agents.control.score).filter((x) => x != null));
     let spoken = '';
-    if (!latest) {
+    /* Sep 29 2026: the newest run, finished or not. A run that stopped, or
+     * finished with nothing scored, is said as a failure with its reason --
+     * "Kiana null of 100" was what Sep 28's dry seat sounded like. */
+    const newest = readRuns(1)[0] || null;
+    const newestScored = newest && newest.ok && newest.agents && newest.agents.kiana && (newest.agents.kiana.scored || 0) > 0;
+    if (newest && !newestScored) {
+      const ageH = Math.round((Date.now() - Date.parse(newest.finishedAt || newest.at)) / 36e5);
+      const why = runFailureReason(newest) || 'no probe came back with a reply';
+      spoken = `Persona battery, ${ageH < 30 ? 'last run' : `${Math.round(ageH / 24)} days ago`}: could not score, because ${why}`
+        + (kWeek != null && week.length >= 3 ? `; the seven-night mean before it was ${kWeek} against ${cWeek}` : '') + '.';
+    } else if (!latest) {
       spoken = 'Persona battery: no completed run yet.';
     } else {
       const k = latest.agents.kiana || {}; const c = latest.agents.control || {};
@@ -575,4 +639,4 @@ function attachBattery(app, { bridgeSecretOk, proxyUrl, proxySecret, openrouterK
   return battery;
 }
 
-module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt, jevChair, judgeWithRetry };
+module.exports = { attachBattery, makeBattery, PROBES, FLAG_KEYS, parseJudge, judgePrompt, jevChair, judgeWithRetry, runFailureReason, SEAT_DRY_RE };
