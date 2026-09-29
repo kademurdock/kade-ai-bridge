@@ -120,6 +120,7 @@ function bill(session) {
       pend: emptyPend(), postedSecs: 0, lastPostAt: Date.now(), seq: 0,
       segStartSecs: Number(session.liveSecondsTotal || 0), segMetered: false,
       model: null, totals: { metered: 0, est: 0, reports: 0 },
+      inflight: new Set(), ended: false,
     };
   }
   return session._liveBill;
@@ -232,6 +233,15 @@ async function flush(session, why = 'tick', { post = postUsageEvent, attempts, s
   try {
     if (!session) return false;
     const b = bill(session);
+    // Sep 29 2026: a hang-up runs stopLive's 'stop' post and this 'final' back to
+    // back, so the 'stop' is still in the air here. With the fork down it gave
+    // its cost back AFTER 'final' had found nothing to send, and nothing posted
+    // again: the call went unbilled. 'final' now waits for every post in flight
+    // to settle, then sends whatever is left.
+    if (why === 'final') {
+      if (b.inflight && b.inflight.size) await Promise.allSettled([...b.inflight]);
+      b.ended = true;
+    }
     const usd = b.pend.metered + b.pend.est;
     const secs = Number(session.liveSecondsTotal || 0) - b.postedSecs;
     if (why === 'final' && (b.totals.metered > 0 || b.totals.est > 0)) {
@@ -249,22 +259,26 @@ async function flush(session, why = 'tick', { post = postUsageEvent, attempts, s
     const body = usageBody(session, t, why, secret);
     const tries = Math.max(1, attempts || (why === 'final' || why === 'stop' ? 3 : 1));
     const wait = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
-    for (let i = 1; i <= tries; i++) {
-      try {
-        await post(body);
-        return true;
-      } catch (e) {
-        if (!nothingLanded(e)) {
-          console.warn(`[video-live] usage post ${why} #${t.seq} failed and may have landed, so it is not re-sent: ${e && e.message}`);
+    const sending = (async () => {
+      for (let i = 1; i <= tries; i++) {
+        try {
+          await post(body);
+          return true;
+        } catch (e) {
+          if (!nothingLanded(e)) {
+            console.warn(`[video-live] usage post ${why} #${t.seq} failed and may have landed, so it is not re-sent: ${e && e.message}`);
+            return false;
+          }
+          if (i < tries) { await wait(i * 5000); continue; }
+          giveBack(session, t);
+          console.warn(`[video-live] usage post ${why} #${t.seq} failed (${e && e.message}); ${why === 'final' || b.ended ? 'the call is over, so this part is lost' : 'kept for the next post'}`);
           return false;
         }
-        if (i < tries) { await wait(i * 5000); continue; }
-        giveBack(session, t);
-        console.warn(`[video-live] usage post ${why} #${t.seq} failed (${e && e.message}); ${why === 'final' ? 'the call is over, so this part is lost' : 'kept for the next post'}`);
-        return false;
       }
-    }
-    return false;
+      return false;
+    })();
+    b.inflight.add(sending);
+    try { return await sending; } finally { b.inflight.delete(sending); }
   } catch (e) {
     console.log('[video-live] usage post failed:', e && e.message);
     return false;

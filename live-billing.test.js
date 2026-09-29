@@ -236,6 +236,63 @@ test('the hang-up post carries leftover minutes even with no cost left; never a 
   } finally { delete process.env.KADE_USAGE_EVENT_SECRET; }
 });
 
+/* Sep 29 2026: a hang-up during a fork outage. stopLive's 'stop' post and the
+ * hang-up's 'final' start back to back (neither awaited); the 'stop' is refused
+ * three times and gives its cost back after 'final' had already found nothing. */
+test('hang-up in a fork outage: the refused stop post is sent by the final, once', async () => {
+  process.env.KADE_USAGE_EVENT_SECRET = 'offline';
+  try {
+    const s = call();
+    const posts = [];
+    lb.startSegment(s);
+    lb.addUsage(s, REPORT, MODEL);
+    s.liveSecondsTotal = 30;
+    lb.endSegment(s);
+    const refused = async () => { const e = new Error('connect ECONNREFUSED'); e.code = 'ECONNREFUSED'; throw e; };
+    const [stopOk, finOk] = await quiet(() => Promise.all([
+      lb.flush(s, 'stop', { post: refused, sleep: async () => {} }),
+      lb.flush(s, 'final', { post: async (b) => posts.push(b), sleep: async () => {} }),
+    ]));
+    assert.equal(stopOk, false);
+    assert.equal(finOk, true);
+    assert.equal(posts.length, 1);
+    close(posts[0].costUSD, 0.02375, 'the whole call, billed once');
+    assert.equal(posts[0].quantity, 0.5, 'with its minutes');
+    assert.equal(posts[0].metadata.why, 'final');
+    assert.equal(s._liveBill.inflight.size, 0);
+  } finally { delete process.env.KADE_USAGE_EVENT_SECRET; }
+});
+
+test('the final waits for a stop post in flight and never sends a second copy of it', async () => {
+  process.env.KADE_USAGE_EVENT_SECRET = 'offline';
+  try {
+    for (const outcome of ['lands', 'times out']) {
+      const s = call();
+      const posts = [];
+      lb.startSegment(s);
+      lb.addUsage(s, REPORT, MODEL);
+      s.liveSecondsTotal = 30;
+      let release;
+      const gate = new Promise((r) => { release = r; });
+      const stopPost = async (b) => {
+        await gate;
+        if (outcome === 'lands') { posts.push(b); return; }
+        const e = new Error('timeout of 8000ms exceeded'); e.code = 'ECONNABORTED'; throw e;
+      };
+      await quiet(async () => {
+        const stop = lb.flush(s, 'stop', { post: stopPost });
+        const fin = lb.flush(s, 'final', { post: async (b) => posts.push(b) });
+        await new Promise((r) => setImmediate(r));
+        assert.equal(posts.length, 0, `${outcome}: the final is still waiting on the stop`);
+        release();
+        await stop;
+        assert.equal(await fin, false, `${outcome}: nothing left for the final`);
+      });
+      assert.equal(posts.length, outcome === 'lands' ? 1 : 0, `${outcome}: a post that may have landed is never re-sent`);
+    }
+  } finally { delete process.env.KADE_USAGE_EVENT_SECRET; }
+});
+
 test('nobody to bill (no secret, or an unlinked caller) posts nothing and never throws', async () => {
   const posts = [];
   const s = call({ userId: null });

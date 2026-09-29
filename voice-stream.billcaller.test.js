@@ -88,13 +88,20 @@ test('phone: an inbound call is billed to the caller; an outbound call never is 
       params,
     });
     vm.runInContext(`let session;\n${start}\nthis.session = session;`, ctx);
-    return ctx.session.billCaller;
+    return ctx.session;
   };
-  assert.strictEqual(run({ from: '+15550100' }, null), true, 'inbound');
+  assert.strictEqual(run({ from: '+15550100' }, null).billCaller, true, 'inbound');
+  assert.strictEqual(run({ from: '+15550100' }, null).twilioOutbound, false, 'inbound');
   // A call someone asked a character to place, a wellness check-in, a phone agent call.
-  assert.strictEqual(run({ from: '+15550100', outbound: '1' }, { agentId: 'k', agentName: 'Kiana' }), false);
+  const placed = run({ from: '+15550100', outbound: '1' }, { agentId: 'k', agentName: 'Kiana', userId: 'amber-id' });
+  assert.strictEqual(placed.billCaller, false);
+  assert.strictEqual(placed.outbound, true);
+  assert.strictEqual(placed.outboundRequesterId, 'amber-id');
   // Twilio says outbound but the context has expired: still never the callee's bill.
-  assert.strictEqual(run({ from: '+15550100', outbound: '1' }, null), false);
+  const lost = run({ from: '+15550100', outbound: '1' }, null);
+  assert.strictEqual(lost.billCaller, false);
+  assert.strictEqual(lost.outbound, undefined, 'no mission context, so none of the outbound behaviour');
+  assert.strictEqual(lost.twilioOutbound, true, 'but the voice_chat estimate still knows it was outbound (Sep 29 2026)');
 });
 
 test('app/web: a voice session is billed to the caller; a direct Spotter session is not (F12)', () => {
@@ -159,7 +166,14 @@ test('an outbound call bills the person who asked for it, never the person answe
   await ctx.post({ outbound: true, outboundRequesterId: 'amber-id', userId: 'mom-id', lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
   // An outbound call with nobody on record as asking: the platform absorbs it.
   await ctx.post({ outbound: true, outboundRequesterId: null, userId: 'mom-id', lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
+  // Sep 29 2026: the bridge restarted while it rang, so the outbound context is gone and
+  // session.outbound never got set; Twilio's outbound=1 still keeps it off mom's bill.
+  await ctx.post({ twilioOutbound: true, userId: 'mom-id', lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
   assert.strictEqual(posted.length, 1);
   assert.strictEqual(posted[0].body.userId, 'amber-id');
   assert.strictEqual(posted[0].body.userEmail, undefined);
+  // An inbound call still bills the caller.
+  await ctx.post({ twilioOutbound: false, lcEmail: 'mom@example.invalid', agentName: 'Kiana', history });
+  assert.strictEqual(posted.length, 2);
+  assert.strictEqual(posted[1].body.userEmail, 'mom@example.invalid');
 });

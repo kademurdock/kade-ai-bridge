@@ -3548,6 +3548,10 @@ function attachMediaStreams(server, users, cfg) {
           }
           // Part 291 review F12: only an inbound call is the caller's own. Twilio's
           // outbound=1 wins even when the outbound context has expired.
+          // Sep 29 2026: the voice_chat estimate too. With the context gone (a
+          // bridge restart while it rang) session.outbound stays false, and the
+          // estimate went to the person who answered; postVoiceChatUsage reads this.
+          session.twilioOutbound = params.outbound === '1';
           session.billCaller = params.outbound !== '1' && !outboundCtx;
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
 
@@ -4079,8 +4083,10 @@ async function postVoiceChatUsage(session) {
     if (!secret) return;
     // Part 291: outbound calls bill the person who asked for the call; with nobody on record the
     // platform absorbs it (the callee never pays for a call someone else started).
-    const userId = session.outbound ? (session.outboundRequesterId || null) : (session.userId || null);
-    const userEmail = session.outbound ? null : (session.lcEmail || null);
+    // Sep 29 2026: Twilio's outbound=1 counts even when the outbound context was lost.
+    const outbound = session.outbound || session.twilioOutbound === true;
+    const userId = outbound ? (session.outboundRequesterId || null) : (session.userId || null);
+    const userEmail = outbound ? null : (session.lcEmail || null);
     if (!userId && !userEmail) return;
     const hist = (session.history || []).filter((m) => m && m.content && String(m.content).trim());
     if (!hist.length) return;
