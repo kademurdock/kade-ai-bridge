@@ -208,6 +208,28 @@ function liveCompression(env = process.env) {
   return { triggerTokens: String(trigger), slidingWindow: { targetTokens: String(keep) } };
 }
 
+/* SESSION RESUMPTION (Sep 29 2026). Google ends every Live CONNECTION after
+ * about ten minutes, whatever the compression does, and warns first with a
+ * `goAway` message. Amber A's Spotter call on Sep 27 hit it: "google ws closed
+ * 1008 Connection aborted because the client failed to close the connection
+ * after receiving a GoAway signal", then the handback line, mid-call.
+ * The documented cure (ai.google.dev/gemini-api/docs/live-api/session-management):
+ * ask for resumption in the setup (`sessionResumption: {}`), keep the latest
+ * `sessionResumptionUpdate.newHandle` while `resumable` is true, and when the
+ * goAway lands open a NEW connection whose setup carries that handle. The new
+ * connection continues the same conversation; once its setupComplete arrives
+ * the call moves over and the old one is closed. The caller hears no handback
+ * and no second greeting; the watchdog is not re-armed (a resumed Spotter
+ * may rightly stay quiet). If there is no handle yet, or the new connection
+ * fails or is not up within LIVE_RESUME_WAIT_MS, the old behaviour stands:
+ * the old connection ends and the character says it has the call back.
+ * Kill: LIVE_RESUME=0 (no resumption field is sent at all). */
+const liveResumeOn = () => process.env.LIVE_RESUME !== '0';
+const LIVE_RESUME_WAIT_MS = () => {
+  const v = parseInt(process.env.LIVE_RESUME_WAIT_MS || '10000', 10);
+  return Number.isFinite(v) && v > 0 ? v : 10000;
+};
+
 function buildSetupMessage(session) {
   // SPOTTER model (July 16 2026, Kade's design): the live lane is NOT the
   // character wearing a different voice — it's the caller's own SPOTTER, a
@@ -306,6 +328,9 @@ function buildSetupMessage(session) {
       // v1alpha. Fail-soft: if the field is ignored or no outputTranscription
       // ever arrives, we simply fall back to today's caller-only transcript.
       outputAudioTranscription: {},
+      // Sep 29 2026: see SESSION RESUMPTION above. Empty = "give me handles";
+      // with a handle = "continue that conversation" on a new connection.
+      ...(liveResumeOn() ? { sessionResumption: session._liveResumeHandle ? { handle: session._liveResumeHandle } : {} } : {}),
     },
   };
 }
@@ -378,26 +403,118 @@ function startLive(session, speak) {
       try { gws.send(JSON.stringify(buildSetupMessage(session))); } catch (e) { console.log('[video-live] setup send failed:', e.message); }
     });
     gws.on('message', (raw) => handleGoogleMessage(session, raw, gws));
-    // Part 295: a socket this session already let go of (our own stopLive, or an
-    // old connection after a new one started) no longer speaks for the call.
-    // Before, closing it ourselves fired stopLive a second time, and the
-    // handback line could be said twice. Google's close reason is logged now:
-    // it is where RESOURCE_EXHAUSTED and friends arrive.
-    gws.on('close', (code, reason) => {
-      if (session._liveWs !== gws) return;
-      const why = String(reason || '');
-      console.log('[video-live] google ws closed', code, why.slice(0, 200));
-      noteGoogleTrouble(session, why);
-      stopLive(session, 'closed');
-    });
-    gws.on('error', (e) => {
-      if (session._liveWs !== gws) return;
-      console.log('[video-live] google ws error:', e && e.message);
-      noteGoogleTrouble(session, e && e.message);
-      stopLive(session, 'error');
-    });
+    gws.on('close', (code, reason) => onGoogleClose(session, gws, code, reason));
+    gws.on('error', (e) => onGoogleError(session, gws, e));
   } catch (e) {
     console.log('[video-live] start failed (call continues normally):', e && e.message);
+  }
+}
+
+// Part 295: a socket this session already let go of (our own stopLive, or an
+// old connection after a new one started) no longer speaks for the call.
+// Before, closing it ourselves fired stopLive a second time, and the
+// handback line could be said twice. Google's close reason is logged now:
+// it is where RESOURCE_EXHAUSTED and friends arrive.
+// Sep 29 2026: the same two handlers serve a resumed connection, both while
+// it is still being set up (its failure falls back) and after it took over.
+function onGoogleClose(session, gws, code, reason) {
+  const why = String(reason || '');
+  if (session._livePendingWs === gws) { resumeFailed(session, gws, `closed ${code} ${why.slice(0, 120)}`); return; }
+  if (session._liveWs !== gws) return;
+  if (session._livePendingWs) {
+    // The old connection ended first; the new one, still being set up, decides.
+    session._liveOldClosed = true;
+    console.log('[video-live] google ws closed', code, why.slice(0, 200), '(a resumed connection is on its way)');
+    noteGoogleTrouble(session, why);
+    return;
+  }
+  console.log('[video-live] google ws closed', code, why.slice(0, 200));
+  noteGoogleTrouble(session, why);
+  stopLive(session, 'closed');
+}
+function onGoogleError(session, gws, e) {
+  const msg = (e && e.message) || '';
+  if (session._livePendingWs === gws) { resumeFailed(session, gws, `error ${msg.slice(0, 120)}`); return; }
+  if (session._liveWs !== gws) return;
+  if (session._livePendingWs) {
+    session._liveOldClosed = true;
+    console.log('[video-live] google ws error:', msg, '(a resumed connection is on its way)');
+    noteGoogleTrouble(session, msg);
+    return;
+  }
+  console.log('[video-live] google ws error:', msg);
+  noteGoogleTrouble(session, msg);
+  stopLive(session, 'error');
+}
+
+/** A resumable handle from Google. Only a resumable one replaces the last. */
+function noteResumeHandle(session, update) {
+  if (update && update.resumable && typeof update.newHandle === 'string' && update.newHandle) {
+    session._liveResumeHandle = update.newHandle;
+  }
+}
+
+/** Google's goAway on the live connection: continue on a new one. Returns
+ * true when a resumed connection was started. */
+function resumeLive(session, oldGws, goAway) {
+  const left = goAway && goAway.timeLeft ? String(goAway.timeLeft) : 'soon';
+  if (!liveResumeOn() || !WebSocketClient) return false;
+  if (session._liveWs !== oldGws || !session.liveOn || session._livePendingWs) return false;
+  if (!session._liveResumeHandle) {
+    console.log(`[video-live] Google is ending this connection (${left} left) and has not given a resume handle yet (user=${session.userId})`);
+    return false;
+  }
+  let ngws;
+  try { ngws = new WebSocketClient(liveUrl()); } catch (e) {
+    console.log('[video-live] resume could not open a connection:', e && e.message);
+    return false;
+  }
+  session._livePendingWs = ngws;
+  session._liveOldClosed = false;
+  session._liveResumeAskedAt = Date.now();
+  console.log(`[video-live] Google is ending this connection (${left} left); resuming on a new one (user=${session.userId})`);
+  ngws.on('open', () => {
+    try { ngws.send(JSON.stringify(buildSetupMessage(session))); } catch (e) { resumeFailed(session, ngws, `setup send ${e.message}`); }
+  });
+  ngws.on('message', (raw) => handleGoogleMessage(session, raw, ngws));
+  ngws.on('close', (code, reason) => onGoogleClose(session, ngws, code, reason));
+  ngws.on('error', (e) => onGoogleError(session, ngws, e));
+  if (session._liveResumeTimer) clearTimeout(session._liveResumeTimer);
+  session._liveResumeTimer = setTimeout(() => {
+    if (session._livePendingWs === ngws) resumeFailed(session, ngws, `not up after ${LIVE_RESUME_WAIT_MS()} ms`);
+  }, LIVE_RESUME_WAIT_MS());
+  if (session._liveResumeTimer.unref) session._liveResumeTimer.unref();
+  return true;
+}
+
+/** The resumed connection is up: the call moves to it, the old one closes. */
+function adoptResumed(session, ngws) {
+  if (session._liveResumeTimer) { clearTimeout(session._liveResumeTimer); session._liveResumeTimer = null; }
+  const old = session._liveWs;
+  session._livePendingWs = null;
+  session._liveOldClosed = false;
+  session._liveWs = ngws;
+  session._liveResumes = Number(session._liveResumes || 0) + 1;
+  // The old connection's cost is settled as its own segment, the new one starts.
+  try { liveBilling.endSegment(session); liveBilling.flush(session, 'resume').catch(() => {}); liveBilling.startSegment(session); } catch {}
+  if (old) { try { old.close(); } catch {} }
+  const ms = session._liveResumeAskedAt ? Date.now() - session._liveResumeAskedAt : 0;
+  console.log(`[video-live] resumed on a new connection user=${session.userId} (resume ${session._liveResumes}, ${ms} ms)`);
+}
+
+/** The resumed connection failed. With the old one still open, nothing is
+ * lost (it ends in its own time and the handback is said then). With the old
+ * one already gone, the call hands back now. */
+function resumeFailed(session, ngws, why) {
+  if (session._livePendingWs !== ngws) return;
+  if (session._liveResumeTimer) { clearTimeout(session._liveResumeTimer); session._liveResumeTimer = null; }
+  session._livePendingWs = null;
+  try { ngws.close(); } catch {}
+  console.warn(`[video-live] resume failed (${why}) user=${session.userId}`);
+  noteGoogleTrouble(session, why);
+  if (session._liveOldClosed) {
+    session._liveOldClosed = false;
+    stopLive(session, 'closed');
   }
 }
 
@@ -417,7 +534,17 @@ function handleGoogleMessage(session, raw, gws) {
   // setupComplete landing after a hang-up or "live off" during setup would
   // otherwise turn live on for nobody: its tick would bill idle minutes, and
   // with the socket released no close would ever stop it.
-  if (gws && session._liveWs !== gws) return;
+  if (gws && session._liveWs !== gws) {
+    // Sep 29 2026: the resumed connection being set up. Its handles count, and
+    // its setupComplete moves the call over; nothing else from it until then.
+    if (gws === session._livePendingWs) {
+      if (msg.sessionResumptionUpdate) noteResumeHandle(session, msg.sessionResumptionUpdate);
+      if (msg.setupComplete) adoptResumed(session, gws);
+    }
+    return;
+  }
+  if (msg.sessionResumptionUpdate) noteResumeHandle(session, msg.sessionResumptionUpdate);
+  if (msg.goAway) { resumeLive(session, gws, msg.goAway); return; }
   if (msg.setupComplete) {
     session.liveOn = true;
     session._liveStartedAt = Date.now(); // greeting-grace anchor, see sc.interrupted below
@@ -578,6 +705,14 @@ function forwardFrame(session, b64jpeg) {
 function stopLive(session, reason) {
   if (session._liveTick) { clearInterval(session._liveTick); session._liveTick = null; }
   if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
+  // Sep 29 2026: a resumed connection still being set up goes with the call,
+  // and the handle is this call's only: the next "live on" starts fresh.
+  if (session._liveResumeTimer) { clearTimeout(session._liveResumeTimer); session._liveResumeTimer = null; }
+  const pending = session._livePendingWs;
+  session._livePendingWs = null;
+  session._liveOldClosed = false;
+  session._liveResumeHandle = null;
+  if (pending) { try { pending.close(); } catch {} }
   // Commit any half-finished model turn so a hangup mid-sentence still lands
   // the Spotter's last words in the post-call transcript. Fail-soft.
   if (session._liveModelText && session._liveModelText.trim()) {
@@ -670,4 +805,4 @@ module.exports = {
   shouldWarnLiveSilence,
   LIVE_SILENT_LINE, enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
 // Exported for the pre-push test harness only — not called across modules.
-module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE };
+module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive };
