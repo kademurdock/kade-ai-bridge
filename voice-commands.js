@@ -374,8 +374,10 @@ const BROWSER_UA =
 const AI_TELL_LEAD_BANS = [
   /^\s*(?:great|excellent|fantastic|wonderful|brilliant|good|interesting|fascinating|love(?:d)?)\s+(?:question|point|catch|observation|idea|ask)\s*!?[.,]?\s*/i,
   /^\s*(?:that['’]s|what)\s+(?:a\s+)?(?:great|excellent|fascinating|wonderful|brilliant|interesting)\b[^.!?]*[.!?]\s*/i,
-  /^\s*you['’]re\s+(?:absolutely\s+)?right[^.!?]*[.!?]\s*/i,
-  /^\s*i\s+love\s+(?:that|how)\b[^.!?]*[.!?]\s*/i,
+  /* These openings can carry a correction or a specific taste. Only the
+   * standalone acknowledgment/praise is removable without deleting that content. */
+  /^\s*you['’]re\s+(?:absolutely\s+)?right\s*[.!]\s*/i,
+  /^\s*i\s+love\s+that\s*[.!]\s*/i,
   // Sep 21 2026 (fork stripAiTells, ported Sep 25 2026 Part 292): the two
   // assistant openers with no person left in them. "Of course" and "Sure" stay.
   /^\s*certainly[!.,:]\s*/i,
