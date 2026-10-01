@@ -1,136 +1,126 @@
 'use strict';
-/**
- * monthly.js — THE MONTHLY BOOKS (Sep 5 2026, Part 131). Her rule: no scheduling
- * on her computer or Cowork — it lives on the platform, beside the battery.
- *
- * On the 1st of every month (09:00 Central) it compares what the family was
- * CHARGED (the fork's meter: real stickers x KADE_BILLING_MULTIPLIER, summed
- * from `/librechat/usage?days=N`) with what the models REALLY cost (the daily
- * balance snapshots the bridge already keeps: Moonshot + OpenRouter deltas),
- * adds the metered extras, and pushes her ONE line: charged, real, the
- * multiplier in force, and the multiplier the month actually needed. A row
- * lands in /data/monthly.jsonl. GET /monthly reports the month so far on
- * demand; POST /monthly/fire runs it now (both BRIDGE_SECRET).
- *
- * Honest gaps it names in its own line: the Z.AI pot (the background fleet's
- * pot since Aug 21) has no balance watch, so its spend is not in "real"; and
- * the fixed bills (Inworld founder $25, Railway ~$32, Codemagic) are an env
- * number, MONTHLY_FIXED_USD, default 70, not a live read.
- *
- * Part 295 (Sep 26 2026): Google joins "real" the way Z.AI did, from a ledger
- * the bridge keeps itself (/data/google-days.json, google-watch.js): the
- * Spotter's metered cost and the BYOK share of the bridge's own OpenRouter
- * calls. The line says "metered by the bridge" because it is only that part:
- * the fork's direct Google calls (memory embeddings, Lyria, the lyric
- * transcriber) and its BYOK describe lanes are not in it. Once her key sits in
- * OpenRouter as BYOK, OpenRouter's usage counter stops carrying Gemini's cost
- * too, so those fork lanes would need their own ledger (or a Google Cloud
- * billing export) before "real" is whole again.
- */
+
 const fs = require('fs');
 const path = require('path');
+const { calendarWindow, providerCosts, monthKeyOf, centralParts } = require('./monthly-costs');
 
-const FIXED_USD = Number(process.env.MONTHLY_FIXED_USD || 70);
-const FIRE_HOUR_UTC = parseInt(process.env.MONTHLY_HOUR_UTC || '14', 10); // 9 a.m. Central (CDT)
+const configuredFixed = Number(process.env.MONTHLY_FIXED_USD || 70);
+const FIXED_USD = Number.isFinite(configuredFixed) && configuredFixed >= 0 ? configuredFixed : 70;
 const LEDGER = process.env.MONTHLY_LEDGER || '/data/monthly.jsonl';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const round = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+const money = (value) => `$${value.toFixed(2)}`;
 
-function centralParts(now = new Date()) {
-  const p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' })
-    .formatToParts(now).reduce((o, x) => ((o[x.type] = x.value), o), {});
-  return { y: +p.year, m: +p.month, d: +p.day };
+function isScheduledTime(now, { centralHour = 9, utcHour = null } = {}) {
+  const parts = centralParts(now);
+  return parts.d === 1 && (utcHour == null ? parts.h === centralHour : now.getUTCHours() === utcHour);
 }
-function monthKeyOf(now = new Date(), back = 0) {
-  const { y, m } = centralParts(now);
-  const t = new Date(Date.UTC(y, m - 1 - back, 1));
-  return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}`;
-}
-function daysInto(now = new Date()) { return centralParts(now).d; }
 
-/* Real provider spend across a month from the bridge's daily snapshots.
- * A snapshot row: {dateKey:'YYYY-MM-DD', moonshot, openrouter_usage, openrouter, fish, twilio, ...}.
- * balance-kind pots go DOWN as they are spent; usage-kind go UP. */
-function realSpend(history, monthKey, zaiDays = {}, googleDays = {}) {
-  const rows = history.filter((h) => h && typeof h.dateKey === 'string' && h.dateKey.startsWith(monthKey)).sort((a, b) => a.dateKey < b.dateKey ? -1 : 1);
-  const ledger = (days) => round(Object.entries(days || {}).filter(([k]) => k.startsWith(monthKey)).reduce((s, [, v]) => s + (Number(v) || 0), 0));
-  const zai = ledger(zaiDays);
-  const google = ledger(googleDays);
-  if (rows.length < 2) return { models: round(zai + google), zai, google, days: rows.length, note: 'fewer than two snapshots this month' };
-  const first = rows[0], last = rows[rows.length - 1];
-  const delta = (key, kind) => (first[key] == null || last[key] == null) ? 0 : Math.max(0, kind === 'usage' ? last[key] - first[key] : first[key] - last[key]);
-  const moonshot = delta('moonshot', 'balance');
-  const openrouter = last.openrouter_usage != null ? delta('openrouter_usage', 'usage') : delta('openrouter', 'balance');
-  return { models: round(moonshot + openrouter + zai + google), moonshot: round(moonshot), openrouter: round(openrouter), zai, google, days: rows.length, from: first.dateKey, to: last.dateKey };
-}
-function round(n) { return Math.round((Number(n) || 0) * 100) / 100; }
-
-function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = () => ({}), readGoogleDays = () => ({}), runNotify, adminUserId, log = console, fetchImpl = global.fetch }) {
-  async function chargedFromFork(days) {
-    const r = await fetchImpl(`${proxyUrl}/librechat/usage?days=${Math.max(1, days)}`, {
-      headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
+function makeMonthly({ proxyUrl, proxySecret, readBalanceHistory, readZaiDays = () => ({}), readGoogleDays = () => ({}), runNotify, adminUserId, log = console, fetchImpl = global.fetch, clock = () => new Date(), ledgerPath = LEDGER, enabled = process.env.MONTHLY_REPORT_ENABLED !== '0' }) {
+  async function accountingFromFork(window) {
+    const params = new URLSearchParams({ from: window.from, to: window.to });
+    const response = await fetchImpl(`${proxyUrl}/librechat/monthly-books?${params}`, {
+      headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': UA },
     });
-    if (!r.ok) throw new Error(`usage ${r.status}`);
-    const u = await r.json();
-    const t = u.totals || {};
-    return { charged: round((t.llmSpendUSD || {}).window || 0), extras: round((t.extraSpendUSD || {}).window || 0), users: Array.isArray(u.users) ? u.users.length : null };
+    if (!response.ok) throw new Error(`accounting ${response.status}`);
+    const data = await response.json();
+    if (data.version !== 1 || data.window?.from !== window.from || data.window?.to !== window.to || data.window?.timeZone !== window.timeZone || data.window?.endExclusive !== true) {
+      throw new Error('accounting window does not match');
+    }
+    const fields = {
+      ownerExempt: ['chatNominalUSD', 'extrasNominalUSD'],
+      nonAdmin: ['chatChargedUSD', 'extrasChargedUSD', 'walletChargedUSD', 'extrasRecordedChargedUSD', 'extrasInferredChargedUSD', 'walletRecordedChargedUSD'],
+      unclassified: ['chatNominalUSD', 'extrasNominalUSD'],
+      repayments: ['recordedUSD', 'count'],
+      grants: ['netUSD', 'count'],
+    };
+    const accounting = { available: true, window: data.window, coverage: data.coverage || {}, ...(data.extraRecords ? { extraRecords: data.extraRecords } : {}) };
+    for (const [category, names] of Object.entries(fields)) {
+      accounting[category] = {};
+      for (const name of names) {
+        const value = data[category]?.[name];
+        const nonnegative = ['chatNominalUSD', 'chatChargedUSD', 'recordedUSD', 'count'].includes(name);
+        if (!Number.isFinite(value) || (nonnegative && value < 0) || (name === 'count' && !Number.isInteger(value))) throw new Error('invalid accounting totals');
+        accounting[category][name] = name === 'count' ? value : round(value);
+      }
+    }
+    const charges = accounting.nonAdmin;
+    const matchesRoundedSum = (left, right, total) => Math.abs(round(left + right) - total) <= 0.010001;
+    if (!matchesRoundedSum(charges.chatChargedUSD, charges.extrasChargedUSD, charges.walletChargedUSD) || !matchesRoundedSum(charges.extrasRecordedChargedUSD, charges.extrasInferredChargedUSD, charges.extrasChargedUSD) || !matchesRoundedSum(charges.chatChargedUSD, charges.extrasRecordedChargedUSD, charges.walletRecordedChargedUSD)) throw new Error('inconsistent wallet accounting totals');
+    return accounting;
   }
-  /* The multiplier LIVES on the fork (KADE_BILLING_MULTIPLIER on the LibreChat
-   * service). Read it back through the fork's own my-cost route so the books
-   * can never disagree with the meter; the env here is only a fallback. */
-  async function multiplierInForce() {
+
+  async function report({ monthKey, closing = false } = {}) {
+    const now = clock();
+    if (!enabled) return { version: 2, disabled: true, spoken: 'Monthly reporting is paused.', at: now.toISOString() };
+    const month = monthKey || monthKeyOf(now);
+    const window = calendarWindow(month, now, closing);
+    const [accounting, history, zai, google] = await Promise.all([
+      accountingFromFork(window).catch((error) => ({ available: false, window, error: error.message })),
+      Promise.resolve().then(readBalanceHistory),
+      Promise.resolve().then(readZaiDays),
+      Promise.resolve().then(readGoogleDays),
+    ]);
+    const costs = providerCosts(history, window, zai, google);
+    const fullWindow = calendarWindow(month, new Date(Date.parse(window.from) + 32 * 86400000), true);
+    const fraction = Math.max(0, Math.min(1, (Date.parse(window.to) - Date.parse(window.from)) / (Date.parse(fullWindow.to) - Date.parse(fullWindow.from))));
+    const fixedBills = { source: 'configuration estimate, not an invoice', estimatedMonthlyUSD: FIXED_USD, estimatedWindowUSD: round(FIXED_USD * fraction) };
+    const lines = [`${closing ? 'Books for' : 'So far in'} ${month} (Chicago calendar month).`];
+    if (accounting.available) {
+      const { nonAdmin, ownerExempt, repayments, grants, unclassified } = accounting;
+      lines.push(`Recorded family net wallet charges, classified by current account roles: ${money(nonAdmin.walletRecordedChargedUSD)}; chat debits ${money(nonAdmin.chatChargedUSD)}, net extras charges ${money(nonAdmin.extrasRecordedChargedUSD)}.`);
+      if (accounting.coverage.nonAdminLegacyExtraRows > 0 || nonAdmin.extrasInferredChargedUSD !== 0) lines.push(`Older family extras without a saved charge field have recorded cost ${money(nonAdmin.extrasInferredChargedUSD)}; their wallet charge amount is inferred separately.`);
+      lines.push(`Current owner's usage: nominal chat ${money(ownerExempt.chatNominalUSD)}, recorded extras cost ${money(ownerExempt.extrasNominalUSD)}; excluded from family charges by current roles.`);
+      if (accounting.extraRecords?.voiceEstimateRows > 0) lines.push('Recorded extras include voice estimates that may overlap chat; they are not added to provider observations.');
+      lines.push(`Recorded repayments ${money(repayments.recordedUSD)}; credit grants ${money(grants.netUSD)} separately.`);
+      if (unclassified.chatNominalUSD || unclassified.extrasNominalUSD) lines.push(`Unclassified-account usage: nominal chat ${money(unclassified.chatNominalUSD)}, recorded extras cost ${money(unclassified.extrasNominalUSD)}; kept separate.`);
+    } else {
+      lines.push('Wallet charges, owner usage, repayments and grants are unavailable for this window.');
+    }
+    const labels = { moonshot: 'Moonshot', openrouter: 'OpenRouter', zai: 'Z.AI proxy meter', google: 'Google bridge meter' };
+    const observations = Object.entries(costs.providers).map(([key, value]) => `${labels[key] || key}: ${value.recordedUSD == null ? 'unavailable' : money(value.recordedUSD)} (${value.coverage.status})`);
+    lines.push(`Provider observations: ${observations.join('; ')}. These include owner and platform work; metered categories cover only their instrumented calls.`);
+    if (!costs.complete) lines.push('Provider coverage is incomplete; this is not a complete monthly provider bill.');
+    lines.push(`Fixed bills are a separate estimate: ${money(fixedBills.estimatedWindowUSD)} for this window.`);
+    return {
+      version: 2, month, closing, window, accounting, providerCosts: costs, fixedBills,
+      comparison: { comparable: false, reason: 'Provider-account costs and family wallet charges have different scopes; provider and historical ledger coverage may also be incomplete.' },
+      multiplierNeeded: null, ratio: null, spoken: lines.join(' '), at: now.toISOString(),
+    };
+  }
+
+  function appendLedger(row) {
     try {
-      const r = await fetchImpl(`${proxyUrl}/librechat/my-cost?userId=${encodeURIComponent(adminUserId)}`, {
-        headers: { Authorization: `Bearer ${proxySecret}`, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
-      });
-      if (r.ok) { const j = await r.json(); if (Number.isFinite(j.multiplier) && j.multiplier > 0) return j.multiplier; }
-    } catch {}
-    const raw = Number(process.env.KADE_BILLING_MULTIPLIER);
-    return Number.isFinite(raw) && raw > 0 ? raw : 1;
+      fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+      fs.appendFileSync(ledgerPath, JSON.stringify(row) + '\n');
+    } catch (error) { log.warn('[monthly] ledger write failed:', error.message); }
   }
-  async function report({ monthKey, days, closing } = {}) {
-    const now = new Date();
-    const mk = monthKey || monthKeyOf(now);
-    const nDays = days != null ? days : daysInto(now);
-    const [forkRes, hist] = await Promise.all([chargedFromFork(nDays).catch((e) => ({ error: e.message })), Promise.resolve(readBalanceHistory())]);
-    const real = realSpend(hist, mk, readZaiDays(), readGoogleDays());
-    const charged = forkRes.charged || 0;
-    const mult = await multiplierInForce();
-    const realModels = real.models || 0;
-    /* Fixed bills are a MONTH's worth; a mid-month read compares them against
-     * only nDays of model spend, which made a 5-day read say "needed 38" the
-     * night this shipped. Prorate: days elapsed over days in the month. */
-    const [my, mm] = mk.split('-').map(Number);
-    const daysInMonth = new Date(Date.UTC(my, mm, 0)).getUTCDate();
-    const fixedSoFar = closing ? FIXED_USD : round(FIXED_USD * Math.min(1, nDays / daysInMonth));
-    const needed = realModels > 0 ? round((realModels + (forkRes.extras || 0) + fixedSoFar) / realModels) : null;
-    const ratio = realModels > 0 ? round(charged / realModels) : null;
-    const spoken =
-      `${closing ? 'Books for ' : 'So far in '}${mk}: the family was charged $${charged.toFixed(2)} for models; the models really cost $${realModels.toFixed(2)}` +
-      ` (Moonshot $${(real.moonshot || 0).toFixed(2)}, OpenRouter $${(real.openrouter || 0).toFixed(2)}, Z.AI $${(real.zai || 0).toFixed(2)} metered by the proxy` +
-      `${real.google ? `, Google $${real.google.toFixed(2)} metered by the bridge` : ''})` +
-      `; metered extras $${(forkRes.extras || 0).toFixed(2)}; fixed bills about $${FIXED_USD} a month${closing ? '' : ` ($${fixedSoFar.toFixed(2)} so far)`}. The multiplier is ${mult}` +
-      (needed != null ? `; this month needed about ${needed}.` : '.') +
-      (ratio != null ? ` Charged over real: ${ratio}x.` : '') + (forkRes.error ? ` (fork usage read failed: ${forkRes.error})` : '');
-    return { month: mk, days: nDays, closing: !!closing, charged, extras: forkRes.extras || 0, real, fixedUSD: FIXED_USD, fixedSoFar, multiplier: mult, multiplierNeeded: needed, ratio, users: forkRes.users, spoken, at: now.toISOString() };
-  }
-  function appendLedger(row) { try { fs.mkdirSync(path.dirname(LEDGER), { recursive: true }); fs.appendFileSync(LEDGER, JSON.stringify(row) + '\n'); } catch (e) { log.warn('[monthly] ledger write failed:', e.message); } }
+
   function lastClosed() {
-    try { const lines = fs.readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean); for (let i = lines.length - 1; i >= 0; i--) { const r = JSON.parse(lines[i]); if (r.closing) return r; } } catch {} return null;
+    try {
+      const lines = fs.readFileSync(ledgerPath, 'utf8').split('\n').filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const row = JSON.parse(lines[i]);
+        if (!row.closing) continue;
+        if (row.version === 2) return row;
+        return { ...row, legacyReport: true, multiplierNeeded: null, ratio: null, comparison: { comparable: false, reason: 'Historical report used different accounting scopes and date windows.' }, spoken: `Historical report for ${row.month} used different accounting scopes and date windows; it is not reconciled calendar-month books.` };
+      }
+    } catch {}
+    return null;
   }
+
   async function close({ trigger = 'clock' } = {}) {
-    // Closing the PREVIOUS month: snapshots and the fork window both cover it.
-    const now = new Date();
-    const prev = monthKeyOf(now, 1);
-    const [y, m] = prev.split('-').map(Number);
-    const dim = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const row = await report({ monthKey: prev, days: dim + daysInto(now), closing: true });
+    if (!enabled) throw new Error('Monthly reporting is paused');
+    const row = await report({ monthKey: monthKeyOf(clock(), 1), closing: true });
     row.trigger = trigger;
     appendLedger(row);
     try {
       await runNotify({ agentId: 'monthly-books', agentName: 'Books', title: 'The monthly books', body: row.spoken, urgent: false, userId: adminUserId, adminAlert: true, category: 'admin' });
-    } catch (e) { log.warn('[monthly] notify failed:', e.message); }
+    } catch (error) { log.warn('[monthly] notify failed:', error.message); }
     return row;
   }
-  return { report, close, lastClosed, monthKeyOf, realSpend };
+
+  return { report, close, lastClosed, monthKeyOf, enabled };
 }
 
 function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalanceHistory, readZaiDays, readGoogleDays, runNotify, adminUserId }) {
@@ -138,25 +128,32 @@ function attachMonthly(app, { bridgeSecretOk, proxyUrl, proxySecret, readBalance
   const adminOk = (req) => bridgeSecretOk(req, req.get('x-kade-secret') || req.get('x-bridge-secret') || req.query.secret || (req.body && req.body.secret));
   app.get('/monthly', async (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-    try { res.json({ now: await monthly.report(), lastClosed: monthly.lastClosed() }); } catch (e) { res.status(500).json({ error: e.message }); }
+    try { res.json({ now: await monthly.report(), lastClosed: monthly.lastClosed() }); } catch (error) { res.status(500).json({ error: error.message }); }
   });
   app.post('/monthly/fire', async (req, res) => {
     if (!adminOk(req)) return res.status(403).json({ error: 'Unauthorized' });
-    try { res.json(await monthly.close({ trigger: 'manual' })); } catch (e) { res.status(500).json({ error: e.message }); }
+    if (!monthly.enabled) return res.status(503).json({ error: 'Monthly reporting is paused' });
+    try { res.json(await monthly.close({ trigger: 'manual' })); } catch (error) { res.status(500).json({ error: error.message }); }
   });
+  if (!monthly.enabled) {
+    console.log('[monthly] paused by MONTHLY_REPORT_ENABLED=0');
+    return monthly;
+  }
+  const centralHour = Number(process.env.MONTHLY_HOUR_CENTRAL || 9);
+  const utcHour = process.env.MONTHLY_HOUR_UTC == null ? null : Number(process.env.MONTHLY_HOUR_UTC);
   const guard = { month: null };
   setInterval(() => {
     const now = new Date();
-    if (daysInto(now) !== 1 || now.getUTCHours() !== FIRE_HOUR_UTC) return;
-    const mk = monthly.monthKeyOf(now);
-    if (guard.month === mk) return;
+    if (!isScheduledTime(now, { centralHour, utcHour })) return;
+    const month = monthKeyOf(now);
+    if (guard.month === month) return;
     const last = monthly.lastClosed();
-    if (last && last.month === monthly.monthKeyOf(now, 1)) { guard.month = mk; return; }
-    guard.month = mk;
-    monthly.close({ trigger: 'clock' }).catch((e) => console.warn('[monthly] close failed:', e.message));
+    if (last && last.month === monthKeyOf(now, 1)) { guard.month = month; return; }
+    guard.month = month;
+    monthly.close({ trigger: 'clock' }).catch((error) => console.warn('[monthly] close failed:', error.message));
   }, 60 * 1000);
-  console.log(`[monthly] armed: the 1st at ${FIRE_HOUR_UTC}h UTC · fixed bills $${FIXED_USD} · ledger ${LEDGER}`);
+  console.log(`[monthly] armed: the 1st at ${utcHour == null ? `${centralHour}h Chicago` : `${utcHour}h UTC (configured override)`} · fixed estimate ${money(FIXED_USD)} · ledger ${LEDGER}`);
   return monthly;
 }
 
-module.exports = { attachMonthly, makeMonthly, realSpend, monthKeyOf, centralParts };
+module.exports = { attachMonthly, makeMonthly, monthKeyOf, centralParts, isScheduledTime };
