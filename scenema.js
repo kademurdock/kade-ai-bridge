@@ -283,6 +283,9 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   if (Number.isInteger(options.seed) && options.seed >= 0) input.seed = options.seed;
   if (typeof options.pace === 'number' && options.pace >= 0.5 && options.pace <= 3) input.pace = options.pace;
   if (options.keep_wav === true) input.keep_wav = true;
+  /* Oct 2 2026: a private opening take sets the voice so the description is
+   * never spoken in the take (the worker ignores it with a reference clip). */
+  if (IS_AUK && options.voice_sample === true) input.voice_sample = true;
   /* Part 126 — the engine's real knobs (README): validate + min_match_ratio
    * (Whisper re-check, up to 3 regenerations), the SeedVC clone stage
    * (vc_cfg_rate identity pressure, vc_steps quality, skip_vc anchor mode).
