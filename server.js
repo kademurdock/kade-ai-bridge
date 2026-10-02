@@ -5194,7 +5194,10 @@ function computeSpend() {
     { key: 'openrouter_usage', name: 'OpenRouter', kind: 'usage' },
     { key: 'openrouter', name: 'OpenRouter', kind: 'balance' },
     { key: 'fish', name: 'fish audio', kind: 'balance' },
-    { key: 'twilio', name: 'Twilio', kind: 'balance' },
+    /* Oct 2 2026: the toll-free number's monthly rent ($2.15, posted around the
+     * 29th) drops the balance in one day and read as "running hot". A day whose
+     * spend is the rent to within two cents is the rent, not calls. */
+    { key: 'twilio', name: 'Twilio', kind: 'balance', rent: Number(process.env.TWILIO_NUMBER_RENT_USD || 2.15) },
     { key: 'flux', name: 'Flux images', kind: 'balance', unit: 'credits' },
   ];
   const lines = [];
@@ -5225,7 +5228,8 @@ function computeSpend() {
       const b = byDay.get(days[i]);
       if (!a || !b || a[p.key] == null || b[p.key] == null) continue;
       const spend = p.kind === 'usage' ? b[p.key] - a[p.key] : a[p.key] - b[p.key];
-      deltas.push({ day: days[i], spend });
+      const isRent = p.rent > 0 && Math.abs(spend - p.rent) <= 0.02;
+      deltas.push({ day: days[i], spend: isRent ? 0 : spend, rent: isRent ? spend : 0 });
     }
     if (!deltas.length) continue;
     seenNames.add(p.name);
@@ -5241,6 +5245,7 @@ function computeSpend() {
       avg30: Math.round(avg * 100) / 100,
       hot,
       spoken: `${p.name}: ${y < 0.005 ? 'quiet' : fmtProviderAmount(y, p.unit)} yesterday` +
+        (yesterday.rent ? ` apart from the $${yesterday.rent.toFixed(2)} monthly number rent` : '') +
         (window.length > 2 ? ` against a ${p.unit === 'credits' ? Math.round(avg) + '-credit-a-day' : '$' + avg.toFixed(2)} average` : '') +
         (hot ? ' — running hot' : ''),
     });
