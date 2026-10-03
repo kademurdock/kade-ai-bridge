@@ -5634,6 +5634,7 @@ async function checkPlatformServices() {
  * A failed FETCH never pages her (a blip must not read as a memory failure) —
  * it reports "unavailable" and leaves ok alone. Cached 5 minutes so chatty
  * status asks don't hammer the fork. Kill: MEMORY_HEALTH_STATUS=0. */
+const memoryAlarm = require('./memory-alarm');
 let memoryHealthCache = { at: 0, data: null, err: null };
 async function fetchMemoryHealth() {
   if (Date.now() - memoryHealthCache.at < 5 * 60 * 1000) return memoryHealthCache;
@@ -5653,7 +5654,7 @@ async function fetchMemoryHealth() {
  * The logbook died silently Aug 24-28 while the card half kept working, and
  * nobody was paged. This is the alert-only, server-side cron she approved:
  * every 6 hours, read the same memory-health the status line reads; if the
- * LIVE KEEPER's newest logbook entry is older than MEMORY_KEEPER_DEAD_H
+ * LIVE KEEPER's last confirmed chat create or amendment is older than MEMORY_KEEPER_DEAD_H
  * (default 30h — a quiet day is not an outage, a day and a night is), send
  * ONE admin push and go quiet for 24h so a dead lane pages once a day, not
  * four times. Rides runNotify's adminAlert path: quiet hours defer it to
@@ -5666,15 +5667,16 @@ async function memoryKeeperAlarmTick() {
   if (process.env.MEMORY_KEEPER_ALARM === '0' || !BRIDGE_SECRET) return;
   if (Date.now() - memoryKeeperAlarmLastFiredMs < 24 * 3600 * 1000) return;
   const { data } = await fetchMemoryHealth();
-  const age = data && data.diary && data.diary.keeperNewestAgeHours;
-  if (typeof age !== 'number' || age < MEMORY_KEEPER_DEAD_H) return;
+  const monitor = memoryAlarm.keeperMonitor(data, { deadHours: MEMORY_KEEPER_DEAD_H });
+  if (monitor.state !== 'stale') return;
+  const age = monitor.ageHours;
   memoryKeeperAlarmLastFiredMs = Date.now();
   console.warn(`[memory-alarm] live keeper silent ${age}h (floor ${MEMORY_KEEPER_DEAD_H}h) — paging admin`);
   try {
     await runNotify({
       agentId: 'kade-memory-alarm', agentName: 'Kade-AI',
       title: 'Memory lane check',
-      body: `The live memory keeper hasn't written a logbook entry in about ${Math.round(age)} hours. Last time this happened it was the Aug-24 outage shape — worth a look when you get a minute.`,
+      body: `The live memory keeper has no confirmed chat create or amendment in about ${Math.round(age)} hours. This checks successful non-temporary chat writes; synthetic and unclassified activity do not reset it. Worth a look when you get a minute.`,
       adminAlert: true, userId: CANARY_ADMIN_USER, route: 'admin',
     });
   } catch (e) { console.warn('[memory-alarm] page failed:', e.message); }
@@ -5682,14 +5684,18 @@ async function memoryKeeperAlarmTick() {
 setInterval(() => { memoryKeeperAlarmTick().catch(() => {}); }, 6 * 3600 * 1000);
 setTimeout(() => { memoryKeeperAlarmTick().catch(() => {}); }, 5 * 60 * 1000);
 
-async function memoryHealthForSpeech() {
+async function memoryHealthForSpeech({ admin = false } = {}) {
   if (process.env.MEMORY_HEALTH_STATUS === '0' || !BRIDGE_SECRET) {
-    return { section: { enabled: false }, spoken: '', okForStatus: true };
+    const keeperMonitor = memoryAlarm.unknownKeeper('disabled', MEMORY_KEEPER_DEAD_H);
+    return { section: { enabled: false, ...(admin ? { keeperMonitor } : {}) }, spoken: admin ? memoryAlarm.keeperSpeech(keeperMonitor) : '', okForStatus: true };
   }
-  const { data, err } = await fetchMemoryHealth();
+  const fetched = await fetchMemoryHealth();
+  const { err } = fetched;
+  const keeperMonitor = memoryAlarm.keeperMonitor(fetched.data, { deadHours: MEMORY_KEEPER_DEAD_H });
+  const data = memoryAlarm.healthForAudience(fetched.data, admin);
   if (!data || data.ok !== true) {
     const why = data && data.disabled ? 'disabled on the fork' : (err || 'no data');
-    return { section: { enabled: true, error: why }, spoken: '', okForStatus: true };
+    return { section: { enabled: true, error: why, ...(admin ? { keeperMonitor } : {}) }, spoken: admin ? memoryAlarm.keeperSpeech(keeperMonitor) : '', okForStatus: true };
   }
   const staleDreamH = parseInt(process.env.MEMORY_DREAM_STALE_H || '48', 10);
   const staleSweepD = parseInt(process.env.MEMORY_SWEEP_STALE_D || '8', 10);
@@ -5708,8 +5714,9 @@ async function memoryHealthForSpeech() {
   let spoken = `Memory: ${bits.join(', ')}.`;
   if (dreamStale) spoken = `MEMORY WARNING: the nightly dream pass has not refreshed a summary in ${Math.round(dreamH)} hours. ` + spoken;
   if (sweepStale) spoken = `MEMORY WARNING: the weekly consolidation sweep is ${sweepH == null ? 'unrecorded' : `${Math.round(sweepH / 24)} days old`}. ` + spoken;
+  if (admin) spoken += ' ' + memoryAlarm.keeperSpeech(keeperMonitor);
   return {
-    section: { enabled: true, ...data, dreamStale, sweepStale },
+    section: { enabled: true, ...data, dreamStale, sweepStale, ...(admin ? { keeperMonitor } : {}) },
     spoken,
     okForStatus: !(dreamStale || sweepStale),
   };
@@ -5914,7 +5921,7 @@ app.get('/platform-status', async (req, res) => {
     const backups = backupStatusForSpeech();
     const balances = balanceStatusForSpeech();
     const crash = crashStatusForSpeech();
-    const memoryH = await memoryHealthForSpeech();
+    const memoryH = await memoryHealthForSpeech({ admin: !!adminOk });
     const voiceR = await voiceReportForSpeech();
     const slopS = await slopStatsForSpeech();
     /* Part 116 — the battery's one line. Ops half (after Spend), like slop. */
