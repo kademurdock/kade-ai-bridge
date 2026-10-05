@@ -51,7 +51,7 @@ const RUNPOD_KEY = process.env.RUNPOD_API_KEY || '';
 const ENDPOINT_ID = process.env.AUK_ENDPOINT_ID || process.env.SCENEMA_ENDPOINT_ID || '';
 const IS_AUK = !!process.env.AUK_ENDPOINT_ID;
 const RUNPOD_BASE = `https://api.runpod.ai/v2/${ENDPOINT_ID}`;
-const RATE_PER_HR = parseFloat(IS_AUK ? (process.env.AUK_RATE_PER_HR || '1.22') : (process.env.SCENEMA_RATE_PER_HR || '1.75'));
+const RATE_PER_HR = parseFloat(IS_AUK ? (process.env.AUK_RATE_PER_HR || '1.75') : (process.env.SCENEMA_RATE_PER_HR || '1.75'));
 const WAKE_USD = parseFloat(IS_AUK ? (process.env.AUK_WAKE_USD || '0') : (process.env.SCENEMA_WAKE_USD || '0.05'));
 const DAILY_CAP = parseFloat(process.env.SCENEMA_DAILY_CAP_USD || '1.00');
 const MONTHLY_CAP = parseFloat(process.env.SCENEMA_MONTHLY_CAP_USD || '20');
@@ -209,7 +209,7 @@ function waitInfo(job, cap) {
   const clockFrom = job.kickedAt ? Date.parse(job.kickedAt) : submitted;
   const leftS = Math.max(0, Math.round(queueLimitMs(cap) / 1000 - (Date.now() - clockFrom) / 1000));
   if (job.state === 'running' || job.startedAt) {
-    return { phase: 'rendering', waitedS, spoken: `Rendering now. ${saySeconds(waitedS)} in.` };
+    return { phase: 'rendering', waitedS, spoken: `${job.progress || 'Rendering now.'} ${saySeconds(waitedS)} in.` };
   }
   const giveUp = leftS > 0
     ? ` I give up in ${saySeconds(leftS)} if nothing comes free.`
@@ -275,6 +275,15 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     input.auk_task = options.auk_task === 'edit' ? 'edit' : 'speech';
     input.instruction = String(options.instruction || '').slice(0, MAX_PROMPT);
     if (options.gen_seconds != null) input.gen_seconds = options.gen_seconds;
+    for (const key of ['edit_start', 'edit_end']) {
+      if (options[key] != null) {
+        if (!Number.isFinite(options[key]) || options[key] < 0) return { error: 'Edit start and end must be valid seconds.' };
+        input[key] = options[key];
+      }
+    }
+    for (const key of ['preserve_before', 'preserve_after']) {
+      if (typeof options[key] === 'boolean') input[key] = options[key];
+    }
   }
   const ref = options.reference_voice_url;
   if (typeof ref === 'string' && /^https?:\/\/\S+$/i.test(ref) && ref.length < 2048) input.reference_voice_url = ref;
@@ -403,6 +412,9 @@ async function pump() {
       }
       if (job.state === 'cancelled') continue;
       if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date().toISOString(); saveJobs(); }
+      if (s.status === 'IN_PROGRESS' && typeof s.output === 'string' && /^AuK HQ: /.test(s.output)) {
+        job.progress = s.output.slice(0, 160); saveJobs();
+      }
       /* THE FLOOR. Still queued, no card has picked it up, and the clock has
        * run out: stop waiting and SAY SO. Startup may still be billed even
        * when the job never reaches inference. Giving up also
@@ -487,7 +499,9 @@ async function pump() {
           await notifyResult(job, 'Your narration is ready', `${len} of audio is ready. Open the Sound Booth to play your take, or find it in My Creations.`);
         } catch (e) { console.warn('[scenema] notify failed:', e.message); }
       } else if (s.status === 'FAILED' || s.status === 'CANCELLED' || s.status === 'TIMED_OUT') {
-        job.state = 'failed'; job.error = s.error || s.status; job.finishedAt = new Date().toISOString(); saveJobs();
+        job.state = 'failed'; job.error = /timeout|timed.out/i.test(String(s.error || s.status))
+          ? 'The audio worker reached its time limit. Any finished sections are kept. Render again to resume; your original recording is unchanged.'
+          : s.error || s.status; job.finishedAt = new Date().toISOString(); saveJobs();
         receipt({ jobId: job.id, userId: job.userId, state: 'failed', error: job.error, executionMs: s.executionTime, costUSD: Math.round(((s.executionTime || 0) / 3600000 * RATE_PER_HR) * 1000) / 1000 });
         await notifyFail(job);
       }

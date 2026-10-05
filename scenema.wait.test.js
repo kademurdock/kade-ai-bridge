@@ -58,6 +58,8 @@ test('a running job stops talking about cards and reports progress', () => {
   assert.equal(w.phase, 'rendering');
   assert.match(w.spoken, /^Rendering now\./);
   assert.doesNotMatch(w.spoken, /give up/);
+  const progress = waitInfo({ state: 'running', submittedAt: agoS(200), progress: 'AuK HQ: part 2 of 3' }, CAP({ running: 1 }));
+  assert.match(progress.spoken, /^AuK HQ: part 2 of 3/);
 });
 
 test('a started job is rendering even if state lags behind startedAt', () => {

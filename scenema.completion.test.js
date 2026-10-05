@@ -47,6 +47,20 @@ test('provider success produces one completion notification and persistent resul
   assert.equal(f.pushes[0].requested, true);
 });
 
+test('AuK progress is saved while working and timeouts explain recovery', async t => {
+  let response = { status: 'IN_PROGRESS', output: 'AuK HQ: part 2 of 3' };
+  const f = fixture(t, () => response);
+  await f.pump();
+  assert.equal(f.read().progress, 'AuK HQ: part 2 of 3');
+  assert.equal(f.read().state, 'running');
+  assert.equal(f.pushes.length, 0);
+  response = { status: 'TIMED_OUT', executionTime: 12000 };
+  await f.pump();
+  assert.equal(f.read().state, 'failed');
+  assert.match(f.read().error, /finished sections are kept.*resume/);
+  assert.equal(f.pushes.length, 1);
+});
+
 test('repeated missing provider records terminate waiting, transient misses do not', async t => {
   let missing = true;
   const f = fixture(t, () => {
