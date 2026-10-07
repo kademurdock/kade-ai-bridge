@@ -41,6 +41,7 @@ const os = require('os');
 const path = require('path');
 const axios = require('axios');
 const express = require('express');
+const { audioDiagnostics, privateSample } = require('./scenema-diagnostics');
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const JOBS_FILE = path.join(DATA_DIR, 'scenema-jobs.json');
@@ -481,13 +482,17 @@ async function pump() {
         const cold = delayS > 45; // a wake, not a warm worker
         const costUSD = Math.round((execS / 3600 * RATE_PER_HR + (cold ? WAKE_USD : 0)) * 1000) / 1000;
         job.state = 'done'; job.finishedAt = new Date().toISOString(); job.costUSD = costUSD;
-        job.result = { engine: out.engine || job.engine, wavKey: out.wav_key, wavUrl: out.wav_url, url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold };
+        const diagnostics = audioDiagnostics(out);
+        job.result = { engine: out.engine || job.engine, wavKey: out.wav_key, wavUrl: out.wav_url, url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold, ...diagnostics };
+        const sample = privateSample(out, job.userId);
+        if (sample) job.result.diagnosticSample = sample;
+        if (out.diagnostic_sample_error === 'retention_failed') job.result.diagnosticSampleError = 'retention_failed';
         saveJobs();
         receipt({ jobId: job.id, userId: job.userId, state: 'done', durationS: out.duration_s, executionS: execS, delayS, cold, costUSD, words: job.estimate?.words });
         console.log(`[scenema] ${job.id} done: ${out.duration_s}s audio in ${execS.toFixed(0)}s (${cold ? 'cold' : 'warm'}), $${costUSD}`);
         await postUsage({ userId: job.userId, seconds: out.duration_s || execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, words: job.estimate?.words, agent: job.agentName } });
         if (!job.suppressAsset) {
-          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio' } });
+          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio', ...diagnostics } });
         }
         /* A part does not buzz her phone -- the fork does that once, after the
          * parts are joined. Five pushes for one story is not five times the

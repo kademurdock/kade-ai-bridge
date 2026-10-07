@@ -7,23 +7,23 @@ const path = require('node:path');
 const vm = require('node:vm');
 const express = require('express');
 
-function fixture(t, response, notification = { ok: true, sent: 1 }) {
+function fixture(t, response, notification = { ok: true, sent: 1 }, jobOverrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'booth-completion-'));
   const file = path.join(dir, 'scenema-jobs.json');
   fs.writeFileSync(file, JSON.stringify([{ id: 'test-job', userId: 'owner', agentId: 'soundbooth',
-    state: 'running', runpodId: 'provider-job', createdAt: new Date(Date.now() - 300000).toISOString() }]));
-  const pushes = [];
+    state: 'running', runpodId: 'provider-job', createdAt: new Date(Date.now() - 300000).toISOString(), ...jobOverrides }]));
+  const pushes = [], assets = [];
   const mod = { exports: {} };
   const provider = { create: () => ({ get: async () => ({ data: await response() }) }),
-    post: async () => ({ data: {} }) };
+    post: async (url, body) => { if (url.endsWith('/api/kade/asset-event')) assets.push(body); return { data: {} }; } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'scenema.js'), 'utf8'), {
     module: mod, require: name => name === 'axios' ? provider : require(name), console,
-    process: { env: { SCENEMA_ENABLED: '0', RAILWAY_VOLUME_MOUNT_PATH: dir } },
+    process: { env: { SCENEMA_ENABLED: '0', RAILWAY_VOLUME_MOUNT_PATH: dir, KADE_USAGE_EVENT_SECRET: 'synthetic-only' } },
     Buffer, URL, setTimeout, clearTimeout,
   });
   mod.exports.attachScenema(express(), { runNotify: async payload => { pushes.push(payload); return notification; } });
   t.after(() => fs.rmSync(dir, { recursive: true }));
-  return { pump: mod.exports._internals.pump, read: () => JSON.parse(fs.readFileSync(file))[0], pushes };
+  return { pump: mod.exports._internals.pump, read: () => JSON.parse(fs.readFileSync(file))[0], pushes, assets };
 }
 
 test('worker errors end the job and request one targeted, routed failure notification', async t => {
@@ -45,6 +45,41 @@ test('provider success produces one completion notification and persistent resul
   assert.equal(f.pushes.length, 1);
   assert.match(f.pushes[0].title, /ready/);
   assert.equal(f.pushes[0].requested, true);
+});
+
+test('real completion path preserves provider diagnostics without inventing legacy values', async t => {
+  const f = fixture(t, () => ({status:'COMPLETED',output:{url:'https://example.invalid/audio',duration_s:12,
+    voice_sample:true,has_reference_voice:false,quality:'base-bf16-32',parts:1}}));
+  await f.pump();
+  const result=f.read().result;
+  assert.equal(result.voiceSample,true);
+  assert.equal(result.hasReferenceVoice,false);
+  assert.equal(result.parts,1);
+  assert.equal(result.quality,'base-bf16-32');
+  assert.equal(result.diagnosticSample,undefined);
+  const legacy=fixture(t, () => ({status:'COMPLETED',output:{url:'https://example.invalid/audio',duration_s:12}}));
+  await legacy.pump();
+  assert.equal(legacy.read().result.voiceSample,undefined);
+  assert.equal(legacy.read().result.hasReferenceVoice,undefined);
+});
+
+test('actual completion keeps a verified private sample on its owner job and never mirrors it to the gallery', async t => {
+  const owner='1234567890abcdef12345678';
+  const output={url:'https://example.invalid/auk/clip.mp3',wav_key:'auk/clip.wav',wav_url:'https://example.invalid/auk/clip.wav',duration_s:12,
+    voice_sample:true,has_reference_voice:false,diagnostic_sample:{owner_id:owner,key:'auk/clip.conditioning.wav',
+      url:'https://example.invalid/auk/clip.conditioning.wav',duration_s:5,sha256:'a'.repeat(64),kind:'bootstrap_reference'}};
+  const f=fixture(t,()=>({status:'COMPLETED',output}),undefined,{userId:owner});
+  await f.pump();
+  assert.equal(f.read().result.diagnosticSample.key,'auk/clip.conditioning.wav');
+  assert.equal(f.assets.length,1);
+  assert.equal(f.assets[0].url,output.url);
+  assert.equal(f.assets[0].metadata.voiceSample,true);
+  assert.equal(f.assets[0].metadata.hasReferenceVoice,false);
+  assert.equal(f.assets[0].metadata.diagnosticSample,undefined);
+  assert.equal(JSON.stringify(f.assets).includes('conditioning.wav'),false);
+  const foreign=fixture(t,()=>({status:'COMPLETED',output}),undefined,{userId:'abcdef1234567890abcdef12'});
+  await foreign.pump();
+  assert.equal(foreign.read().result.diagnosticSample,undefined);
 });
 
 test('AuK progress is saved while working and timeouts explain recovery', async t => {
