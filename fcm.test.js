@@ -33,6 +33,7 @@ test('agent calls reach Android in background as high-priority data with visible
   assert.strictEqual(message.notification, undefined);
   assert.strictEqual(message.android.notification, undefined);
   assert.strictEqual(message.android.priority, 'high');
+  assert.strictEqual(message.android.ttl, '180s');
   assert.deepStrictEqual(message.data, {
     kadeCall: '{"planId":"plan-1","agentId":"della"}', category: 'KADE_CALL',
     title: 'Della is calling', body: 'A quick check-in',
@@ -46,5 +47,6 @@ test('ordinary Android pushes retain their system notification', () => {
   });
   assert.deepStrictEqual(message.notification, { title: 'A new message', body: 'Open your chat' });
   assert.strictEqual(message.android.notification.channel_id, 'kade');
+  assert.strictEqual(message.android.ttl, undefined);
   assert.deepStrictEqual(message.data, { kadeRoute: 'chat' });
 });

@@ -124,6 +124,8 @@ function fcmMessage(deviceToken, title, body, opts = {}) {
     data: { ...dataMapFrom(opts), ...(isCall ? { title: visibleTitle, body: visibleBody } : {}) },
     android: {
       priority: 'high',
+      // Match the bridge's three-minute answer window; ordinary pushes keep FCM's default.
+      ...(isCall ? { ttl: '180s' } : {}),
       ...(!isCall ? { notification: {
         channel_id: 'kade',
         sound: 'default',
