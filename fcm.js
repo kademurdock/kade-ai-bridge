@@ -111,27 +111,36 @@ function dataMapFrom(opts) {
   return out;
 }
 
+/* KADE_CALL is data-only so Android receives it in onMessageReceived even
+ * while backgrounded and can show Answer / Not now actions. Ordinary pushes
+ * keep their system-rendered notification. APNs sends use a separate path. */
+function fcmMessage(deviceToken, title, body, opts = {}) {
+  const isCall = opts && opts.category === 'KADE_CALL';
+  const visibleTitle = String(title || 'Kade-AI').slice(0, 100);
+  const visibleBody = String(body || '').slice(0, 1000);
+  const message = {
+    token: deviceToken,
+    ...(!isCall ? { notification: { title: visibleTitle, body: visibleBody } } : {}),
+    data: { ...dataMapFrom(opts), ...(isCall ? { title: visibleTitle, body: visibleBody } : {}) },
+    android: {
+      priority: 'high',
+      ...(!isCall ? { notification: {
+        channel_id: 'kade',
+        sound: 'default',
+        default_vibrate_timings: true,
+      } } : {}),
+    },
+  };
+  return message;
+}
+
 /* Same signature as sendApnsPush. */
 async function sendFcmPush(deviceToken, title, body, opts = {}) {
   if (!fcmConfigured()) return { token: deviceToken, status: 0, error: _saErr || 'FCM not configured' };
   let bearer;
   try { bearer = await fcmAccessToken(); }
   catch (e) { return { token: deviceToken, status: 0, error: e.message }; }
-  const isCall = opts && opts.category === 'KADE_CALL';
-  const message = {
-    token: deviceToken,
-    notification: { title: String(title || 'Kade-AI').slice(0, 100), body: String(body || '').slice(0, 1000) },
-    data: dataMapFrom(opts),
-    android: {
-      priority: 'high',
-      notification: {
-        channel_id: isCall ? 'kade_calls' : 'kade',
-        sound: 'default',
-        default_vibrate_timings: true,
-        ...(isCall ? { notification_priority: 'PRIORITY_MAX' } : {}),
-      },
-    },
-  };
+  const message = fcmMessage(deviceToken, title, body, opts);
   const r = await postJson(
     `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(fcmProjectId())}/messages:send`,
     { message },
@@ -151,4 +160,4 @@ async function sendFcmPush(deviceToken, title, body, opts = {}) {
 const FCM_TOKEN_RE = /^[A-Za-z0-9_\-]{20,}:[A-Za-z0-9_\-]{40,}$/;
 function looksLikeFcmToken(t) { return FCM_TOKEN_RE.test(String(t || '')); }
 
-module.exports = { fcmConfigured, fcmProjectId, fcmAccessToken, sendFcmPush, looksLikeFcmToken, dataMapFrom, FCM_TOKEN_RE };
+module.exports = { fcmConfigured, fcmProjectId, fcmAccessToken, sendFcmPush, looksLikeFcmToken, dataMapFrom, fcmMessage, FCM_TOKEN_RE };

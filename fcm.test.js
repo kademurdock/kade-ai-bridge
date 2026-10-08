@@ -24,3 +24,27 @@ test('data map flattens nested APNs-style payloads to strings and carries the ca
   const m = dataMapFrom({ category: 'KADE_CALL', data: { kadeCall: { planId: 'p1' }, kadeRoute: 'brief', skip: null } });
   assert.deepStrictEqual(m, { kadeCall: '{"planId":"p1"}', kadeRoute: 'brief', category: 'KADE_CALL' });
 });
+
+test('agent calls reach Android in background as high-priority data with visible notification text', () => {
+  const { fcmMessage } = require('./fcm');
+  const message = fcmMessage('device-token', 'Della is calling', 'A quick check-in', {
+    category: 'KADE_CALL', data: { kadeCall: { planId: 'plan-1', agentId: 'della' } },
+  });
+  assert.strictEqual(message.notification, undefined);
+  assert.strictEqual(message.android.notification, undefined);
+  assert.strictEqual(message.android.priority, 'high');
+  assert.deepStrictEqual(message.data, {
+    kadeCall: '{"planId":"plan-1","agentId":"della"}', category: 'KADE_CALL',
+    title: 'Della is calling', body: 'A quick check-in',
+  });
+});
+
+test('ordinary Android pushes retain their system notification', () => {
+  const { fcmMessage } = require('./fcm');
+  const message = fcmMessage('device-token', 'A new message', 'Open your chat', {
+    data: { kadeRoute: 'chat' },
+  });
+  assert.deepStrictEqual(message.notification, { title: 'A new message', body: 'Open your chat' });
+  assert.strictEqual(message.android.notification.channel_id, 'kade');
+  assert.deepStrictEqual(message.data, { kadeRoute: 'chat' });
+});
