@@ -1298,6 +1298,91 @@ app.post('/broadcasts', (req, res) => {
   res.json({ ok: true, entry });
 });
 
+// Explicit, one-shot platform announcements. This separate admin door adds
+// durable identity, a public-agent chat target and browser push without changing
+// legacy callers' /notify semantics. The fork verifies active account membership
+// and the target's public ACL; only aggregate metrics leave this operation.
+require('./announcements').attachAnnouncements(app, {
+  // No temp-directory fallback for a one-time broadcast journal. A missing,
+  // invalid or temporary mount disables only this new door, never the bridge.
+  persistentStorage: (() => {
+    try {
+      const mount = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+      const temporary = path.resolve(os.tmpdir());
+      return Boolean(mount && path.isAbsolute(mount) && path.resolve(mount) !== temporary &&
+        !path.resolve(mount).startsWith(temporary + path.sep) && fs.existsSync(mount) && fs.statSync(mount).isDirectory());
+    } catch { return false; }
+  })(),
+  storePath: process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'bridge-announcement-operations.json') : null,
+  bridgeSecretOk,
+  nativeRegistry() {
+    const iosConfigured = Boolean(process.env.APNS_KEY && process.env.APNS_KEY_ID && process.env.APNS_TEAM_ID);
+    const androidConfigured = fcm.fcmConfigured();
+    const out = { registered: pushTokens.size, iosConfigured, androidConfigured,
+      excludedTest: 0, excludedUnlinked: 0, excludedUnconfigured: 0, rows: [] };
+    for (const [token, meta] of pushTokens) {
+      const userId = meta && meta.userId;
+      if (testSeatPolicy.isTestUser(userId)) { out.excludedTest++; continue; }
+      if (typeof userId !== 'string' || !/^[a-f0-9]{24}$/i.test(userId)) { out.excludedUnlinked++; continue; }
+      const platform = ((meta && meta.platform) || (fcm.looksLikeFcmToken(token) ? 'android' : 'ios')) === 'android' ? 'android' : 'ios';
+      if (!(platform === 'ios' ? iosConfigured : androidConfigured)) { out.excludedUnconfigured++; continue; }
+      out.rows.push({ token, userId, platform });
+    }
+    return out;
+  },
+  async readAudience(agentId, nativeUserIds) {
+    const result = await axios.post(`${LIBRECHAT_URL}/api/kade/admin/announcement-audience`, { agentId, nativeUserIds }, {
+      headers: { 'x-bridge-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA }, timeout: 15000,
+    });
+    return result.data;
+  },
+  async sendWeb(payload) {
+    const result = await axios.post(`${LIBRECHAT_URL}/api/kade/admin/announcement-web-push`, payload, {
+      headers: { 'x-bridge-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA }, timeout: 60000,
+    });
+    return result.data;
+  },
+  async readWeb(id) {
+    const result = await axios.get(`${LIBRECHAT_URL}/api/kade/admin/announcement-web-push/${encodeURIComponent(id)}`, {
+      headers: { 'x-bridge-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA }, timeout: 15000,
+    });
+    return result.data;
+  },
+  notificationGate(agentId) {
+    const { day, hhmm } = centralClock();
+    const global = notifyCounts.day === day ? notifyCounts.global : 0;
+    const perAgent = notifyCounts.day === day ? (notifyCounts.perAgent[agentId] || 0) : 0;
+    const reason = !notifyPrefs.enabled ? 'notifications are globally muted'
+      : notifyPrefs.mutedAgents.includes(agentId) ? 'this agent is muted'
+      : notifyInQuietHours(hhmm) ? 'quiet hours (Central)'
+      : Date.now() - notifyCounts.lastSentMs < notifyPrefs.cooldownMin * 60000 ? 'cooldown active'
+      : global >= notifyPrefs.globalDailyCap ? 'daily total cap reached'
+      : perAgent >= notifyPrefs.perAgentDailyCap ? 'per-agent daily cap reached' : null;
+    return { allowed: !reason, ...(reason ? { reason } : {}) };
+  },
+  sendNative: sendPush,
+  pruneNative(token) { if (pushTokens.delete(token)) savePushTokens(); },
+  chargeBudget(agentId) {
+    const { day } = centralClock();
+    if (notifyCounts.day !== day) notifyCounts = { day, global: 0, perAgent: {}, lastSentMs: notifyCounts.lastSentMs };
+    notifyCounts.global++;
+    notifyCounts.perAgent[agentId] = (notifyCounts.perAgent[agentId] || 0) + 1;
+    notifyCounts.lastSentMs = Date.now();
+  },
+  publishHistory(entry) {
+    if (broadcastLog.some(row => row.id === entry.id)) throw new Error('Announcement history identity already exists');
+    const next = [...broadcastLog, entry].slice(-50);
+    require('./announcements').atomicSave(BROADCASTS_FILE, next);
+    broadcastLog = next;
+  },
+  updateHistory(id, update) {
+    if (!broadcastLog.some(row => row.id === id)) throw new Error('Announcement history identity is missing');
+    const next = broadcastLog.map(row => row.id === id ? { ...row, ...update } : row);
+    require('./announcements').atomicSave(BROADCASTS_FILE, next);
+    broadcastLog = next;
+  },
+});
+
 // View / change notification preferences (admin). Body/query: secret; POST body may set
 // enabled, perAgentDailyCap, globalDailyCap, cooldownMin, quietStart, quietEnd, muteAgent, unmuteAgent.
 app.get('/notify-prefs', (req, res) => {
