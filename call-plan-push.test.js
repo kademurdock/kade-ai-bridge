@@ -20,6 +20,7 @@ test('a scheduled call carries its account ID through the Android push data', as
     notifyInQuietHours: () => false,
     callPrefs: { perUserDailyCap: 6 },
     tokensForUser: userId => userId === 'account-one' ? ['device-one'] : [],
+    desktopPresence: { has: () => false },
     ringtoneFileFor: () => 'KadeRingClassic.caf',
     sendPush: async (...args) => { sent.push(args); return { status: 200 }; },
     pushTokens: new Map(),
