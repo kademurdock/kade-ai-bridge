@@ -25,6 +25,8 @@ const testSeatPolicy = require('./test-seat-policy');
 // Part 295 (Sep 26 2026): BYOK-safe OpenRouter cost, and the Google key's alarm + spend ledger.
 const { openRouterCost, upstreamCost } = require('./or-cost');
 const googleWatch = require('./google-watch');
+const { pendingRing, canAnswerRing, DesktopPresence } = require('./desktop-calls');
+const desktopPresence = new DesktopPresence();
 
 const app  = express();
 const port = process.env.PORT || 3000;
@@ -3623,7 +3625,8 @@ async function fireCallPlan(plan, { test = false } = {}) {
   }
   if (!test && (callCounts.perUser[plan.userId] || 0) >= callPrefs.perUserDailyCap) return refuse('per-user daily call cap reached');
   const targets = tokensForUser(plan.userId);
-  if (!targets.length) { console.warn(`[calls] RING ZERO TARGETS plan=${plan.id} user=${String(plan.userId).slice(0, 8)}...`); return { ok: true, sent: 0, note: 'no device linked to this user' }; }
+  const desktop = desktopPresence.has(plan.userId);
+  if (!targets.length && !desktop) { console.warn(`[calls] RING ZERO TARGETS plan=${plan.id} user=${String(plan.userId).slice(0, 8)}...`); return { ok: true, sent: 0, note: 'no device linked to this user' }; }
   const sound = ringtoneFileFor(plan);
   const shortPurpose = String(plan.purpose || '').slice(0, 120);
   const results = await Promise.all(targets.map((t) => sendPush(
@@ -3642,10 +3645,10 @@ async function fireCallPlan(plan, { test = false } = {}) {
   plan.pendingAnswer = { firedAt: new Date().toISOString() };
   plan.timesFired = (plan.timesFired || 0) + 1;
   plan.lastFiredDay = day;
-  if (sent > 0 && !test) callCounts.perUser[plan.userId] = (callCounts.perUser[plan.userId] || 0) + 1;
+  if ((sent > 0 || desktop) && !test) callCounts.perUser[plan.userId] = (callCounts.perUser[plan.userId] || 0) + 1;
   saveCallPlans();
   console.log(`[calls] RANG plan=${plan.id} ${plan.agentName} -> user ${String(plan.userId).slice(0, 8)}... sent=${sent} tone=${sound}${test ? ' (test)' : ''}`);
-  return { ok: true, sent, ringtone: sound };
+  return { ok: true, sent, desktopAvailable: desktop, ringtone: sound };
 }
 
 // The web-voice hello calls these (via the attachMediaStreams cfg): read the
@@ -3731,6 +3734,25 @@ app.post('/call-plans', (req, res) => {
     ringtoneFile: ringtoneFileFor(plan),
     quietWarning: quietWarning ? `That time falls inside quiet hours (${notifyPrefs.quietStart}-${notifyPrefs.quietEnd} Central). Without override_quiet:true the phone will NOT ring — the user gets a morning notice instead. Ask them if this call should override quiet hours, and recreate with override_quiet:true if they say yes.` : null,
   });
+});
+app.get('/call-plans/pending', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!notifySecretOk(req) && !bridgeSecretOk(req)) return res.status(403).json({ error: 'Unauthorized' });
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId || userId.length > 64) return res.status(400).json({ error: 'userId required' });
+  const now = Date.now();
+  const rings = callsEnabled() ? [...callPlans.values()].map(plan => pendingRing(plan, userId, now)).filter(Boolean) : [];
+  res.json({ rings });
+});
+app.post('/call-presence', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!notifySecretOk(req) && !bridgeSecretOk(req)) return res.status(403).json({ error: 'Unauthorized' });
+  const body = req.body || {};
+  try {
+    res.json(desktopPresence.set(body.userId, body.leaseId, body.enabled));
+  } catch (error) {
+    res.status(error instanceof RangeError ? 503 : 400).json({ error: error.message });
+  }
 });
 app.get('/call-plans', (req, res) => {
   if (!notifySecretOk(req, req.query.secret) && !bridgeSecretOk(req, req.query.secret)) return res.status(403).json({ error: 'Unauthorized' });
@@ -4046,6 +4068,7 @@ attachMediaStreams(server, users, {
   saveSeenCall: () => saveSeenSet(SEEN_CALL_FILE, seenCallNumbers),
   getOutboundCtx,
   getCallPlan,          // Part 75: agent-call answer priming (web-voice hello)
+  canAnswerCallRing: (planId, userId, agentId, ringId) => callsEnabled() && canAnswerRing(getCallPlan(planId), userId, agentId, ringId),
   markCallAnswered,     // Part 75: answering completes the plan / clears the missed sweep
   onCallEnd,
   endCall,

@@ -4229,6 +4229,15 @@ function attachWebVoice(server) {
           } catch {}
           return;
         }
+        if (Object.prototype.hasOwnProperty.call(msg, 'callRingId') &&
+            (msg.spotterDirect === true || typeof cfg.canAnswerCallRing !== 'function' ||
+             !cfg.canAnswerCallRing(msg.callPlanId, t.uid, t.agentId, msg.callRingId))) {
+          try {
+            ws.send(JSON.stringify({ type: 'error', message: 'This incoming call has expired or was already answered.' }));
+            ws.close(4409, 'ring no longer available');
+          } catch {}
+          return;
+        }
         const user = {
           name:        t.name || null,
           agentId:     t.agentId || cfg.defaultAgent,
@@ -4362,7 +4371,7 @@ function attachWebVoice(server) {
         refreshPronunciationDictionary(session, pronIdentity, cfg);
 
         session.dgWs = openDeepgram(session);
-        session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice });
+        session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice, callSid: session.callSid });
         session.sendState('listening');
         /* NO SPOKEN GREETING ON THIS LANE any more (Part 110) — the `ready`
          * and `listening` states sent just above are what tells the caller the
