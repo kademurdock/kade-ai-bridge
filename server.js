@@ -3634,7 +3634,7 @@ async function fireCallPlan(plan, { test = false } = {}) {
       category: 'KADE_CALL',
       sound,
       interruptionLevel: 'time-sensitive',
-      data: { kadeCall: { planId: plan.id, agentId: plan.agentId, agentName: plan.agentName, purpose: String(plan.purpose || '').slice(0, 300) } },
+      data: { kadeCall: { planId: plan.id, userId: plan.userId, agentId: plan.agentId, agentName: plan.agentName, purpose: String(plan.purpose || '').slice(0, 300) } },
     }
   )));
   let pruned = 0; results.forEach((r) => { if (r.status === 410 && pushTokens.delete(r.token)) pruned++; }); if (pruned) savePushTokens();
