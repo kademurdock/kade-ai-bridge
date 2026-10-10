@@ -5,6 +5,7 @@
 // channel; unknown outcomes are reconciled with GET, never sent again by POST.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const path = require('node:path');
 
 const AGENT_ID = /^agent_[A-Za-z0-9_-]{21}$/;
 const OPERATION_ID = /^[a-z][a-z0-9-]{7,95}$/;
@@ -36,17 +37,24 @@ function validatePayload(input) {
 
 function count(value) { return Number.isSafeInteger(value) && value >= 0 ? value : 0; }
 
-function atomicSave(filename, value) {
+function atomicSave(filename, value, fileSystem = fs, platform = process.platform) {
   const temp = filename + '.tmp';
   let fd;
   try {
-    fd = fs.openSync(temp, 'w', 0o600);
-    fs.writeFileSync(fd, JSON.stringify(value));
-    fs.fsyncSync(fd);
-    fs.closeSync(fd); fd = undefined;
-    fs.renameSync(temp, filename);
+    fd = fileSystem.openSync(temp, 'w', 0o600);
+    fileSystem.writeFileSync(fd, JSON.stringify(value));
+    fileSystem.fsyncSync(fd);
+    fileSystem.closeSync(fd); fd = undefined;
+    fileSystem.renameSync(temp, filename);
+    // File fsync alone does not make the directory's rename durable. Production
+    // runs Linux; Windows does not provide the same directory handle operation.
+    if (platform !== 'win32') {
+      fd = fileSystem.openSync(path.dirname(filename), 'r');
+      fileSystem.fsyncSync(fd);
+      fileSystem.closeSync(fd); fd = undefined;
+    }
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+    if (fd !== undefined) fileSystem.closeSync(fd);
   }
 }
 
@@ -93,6 +101,7 @@ function createAnnouncementService(deps) {
     return { ok: true, id: op.id, payloadHash: op.payloadHash, requestHash: op.requestHash,
       state: op.error ? 'failed' : overall(native, web, active), persistent: op.published === true,
       durableStorage: true,
+      budgetReserved: op.budgetCharged === true,
       title: op.title, body: op.body, agentId: op.agentId, agentName: op.agentName,
       kadeRoute: 'agent-chat', kadeAgentId: op.agentId, url: op.url,
       createdAt: op.createdAt, updatedAt: op.updatedAt, audience: op.audience,
@@ -151,9 +160,10 @@ function createAnnouncementService(deps) {
     });
   }
 
-  function chargeAccepted(op) {
-    if (!op.budgetCharged && (nativeMetrics(op.native).accepted + op.web.accepted > 0)) {
+  function reserveBudget(op) {
+    if (!op.budgetCharged) {
       op.budgetCharged = true;
+      op.budgetChargeKind = 'publication-reservation';
       persist();
       deps.chargeBudget(op.agentId);
     }
@@ -176,7 +186,6 @@ function createAnnouncementService(deps) {
       .then(() => {
         const metrics = nativeMetrics(op.native);
         op.native.state = metrics.unknown ? 'unknown' : 'complete';
-        chargeAccepted(op);
         saveProgress(op);
       }));
     let timeout;
@@ -194,7 +203,10 @@ function createAnnouncementService(deps) {
 
   async function execute(payload) {
     const prepared = await audience(payload.agentId);
-    if (prepared.public.gate?.allowed !== true) throw new AnnouncementError(409, prepared.public.gate?.reason || 'notification guard blocked');
+    // Recheck at the synchronous claim boundary, because a different operation
+    // can have reserved budget while this request awaited account eligibility.
+    const finalGate = deps.notificationGate(payload.agentId);
+    if (finalGate?.allowed !== true) throw new AnnouncementError(409, finalGate?.reason || 'notification guard blocked');
     const op = { ...payload, agentName: prepared.public.publicAgent.name, createdAt: now(), updatedAt: now(),
       audience: prepared.public, published: false,
       native: { state: payload.channels.native ? 'pending' : 'skipped', results: [] },
@@ -208,6 +220,7 @@ function createAnnouncementService(deps) {
         kadeRoute: 'agent-chat', kadeAgentId: op.agentId, url: op.url, payloadHash: op.payloadHash });
       op.published = true;
       saveProgress(op); // history is durable before either native or web fanout
+      reserveBudget(op); // a lost provider response cannot evade cooldown/caps
       await nativeFanout(op, prepared.targets);
       if (op.channels.web) {
         op.web.state = 'sending';
@@ -220,7 +233,6 @@ function createAnnouncementService(deps) {
         }
       }
       saveProgress(op);
-      chargeAccepted(op);
     } catch {
       op.error = op.published ? 'delivery bookkeeping failed; do not retry' : 'persistent publication failed; no pushes were started';
       try { saveProgress(op); } catch { /* original claimed state stays on disk */ }

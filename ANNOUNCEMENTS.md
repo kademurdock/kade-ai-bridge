@@ -27,17 +27,27 @@ the same chat metadata and public agent name for accessible actions.
 The operation journal requires a real persistent Railway volume. There is no
 temporary-directory fallback. The current production bridge has a READY volume
 mounted at `/data`; both the new operation journal and existing history are
-stored there. Writes use a flushed temporary file followed by rename. A missing
+stored there. Writes flush the temporary file, rename it, then fsync the parent
+directory on production Linux (the Windows test runtime skips directory fsync). A missing
 mount or unreadable operation store disables this new API while legacy bridge
 features remain available.
 
-History is persisted before either fanout. Native attempts exclude review/test,
+History is persisted before either fanout. Each durable publication reserves one
+notification budget and cooldown before sending, including zero-recipient or
+rejected operations. This conservative accounting keeps uncertain delivery from
+evading caps; repeated requests and status reads do not reserve again. Native attempts exclude review/test,
 unlinked, unconfigured and inactive-account devices. The fork checks active
 account eligibility and public-agent access, persists its unique web operation,
 and delivers only to existing consenting subscriptions. The bridge uses the
 existing APNs/FCM dispatchers and prunes confirmed dead tokens. Native timeouts
 remain unknown; late provider results can update counts without another send.
 Web timeouts are resolved through the fork's read-only operation status.
+
+The inherited `notifyCounts` totals and cooldown remain in memory. A bridge
+restart clears those limits for a new operation ID. The durable reservation flag
+prevents the same operation ID from charging or sending again across restarts;
+it does not restore global or per-agent cap totals. The frozen Angel introduction
+therefore remains duplicate-safe without changing the legacy cap store.
 
 The existing `/notify`, `/broadcasts` and notification preference routes retain
 their behavior and existing history rows. This patch does not publish or send an

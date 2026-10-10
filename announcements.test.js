@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createAnnouncementService, attachAnnouncements, validatePayload } = require('./announcements');
+const { createAnnouncementService, attachAnnouncements, validatePayload, atomicSave } = require('./announcements');
 
 const AGENT = 'agent_NkG_Fb8_xLz8HFJyx4gNv';
 const input = () => ({ id: 'angel-intro-20261009-01', title: 'Meet Angel 👼✨', body: 'Tap for a fresh chat with Angel.', agentId: AGENT, channels: { native: true, web: true } });
@@ -190,7 +190,7 @@ test('no eligible devices and unconfigured web still leave one durable announcem
   });
   const result = await f.service.start(input());
   assert.equal(result.persistent, true); assert.equal(result.native.attempted, 0); assert.equal(result.web.attempted, 0);
-  assert.equal(result.web.reason, 'unconfigured'); assert.equal(f.counts.budget, 0); assert.equal(f.counts.publication, 1);
+  assert.equal(result.web.reason, 'unconfigured'); assert.equal(f.counts.budget, 1); assert.equal(f.counts.publication, 1);
 });
 
 test('invalid targets, external URL injection, oversized payload and unauthorized route do not reach delivery', async t => {
@@ -231,4 +231,40 @@ test('a missing persistent mount disables the new door without attempting delive
   const res = { status: value => { status = value; return res; }, json: () => {} };
   await routes.get('POST /announcements')({ get: () => 'test-admin', body: input() }, res);
   assert.equal(status, 503); assert.equal(f.counts.native, 0); assert.equal(f.counts.web, 0);
+});
+
+test('web-only lost response reserves budget once before send and keeps repeated reconciliation read-only', async t => {
+  let payload;
+  const f = fixture(t, {
+    nativeRegistry: () => ({ registered: 0, rows: [] }),
+    readAudience: async () => ({ ok: true, publicAgent: { id: AGENT, name: 'Angel', isPublic: true },
+      accounts: { eligible: 1, total: 1, excludedTest: 0 }, nativeEligibleIndexes: [], web: { configured: true, subscriptions: 1, users: 1 } }),
+    sendWeb: async value => { payload = value; assert.equal(f.counts.budget, 1); throw new Error('response lost after acceptance'); },
+  });
+  assert.equal((await f.service.start(input())).state, 'unknown');
+  f.deps.readWeb = async () => ({ id: payload.id, payloadHash: payload.payloadHash, state: 'complete', configured: true,
+    eligibleUsers: 1, subscriptions: 1, attempted: 1, accepted: 1, failed: 0, unknown: 0 });
+  const bytes = fs.readFileSync(f.deps.storePath);
+  for (let i = 0; i < 3; i++) {
+    const result = await f.service.status(input().id);
+    assert.equal(result.state, 'complete'); assert.equal(result.web.accepted, 1); assert.equal(result.budgetReserved, true);
+  }
+  assert.deepEqual(fs.readFileSync(f.deps.storePath), bytes);
+  await createAnnouncementService(f.deps).start(input());
+  assert.equal(f.counts.budget, 1);
+});
+
+test('Linux durability syncs the parent directory after rename; Windows fallback syncs only the file', () => {
+  for (const platform of ['linux', 'win32']) {
+    const events = [];
+    const fileSystem = {
+      openSync: (filename, mode) => { events.push(['open', filename, mode]); return mode === 'w' ? 1 : 2; },
+      writeFileSync: fd => events.push(['write', fd]), fsyncSync: fd => events.push(['sync', fd]),
+      closeSync: fd => events.push(['close', fd]), renameSync: () => events.push(['rename']),
+    };
+    atomicSave('/volume/operation.json', { id: 'one' }, fileSystem, platform);
+    assert.ok(events.findIndex(e => e[0] === 'sync' && e[1] === 1) < events.findIndex(e => e[0] === 'rename'));
+    if (platform === 'linux') assert.ok(events.findIndex(e => e[0] === 'sync' && e[1] === 2) > events.findIndex(e => e[0] === 'rename'));
+    else assert.equal(events.some(e => e[0] === 'sync' && e[1] === 2), false);
+  }
 });
