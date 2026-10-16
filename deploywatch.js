@@ -27,6 +27,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
 
 const STATE_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'deploywatch.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -342,7 +343,7 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser, cancelDe
     const t0 = Date.now();
     const result = { lane, voice, at: new Date().toISOString(), trigger, ok: false, ms: 0, bytes: 0, durationMs: null, longestSilenceMs: null, note: '' };
     try {
-      const headers = { 'Content-Type': 'application/json', 'User-Agent': UA };
+      const headers = { 'Content-Type': 'application/json', 'User-Agent': UA, ...speechHeaders('bridge-probe') };
       if (opts.stream) headers['x-kade-tts-stream'] = '1';
       const r = await fetch(TTS_URL, {
         method: 'POST',

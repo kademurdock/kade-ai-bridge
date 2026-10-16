@@ -26,6 +26,7 @@ const testSeatPolicy = require('./test-seat-policy');
 const { openRouterCost, upstreamCost } = require('./or-cost');
 const googleWatch = require('./google-watch');
 const { pendingRing, canAnswerRing, DesktopPresence } = require('./desktop-calls');
+const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
 const desktopPresence = new DesktopPresence();
 
 const app  = express();
@@ -428,7 +429,7 @@ async function synthesizeVoice(text, voice = null) {
   const r = await axios.post(
     `${TTS_PROXY_URL}/v1/audio/speech`,
     { model: process.env.PHONE_TTS_MODEL || 'tts-1-mini', input, voice: useVoice },
-    { responseType: 'arraybuffer', timeout: 30000 }
+    { responseType: 'arraybuffer', timeout: 30000, headers: speechHeaders('bridge-voicemail') }
   );
   return Buffer.from(r.data);
 }

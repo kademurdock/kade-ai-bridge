@@ -25,6 +25,7 @@ const { URL } = require('url');
 const crypto = require('crypto');
 const fs = require('fs');
 const { speechMetadata, sendCharacterMetadata } = require('./character-audio');
+const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
 const path = require('path');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2854,7 +2855,7 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
   if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech${format === 'mulaw' ? '?telephony=1' : ''}`,
-    { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA },
+    { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...speechHeaders(format === 'mulaw' ? 'bridge-phone' : 'bridge-voice') },
     body
   );
   return new Promise((resolve, reject) => {
