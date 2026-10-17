@@ -4278,7 +4278,8 @@ setInterval(async () => {
 // Schedule (all UTC, matching what the fork ran in-process):
 //   nudges         every 60s      (reminders/birthdays/phone prompts — exact-time delivery)
 //   summary        daily  08:00   (KADE DREAMING relationship summaries + decay)
-//   restart        daily  10:00   (memory-hygiene exit; fork refuses if booted <2h)
+//   restart        daily  10:00   (memory-hygiene exit; fork refuses if booted <2h or a background
+//                  task runs; waits and looks again every 5 min until CLOCK_RESTART_LAST_HOUR)
 //   files          daily  11:00   (expired-file sweep)
 //   consolidation  DAILY 09:00 (Aug 19 2026; was weekly Sun. CLOCK_CONSOLIDATE_DOW=0
 //                  restores Sunday-only.) platform-wide memory consolidation — NOTE:
@@ -4352,6 +4353,7 @@ console.log(
     ' | nudges every 60s',
 );
 const clockLastPoke = { nudges: null, ok: null };
+const { restartTick } = require('./clock-restart');
 
 async function clockPoke(job) {
   /* Part 127: the dreaming pass now writes six sections per relationship and
@@ -4428,6 +4430,21 @@ setInterval(async () => {
   const now = new Date();
   for (const job of CLOCK_JOBS) {
     try {
+      /* Oct 17 2026: the restart waits while a character's background task runs, and looks
+       * again every few minutes inside its window (clock-restart.js). */
+      if (job.name === 'restart') {
+        await restartTick({
+          now,
+          state: clockState,
+          fetchStats: async () => (await axios.get(`${LIBRECHAT_URL}/api/kade/clock/soul-stats`, {
+            headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
+            timeout: 30000,
+          })).data,
+          poke: () => clockPoke('restart'),
+          save: () => { try { fs.writeFileSync(CLOCK_FILE, JSON.stringify(clockState)); } catch { /* state loss ≠ job loss */ } },
+        });
+        continue;
+      }
       if (now.getUTCHours() !== parseInt(process.env[job.hourEnv] || String(job.defHour), 10)) continue;
       if (job.weeklyDowUTC !== undefined && now.getUTCDay() !== job.weeklyDowUTC) continue;
       const dayKey = now.toISOString().slice(0, 10);
