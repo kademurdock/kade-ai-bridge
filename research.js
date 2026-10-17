@@ -496,7 +496,11 @@ async function runJob(job, deps) {
      * a requested push (skips the outreach budget) and its outcome is written
      * on the job, so check/get can say "ready — and the phone tap did not go
      * out" instead of pretending. */
-    if (deps.runNotify && job.notifyOnDone !== false) {
+    /* Oct 16 2026: the character tells them, in the conversation the question came
+     * from, and that message's push opens it. The old tap is the fallback. */
+    if (job.notifyOnDone !== false && (await postBack(job))) {
+      job.notify = { sent: 'in-chat', conversationId: job.postedConversationId, at: new Date().toISOString() };
+    } else if (deps.runNotify && job.notifyOnDone !== false) {
       try {
         const out = await deps.runNotify({
           agentId: job.agentId, agentName: job.agentName || 'Research',
@@ -563,7 +567,36 @@ async function pump(deps) {
  * exactly one place where "what a research job is" is defined. */
 let liveDeps = null;
 
-function createJob({ userId, agentId, agentName, question, depth, focus, includePersonalNotes, notify = true } = {}) {
+
+/* Oct 16 2026: a finished report goes back as the character's own message, written
+ * on the person's seat by the site (POST /api/kade/soul/speak, billed to them like
+ * the chat it came from). RESEARCH_POST_BACK=0 turns it off. Returns true when the
+ * message was posted; any failure leaves the old phone tap to do the job. */
+async function postBack(job) {
+  if (process.env.RESEARCH_POST_BACK === '0') return false;
+  if (!/^agent_[A-Za-z0-9_-]{6,64}$/.test(job.agentId || '') || !job.userId || !process.env.BRIDGE_SECRET) return false;
+  const site = (process.env.FORK_USAGE_URL || process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+  const report = String(job.report || '').slice(0, 4500);
+  const note =
+    `Your deep research finished. The question was: ${job.question}\n` +
+    `Here is the report the research desk wrote for you:\n${report}\n` +
+    'Tell them what you found: the answer first, then the few things that matter most and how sure you are. ' +
+    'Keep it short enough to listen to, and offer to go through the rest or read the full report.';
+  try {
+    const r = await axios.post(`${site}/api/kade/soul/speak`,
+      { userId: job.userId, agentId: job.agentId, note, conversationId: job.conversationId || undefined, kind: 'research', requested: true, push: true },
+      { headers: { 'x-kade-secret': process.env.BRIDGE_SECRET, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }, timeout: 280000 });
+    if (r.data && r.data.ok && r.data.conversationId) {
+      job.postedConversationId = r.data.conversationId;
+      return true;
+    }
+  } catch (e) {
+    console.warn(`[research] post-back failed for ${job.id}, falling back to the phone tap: ${e.message}`);
+  }
+  return false;
+}
+
+function createJob({ userId, agentId, agentName, question, depth, focus, includePersonalNotes, notify = true, conversationId } = {}) {
   if (!enabled()) return { ok: false, code: 503, error: `Research is unavailable: ${disabledWhy()}.` };
   userId = String(userId || '').trim();
   question = String(question || '').replace(/%%%/g, '').trim().slice(0, 600);
@@ -579,6 +612,7 @@ function createJob({ userId, agentId, agentName, question, depth, focus, include
   const job = {
     id: crypto.randomBytes(5).toString('hex'),
     userId, agentId: String(agentId || ''), agentName: String(agentName || '').slice(0, 60),
+    conversationId: /^[0-9a-f-]{36}$/i.test(String(conversationId || '')) ? String(conversationId) : null,
     question, focus: String(focus || '').replace(/%%%/g, '').trim().slice(0, 400) || null,
     depth: d, includePersonalNotes: includePersonalNotes === true,
     /* An internal caller (the errands desk) owns its own done-push; without
@@ -626,6 +660,7 @@ function attachResearch(app, deps = {}) {
       userId: req.body?.userId, agentId: req.body?.agentId, agentName: req.body?.agentName,
       question: req.body?.question, depth: req.body?.depth, focus: req.body?.focus,
       includePersonalNotes: req.body?.include_personal_notes,
+      conversationId: req.body?.conversationId,
     });
     if (!r.ok) return res.status(r.code || 400).json({ error: r.error });
     res.json({ ok: true, id: r.id, position: r.position, etaMinutes: r.etaMinutes });
