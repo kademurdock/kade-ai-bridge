@@ -851,8 +851,36 @@ async function wrapUp(errand, deps) {
   }
 
   setStatus(errand, 'done', 'finished');
+  /* Oct 16 2026: the character tells them in their conversation (its push opens it);
+   * the old tap is the fallback. ERRAND_POST_BACK=0 turns it off. */
+  if (await postBack(errand)) {
+    addStep(errand, 'notify', 'Told you in our conversation, with a tap on your phone.');
+    return;
+  }
   addStep(errand, 'notify', 'Pinged your phone that it was done.');
   await pushOut(errand, deps, 'Your errand is done', `"${cut(errand.goal, 55)}" — ${cut(errand.answer, 150)} Ask Kiana for the receipts.`);
+}
+
+/* The finished answer goes back as the character's own message, written on the
+ * person's seat by the site (POST /api/kade/soul/speak, billed like the chat it
+ * came from). Returns true when it was posted. */
+async function postBack(errand) {
+  if (process.env.ERRAND_POST_BACK === '0') return false;
+  if (!/^agent_[A-Za-z0-9_-]{6,64}$/.test(errand.agentId || '') || !process.env.BRIDGE_SECRET) return false;
+  const site = (process.env.FORK_USAGE_URL || process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
+  const note =
+    `Your errand finished. The errand was: ${errand.goal}\n` +
+    `Here is what you found and wrote up:\n${String(errand.answer || '').slice(0, 3500)}\n` +
+    'Tell them the answer first, in your own voice, short enough to listen to, and offer the receipts (every step and what it cost) if they want them.';
+  try {
+    const r = await axios.post(`${site}/api/kade/soul/speak`,
+      { userId: errand.userId || OWNER_ID, agentId: errand.agentId, note, kind: 'errand', requested: true, push: true },
+      { headers: { 'x-kade-secret': process.env.BRIDGE_SECRET, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }, timeout: 280000 });
+    return Boolean(r.data && r.data.ok && r.data.conversationId);
+  } catch (e) {
+    console.warn(`[errand] ${errand.id} post-back failed, falling back to the phone tap: ${e.message}`);
+    return false;
+  }
 }
 
 function cut(s, n) {
