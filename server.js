@@ -4320,6 +4320,9 @@ const CLOCK_JOBS = [
   { name: 'restart', hourEnv: 'CLOCK_RESTART_HOUR', defHour: 10 },
   { name: 'files', hourEnv: 'CLOCK_FILES_HOUR', defHour: 11 },
   { name: 'consolidation', hourEnv: 'CLOCK_CONSOLIDATE_HOUR', defHour: 9, weeklyDowUTC: clockConsolidateDow() },
+  /* Oct 16 2026: each character's nightly day of its own (fork services/kadeCharacterDays.js),
+   * 7 UTC = 2 a.m. Central, about the day that just ended. */
+  { name: 'character-days', hourEnv: 'CLOCK_DAYS_HOUR', defHour: 7 },
 ];
 let clockState = {};
 try { clockState = JSON.parse(fs.readFileSync(CLOCK_FILE, 'utf8')); } catch { /* first run */ }
@@ -4354,7 +4357,7 @@ async function clockPoke(job) {
   /* Part 127: the dreaming pass now writes six sections per relationship and
    * outran a two-minute wait on Sep 4 ("summary failed: timeout of 120000ms")
    * while the sweep itself finished fine. Long jobs get a long wait. */
-  const LONG_JOBS = { summary: 900000, consolidation: 900000 };
+  const LONG_JOBS = { summary: 900000, consolidation: 900000, 'character-days': 900000 };
   const r = await axios.post(`${LIBRECHAT_URL}/api/kade/clock/${job}`, {}, {
     headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
     timeout: LONG_JOBS[job] || 120000,
