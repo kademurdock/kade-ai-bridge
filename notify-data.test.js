@@ -8,3 +8,10 @@ test('notification payload preserves exact job identity through serialization an
   assert.deepEqual(notificationData('admin', runId), { kadeRoute: 'admin' });
   assert.equal(notificationData(null, runId), undefined);
 });
+
+test('a conversation push carries the exact conversation id, and nothing else gets one', () => {
+  const id = '3f2a9c1e-5b7d-4e8a-9c0f-1a2b3c4d5e6f';
+  assert.deepEqual(notificationData('conversation', null, id), { kadeRoute: 'conversation', kadeConversationId: id });
+  assert.deepEqual(notificationData('conversation', null, 'new'), { kadeRoute: 'conversation' });
+  assert.deepEqual(notificationData('admin', null, id), { kadeRoute: 'admin' });
+});

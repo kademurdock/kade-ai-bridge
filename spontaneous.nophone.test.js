@@ -14,6 +14,8 @@ const path = require('path');
 
 process.env.RAILWAY_VOLUME_MOUNT_PATH = fs.mkdtempSync(path.join(os.tmpdir(), 'spont-'));
 process.env.SPONTANEOUS_USERS = 'u-phone,u-nophone';
+/* The old push-only lane; the in-chat lane is spontaneous.inchat.test.js. */
+process.env.SPONTANEOUS_IN_CHAT = '0';
 
 const axios = require('axios');
 const { attachSpontaneous } = require('./spontaneous');

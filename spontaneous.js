@@ -80,7 +80,28 @@ function attachSpontaneous(app, { bridgeSecretOk, notifySecretOk, runNotify, pro
     );
   }
 
+  /* Oct 16 2026: the text is written ON THE PERSON'S OWN SEAT by the fork (their
+   * memory, Kiana's mood and moments with them load, which the service-seat ask
+   * never had) and lands as the first message of a real conversation they can
+   * answer; the push opens it. Platform-paid: nobody's balance pays for a text
+   * they did not ask for. SPONTANEOUS_IN_CHAT=0 restores the old push-only text. */
+  const inChat = () => process.env.SPONTANEOUS_IN_CHAT !== '0';
+
+  async function speakInChat(u, daysQuiet) {
+    const note = composePrompt(u.name || 'them', daysQuiet).replace(/^\[|\]$/g, '');
+    const r = await axios.post(
+      `${siteBase}/api/kade/soul/speak`,
+      { userId: u.userId, agentId: kianaAgentId, note, kind: 'friend-text', platformPaid: true, push: true },
+      { headers: { 'x-kade-secret': process.env.BRIDGE_SECRET, 'User-Agent': browserUA }, timeout: 280000 },
+    );
+    const d = r.data || {};
+    if (!d.ok) throw new Error(d.error || 'speak failed');
+    const pushed = d.pushed || {};
+    return { text: String(d.text || '').slice(0, 400), sent: true, inChat: true, conversationId: d.conversationId, pushSent: !!(pushed.ok && pushed.sent > 0), notify: pushed };
+  }
+
   async function composeAndSend(u, daysQuiet, dry) {
+    if (!dry && inChat()) return speakInChat(u, daysQuiet);
     const r = await axios.post(
       `${proxyUrl}/librechat/ask`,
       { agentId: kianaAgentId, messages: [{ role: 'user', content: composePrompt(u.name || 'them', daysQuiet) }], userEmail: u.email || undefined, deleteAfter: true },
