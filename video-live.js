@@ -398,19 +398,143 @@ function buildSetupMessage(session) {
  * the greet is requested at setup, so a healthy session speaks well inside
  * that), it says so once, out loud, through the normal synth voice the call
  * already has, and logs LOUDLY so the next log-diver finds a verdict instead
- * of a gap. One warning per call, never nagging. LIVE_SILENCE_MS=0 disables. */
+ * of a gap. One warning per call, never nagging. LIVE_SILENCE_MS=0 disables.
+ *
+ * OCT 20 2026 — THE COUNT STARTS WHEN THE CALLER SPEAKS. The count above ran
+ * from setup, but the greet has been off since Aug 9, and neither Live model
+ * (3.1 flash preview, 3.8) says a word before the caller does: both sat silent
+ * for 15 s in a test. So anyone who waited, or asked a long first question,
+ * heard "the live eyes aren't answering" with nothing wrong: 5 of the 30 real
+ * Spotter calls reviewed that day, each answered right after the notice. Now
+ * the watchdog arms on the caller's first speech that Google could have heard
+ * (mic audio forwarded while live, loud and long enough to be a voice, or
+ * their first words from our own transcriber), and the count runs from the
+ * caller's LAST speech, so a long question is timed from its end. A caller who
+ * keeps asking "are you there?" still hears the notice: LIVE_SILENCE_MAX_MS
+ * after their first words, whatever came since. Nothing changes after the
+ * first model audio. A caller who never speaks is never warned. */
 const LIVE_SILENCE_MS = () => {
   const v = parseInt(process.env.LIVE_SILENCE_MS || '12000', 10);
   return Number.isFinite(v) ? v : 12000;
 };
+const LIVE_SILENCE_MAX_MS = () => {
+  const v = parseInt(process.env.LIVE_SILENCE_MAX_MS || '20000', 10);
+  return Number.isFinite(v) ? v : 20000;
+};
+// Mic level that counts as a voice: RMS of the 16 kHz PCM16 chunk, 500 is
+// about -36 dBFS (phone and browser mics run speech near -25 with their gain
+// control on). Audio alone arms only after LIVE_VAD_MIN_MS of voice, so a
+// cough, a bark or a door does not start the count; short words like "hi"
+// arrive as a transcript instead.
+const LIVE_VAD_RMS = () => {
+  const v = parseInt(process.env.LIVE_VAD_RMS || '500', 10);
+  return Number.isFinite(v) && v > 0 ? v : 500;
+};
+const LIVE_VAD_MIN_MS = 500;
+const LIVE_VAD_GAP_MS = 400;
+// Our own synth voice in the mic is not the caller (the echo gate's window).
+const LIVE_ECHO_MS = 1200;
+// Words transcribed this soon after setup may have been said before Google was
+// listening (the audio is only forwarded once live is up), so they do not arm.
+const LIVE_WORDS_SKIP_MS = 4000;
 const LIVE_SILENT_LINE =
   "Hey, it's not you — the live eyes aren't answering me right now. Google's end has gone quiet. Give it a few seconds, or hang up and call back; it usually comes right back.";
 /** Pure verdict so the test can hold it still: warn exactly once, only while
- * live, only if the deadline passed with zero model audio ever heard. */
-function shouldWarnLiveSilence({ liveOn, armedAt, firstAudioAt, warned, now, ms }) {
-  if (!liveOn || warned || !armedAt || !ms || ms <= 0) return false;
+ * live, only after the caller spoke, and only with zero model audio ever
+ * heard: LIVE_SILENCE_MS after their last speech, or LIVE_SILENCE_MAX_MS after
+ * their first words (wordsAt), whichever comes first. */
+function shouldWarnLiveSilence({ liveOn, callerFirstAt, callerLastAt, wordsAt, firstAudioAt, warned, now, ms, maxMs }) {
+  if (!liveOn || warned || !callerFirstAt || !ms || ms <= 0) return false;
   if (firstAudioAt) return false;
-  return now - armedAt >= ms;
+  return now >= liveSilenceDueAt({ callerFirstAt, callerLastAt, wordsAt, ms, maxMs });
+}
+/** When the notice falls due, or 0 while the caller has not spoken. */
+function liveSilenceDueAt({ callerFirstAt, callerLastAt, wordsAt, ms, maxMs }) {
+  if (!callerFirstAt || !ms || ms <= 0) return 0;
+  const byLast = Math.max(callerFirstAt, callerLastAt || 0) + ms;
+  return wordsAt && maxMs > 0 ? Math.min(byLast, wordsAt + maxMs) : byLast;
+}
+function liveSilenceState(session, now) {
+  return {
+    liveOn: session.liveOn,
+    callerFirstAt: session._liveCallerFirstAt,
+    callerLastAt: session._liveCallerLastAt,
+    wordsAt: session._liveCallerWordsAt,
+    firstAudioAt: session._liveFirstAudioAt,
+    warned: session._liveSilenceWarned,
+    now,
+    ms: LIVE_SILENCE_MS(),
+    maxMs: LIVE_SILENCE_MAX_MS(),
+  };
+}
+/** Still waiting for the model's first word on a live call? */
+function watchingSilence(session) {
+  return !!(session.liveOn && session._liveWatchOn && !session._liveSilenceWarned && !session._liveFirstAudioAt);
+}
+/** One timer at a time, set for the current deadline. When it fires early
+ * because the caller spoke again, it sets itself for the new one. */
+function scheduleLiveSilence(session) {
+  if (session._liveWatch || !watchingSilence(session)) return;
+  const due = liveSilenceDueAt(liveSilenceState(session, Date.now()));
+  if (!due) return;
+  session._liveWatch = setTimeout(() => checkLiveSilence(session), Math.max(0, due - Date.now()) + 50);
+  if (session._liveWatch.unref) session._liveWatch.unref();
+}
+function checkLiveSilence(session) {
+  session._liveWatch = null;
+  try {
+    const st = liveSilenceState(session, Date.now());
+    if (shouldWarnLiveSilence(st)) {
+      session._liveSilenceWarned = true;
+      const quietMs = st.now - Math.max(st.callerFirstAt, st.callerLastAt || 0);
+      console.warn(`[video-live] WATCHDOG: no model audio ${quietMs}ms after the caller last spoke (first spoke ${Math.round((st.callerFirstAt - (session._liveStartedAt || st.callerFirstAt)) / 1000)}s after setup, ${Math.round((st.now - st.callerFirstAt) / 1000)}s ago) (user=${session.userId}) — speaking the silence notice`);
+      try { session.history.push({ role: 'assistant', content: LIVE_SILENT_LINE, lane: 'live' }); } catch {}
+      const sp = session._liveSpeak;
+      if (sp) sp(session, LIVE_SILENT_LINE, session.voice).catch(() => {});
+      return;
+    }
+    scheduleLiveSilence(session);
+  } catch { /* the watchdog must never hurt the call */ }
+}
+/** The caller spoke at `at` (still speaking at `now`): arm, or move the count. */
+function noteCallerSpoke(session, at, now, how) {
+  if (!watchingSilence(session)) return;
+  if (!session._liveCallerFirstAt) {
+    session._liveCallerFirstAt = at;
+    console.log(`[video-live] watchdog armed: the caller spoke (${how}) ${Math.round((at - (session._liveStartedAt || at)) / 1000)}s after setup (user=${session.userId})`);
+  }
+  session._liveCallerLastAt = Math.max(session._liveCallerLastAt || 0, now);
+  scheduleLiveSilence(session);
+}
+/** RMS of a PCM16 little-endian chunk. */
+function pcmRms(pcm) {
+  const n = Math.floor(pcm.length / 2);
+  if (!n) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const s = pcm.readInt16LE(i * 2); sum += s * s; }
+  return Math.sqrt(sum / n);
+}
+/** Mic audio Google is getting: a voice arms the watchdog and moves its count. */
+function noteCallerAudio(session, pcm, now = Date.now()) {
+  if (!watchingSilence(session) || !pcm || !pcm.length) return;
+  if (session.isSpeaking || (session.lastSpokAt && now - session.lastSpokAt < LIVE_ECHO_MS)) return;
+  if (pcmRms(pcm) < LIVE_VAD_RMS()) return;
+  if (!session._liveVoiceAt || now - session._liveVoiceAt > LIVE_VAD_GAP_MS) {
+    session._liveVoiceRunAt = now;
+    session._liveVoiceRunMs = 0;
+  }
+  session._liveVoiceAt = now;
+  session._liveVoiceRunMs += pcm.length / 32; // 16 kHz PCM16: 32 bytes a millisecond
+  if (session._liveCallerFirstAt || session._liveVoiceRunMs >= LIVE_VAD_MIN_MS) {
+    noteCallerSpoke(session, session._liveVoiceRunAt, now, 'voice');
+  }
+}
+/** The caller's words from our transcriber (voice-stream handleUtterance). */
+function noteCallerWords(session, now = Date.now()) {
+  if (!watchingSilence(session)) return;
+  if (session._liveStartedAt && now - session._liveStartedAt < LIVE_WORDS_SKIP_MS) return;
+  if (!session._liveCallerWordsAt) session._liveCallerWordsAt = now;
+  noteCallerSpoke(session, now, now, 'words');
 }
 
 /* GOOGLE KEY TROUBLE (Sep 26 2026, Part 295). The Live key is prepaid; when it
@@ -630,33 +754,18 @@ function handleGoogleMessage(session, raw, gws) {
       } catch { /* fail-soft */ }
     }
     console.log(`[video-live] LIVE session up user=${session.userId} model=${liveModel()}`);
-    /* Arm the silence watchdog. Cleared by the first model audio; fires at
+    /* Ready the silence watchdog. It arms on the caller's first speech (see
+     * noteCallerSpoke), is cleared by the first model audio, and fires at
      * most once per call. */
-    session._liveArmedAt = Date.now();
     session._liveFirstAudioAt = 0;
     session._liveSilenceWarned = false;
-    if (session._liveWatch) clearTimeout(session._liveWatch);
-    if (LIVE_SILENCE_MS() > 0) {
-      session._liveWatch = setTimeout(() => {
-        try {
-          if (shouldWarnLiveSilence({
-            liveOn: session.liveOn,
-            armedAt: session._liveArmedAt,
-            firstAudioAt: session._liveFirstAudioAt,
-            warned: session._liveSilenceWarned,
-            now: Date.now(),
-            ms: LIVE_SILENCE_MS(),
-          })) {
-            session._liveSilenceWarned = true;
-            console.warn(`[video-live] WATCHDOG: no model audio ${LIVE_SILENCE_MS()}ms after setup (user=${session.userId}) — speaking the silence notice`);
-            try { session.history.push({ role: 'assistant', content: LIVE_SILENT_LINE, lane: 'live' }); } catch {}
-            const sp = session._liveSpeak;
-            if (sp) sp(session, LIVE_SILENT_LINE, session.voice).catch(() => {});
-          }
-        } catch { /* the watchdog must never hurt the call */ }
-      }, LIVE_SILENCE_MS() + 50);
-      if (session._liveWatch.unref) session._liveWatch.unref();
-    }
+    session._liveCallerFirstAt = 0;
+    session._liveCallerLastAt = 0;
+    session._liveCallerWordsAt = 0;
+    session._liveVoiceAt = 0;
+    session._liveVoiceRunMs = 0;
+    if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
+    session._liveWatchOn = LIVE_SILENCE_MS() > 0;
     return;
   }
   // Spoken audio back from Google: 24kHz PCM16 chunks (verified live:
@@ -668,7 +777,14 @@ function handleGoogleMessage(session, raw, gws) {
   if (Array.isArray(parts)) {
     for (const p of parts) {
       if (p.inlineData && p.inlineData.data) {
-        if (!session._liveFirstAudioAt) session._liveFirstAudioAt = Date.now();
+        if (!session._liveFirstAudioAt) {
+          session._liveFirstAudioAt = Date.now();
+          if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
+          const spoke = session._liveCallerLastAt
+            ? `${session._liveFirstAudioAt - session._liveCallerLastAt}ms after the caller last spoke`
+            : 'before the caller spoke';
+          console.log(`[video-live] first model audio ${session._liveStartedAt ? session._liveFirstAudioAt - session._liveStartedAt : '?'}ms after setup, ${spoke} (user=${session.userId})`);
+        }
         try {
           const pcm = Buffer.from(p.inlineData.data, 'base64');
           if (pcm.length && session.ws && session.ws.readyState === 1) {
@@ -729,8 +845,9 @@ function handleGoogleMessage(session, raw, gws) {
   }
 }
 
-/** Browser mic audio while live: forward as 16kHz PCM chunks. */
-function forwardAudio(session, b64pcm16k) {
+/** Browser mic audio while live: forward as 16kHz PCM chunks. `pcm` is the
+ * same chunk as a Buffer, for the silence watchdog's ear (Oct 20 2026). */
+function forwardAudio(session, b64pcm16k, pcm) {
   const gws = session._liveWs;
   if (!session.liveOn || !gws || gws.readyState !== 1) return;
   try {
@@ -738,6 +855,9 @@ function forwardAudio(session, b64pcm16k) {
     // server 1007-closes with "Use audio, video, or text instead").
     gws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: 'audio/pcm;rate=16000', data: b64pcm16k } } }));
   } catch { /* fail-soft */ }
+  try {
+    if (watchingSilence(session)) noteCallerAudio(session, pcm || Buffer.from(b64pcm16k, 'base64'));
+  } catch { /* the watchdog must never hurt the call */ }
 }
 
 /** Camera frames while live: reuse the existing {type:'frame'} messages. */
@@ -849,7 +969,7 @@ function handleLiveMsg(session, msg, speak) {
 }
 
 module.exports = {
-  shouldWarnLiveSilence,
+  shouldWarnLiveSilence, noteCallerWords,
   LIVE_SILENT_LINE, enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
 // Exported for the pre-push test harness only — not called across modules.
-module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive };
+module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive, liveSilenceDueAt, pcmRms, noteCallerAudio };

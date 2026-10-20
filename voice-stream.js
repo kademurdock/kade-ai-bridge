@@ -1985,6 +1985,9 @@ async function handleUtterance(session, text) {
     // are where the durable facts live.) lane 'live' (Part 295) marks it as a
     // turn the Spotter heard, not one the text model answered.
     try { session.history.push({ role: 'user', content: text, lane: 'live' }); } catch {}
+    // Oct 20 2026: the caller's words start (or move) the live-silence
+    // watchdog's count; it no longer runs from connect.
+    try { videoLive.noteCallerWords(session); } catch {}
     if (/\b(?:live\s*(?:mode\s*)?(?:off|stop|end|quit|done)|(?:stop|end|turn\s+off|kill)\s+live(?:\s+mode)?)\b/i.test(text)) {
       try { videoLive.stopLive(session, 'voice-off'); } catch {}
     }
@@ -4214,7 +4217,12 @@ function attachWebVoice(server) {
         // LIVE lane: same 16k PCM16 chunks the mic already ships for Deepgram
         // get forwarded to Google (Deepgram stays open for captions + the
         // "live off" voice escape hatch — its turns are gated in handleUtterance).
-        if (session && session.liveOn) { try { videoLive.forwardAudio(session, Buffer.from(raw).toString('base64')); } catch {} }
+        if (session && session.liveOn) {
+          try {
+            const pcm = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+            videoLive.forwardAudio(session, pcm.toString('base64'), pcm);
+          } catch {}
+        }
         return;
       }
       let msg;
