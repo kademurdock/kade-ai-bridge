@@ -555,9 +555,8 @@ function rateLine(cmd, rate, moved) {
 }
 
 // The listener's own number from a call's hello. Anything but a number means they
-// never chose one, and the character's speed plays. Only the website sends it so
-// far: the iPhone hello (StreamingCallService.swift) has no speed yet, so an app
-// call plays the character's number or 1x until a build that sends it ships.
+// never chose one, and the character's speed plays. The website and iPhone 2.2.17
+// send it; older iPhone builds don't, so their calls play the character's number or 1x.
 function helloListenerRate(speed) {
   if (typeof speed !== 'number' || !Number.isFinite(speed)) return undefined;
   return Math.min(RATE_MAX, Math.max(RATE_MIN, speed));
