@@ -289,6 +289,11 @@ test('the voicemail switch, a fax, and a script that ran out of time', async () 
     strict({ params: { token: 'b'.repeat(32) }, body: { AnsweredBy: 'fax' } }, r2);
     assert.doesNotMatch(r2.xml, /FULL/);
 
+    store.scripts.set('d'.repeat(32), { at: clock, twiml: '<Response>FULL</Response>' });
+    const r4 = twimlRes();
+    strict({ params: { token: 'd'.repeat(32) }, body: { AnsweredBy: 'unknown' } }, r4);
+    assert.doesNotMatch(r4.xml, /FULL/, 'an undecided answer never hears the password');
+
     clock += SCRIPT_TTL_MS + 1;
     const r3 = twimlRes();
     strict({ params: { token: 'c'.repeat(32) }, body: { CallSid: 'CA' + 'c'.repeat(32), AnsweredBy: 'human' } }, r3);

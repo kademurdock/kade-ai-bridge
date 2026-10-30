@@ -255,7 +255,9 @@ function accountWelcomeTwimlHandler({
       if (!checkSignature(req)) console.warn(`[account-welcome-call] signature mismatch on script fetch ${sid || '?'}`);
     } catch {}
     const answeredBy = String(body.AnsweredBy || '');
-    const machine = /^(machine|fax)/.test(answeredBy);
+    // 'unknown' means detection could not tell (a silent person, or a machine with an odd greeting).
+    // Treated as a machine, so a password never lands on a voicemail; the card asks for a call back.
+    const machine = /^(machine|fax|unknown)/.test(answeredBy);
     const entry = /^[0-9a-f]{32}$/.test(token) ? store.scripts.get(token) : null;
     if (entry) store.scripts.delete(token);
     const fresh = Boolean(entry) && now() - entry.at <= SCRIPT_TTL_MS;
