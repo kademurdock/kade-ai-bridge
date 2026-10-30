@@ -54,7 +54,7 @@ test('every ask-stream request goes through askStreamBody (so viaFork is exact)'
 });
 
 test('a new session is never billed until the start handler says so', () => {
-  const ctx = context({ WebSocket: { OPEN: 1 }, captionSafe: (s) => s });
+  const ctx = context({ WebSocket: { OPEN: 1 }, captionSafe: (s) => s, characterRateFor: () => null });
   vm.runInContext(
     grab('class CallSession {', '// ── Barge-in', { inclusive: false }) +
       grab('class WebCallSession extends CallSession {', 'function verifyWebTicket', { inclusive: false }) +
@@ -79,6 +79,7 @@ test('phone: an inbound call is billed to the caller; an outbound call never is 
         }
       },
       buildOutboundSuffix: () => '',
+      settleRate() {},
       global: { _vsConfig: { getOutboundCtx: () => outboundCtx } },
       streamSid: 's',
       callSid: 'c',

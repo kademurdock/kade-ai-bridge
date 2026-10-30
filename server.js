@@ -14,7 +14,7 @@
 const express  = require('express');
 const http     = require('http');
 const http2    = require('http2');
-const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd } = require('./voice-stream');
+const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd, characterRateFor } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
 const crypto   = require('crypto');
@@ -2448,6 +2448,7 @@ app.post('/outbound-call', async (req, res) => {
   } catch (e) {
     console.warn('[outbound] agent voice lookup failed (using fallbacks):', e.message);
   }
+  const builderTts = { voiceId: outVoice, rate: outRate };
   if (!outVoice) outVoice = findVoice(agentName || DEFAULT_AGENT_NAME);
   if (!outVoice) outVoice = voice || DEFAULT_PHONE_VOICE;
   // July 12 2026: the CALLEE's own voice pick for this agent beats the
@@ -2460,6 +2461,12 @@ app.post('/outbound-call', async (req, res) => {
       console.log(`[outbound] callee personal voice applied: "${personal}"`);
     }
   } catch { /* agent default stands */ }
+  // Oct 30 2026: the agent's number belongs to its builder voice, so a callee's own
+  // pick or a name match plays at the callee's number or 1x. The greeting is rendered
+  // here, ahead of the call, so it has to look up that number itself.
+  outRate = characterRateFor(builderTts, outVoice);
+  const calleeRate = users.get(e164)?.rate;
+  const greetingRate = outRate ?? (typeof calleeRate === 'number' ? calleeRate : undefined);
   console.log(`[outbound] voice resolved: "${outVoice}"${outRate ? ` rate ${outRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
   // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
   // is JUST "Hi — is this X?" — the stream layer waits for their answer before
@@ -2559,8 +2566,8 @@ app.post('/outbound-call', async (req, res) => {
   let greeting2Buf = null;
   try {
     [greetingBuf, greeting2Buf] = await Promise.all([
-      vsSynthesize(greetingText, outVoice, outRate ?? undefined),
-      greeting2Text ? vsSynthesize(greeting2Text, outVoice, outRate ?? undefined) : Promise.resolve(null),
+      vsSynthesize(greetingText, outVoice, greetingRate),
+      greeting2Text ? vsSynthesize(greeting2Text, outVoice, greetingRate) : Promise.resolve(null),
     ]);
     console.log(`[outbound] greeting pre-synthesized: part1 ${greetingBuf.length} bytes${greeting2Buf ? `, part2 ${greeting2Buf.length} bytes` : ''}`);
   } catch (e) {
