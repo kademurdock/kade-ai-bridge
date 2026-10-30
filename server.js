@@ -2435,7 +2435,7 @@ app.post('/outbound-call', async (req, res) => {
   // inbound preference (Kade's round-2 catch: Zadiana called in Kiana's
   // voice). Priority: the agent record's builder-set tts.voiceId ->
   // an Inworld voice matching the agent's name (e.g. the "Zadiana" voice) ->
-  // explicit voice param -> platform default. Same for speaking rate.
+  // explicit voice param -> platform default.
   let outVoice = null;
   let outRate = null;
   try {
@@ -2462,12 +2462,14 @@ app.post('/outbound-call', async (req, res) => {
     }
   } catch { /* agent default stands */ }
   // Oct 30 2026: the agent's number belongs to its builder voice, so a callee's own
-  // pick or a name match plays at the callee's number or 1x. The greeting is rendered
-  // here, ahead of the call, so it has to look up that number itself.
+  // pick or a name match carries none. The callee's saved number beats the agent's,
+  // the same as inbound. The greeting is rendered here, ahead of the call, so it has
+  // to look up that number itself: the callee's, else the agent's, else 1x. outRate
+  // stays the agent's alone, for "normal" to return to on the call.
   outRate = characterRateFor(builderTts, outVoice);
   const calleeRate = users.get(e164)?.rate;
-  const greetingRate = outRate ?? (typeof calleeRate === 'number' ? calleeRate : undefined);
-  console.log(`[outbound] voice resolved: "${outVoice}"${outRate ? ` rate ${outRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
+  const greetingRate = typeof calleeRate === 'number' ? calleeRate : (outRate ?? undefined);
+  console.log(`[outbound] voice resolved: "${outVoice}"${greetingRate ? ` rate ${greetingRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
   // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
   // is JUST "Hi — is this X?" — the stream layer waits for their answer before
   // part 2 (disclosure + purpose). Unknown callee: one combined line.

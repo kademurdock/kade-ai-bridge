@@ -546,8 +546,9 @@ function nextRateStop(cur, dir) {
 
 // What a confirmation says, played at the new speed: audible proof plus the number.
 function rateLine(cmd, rate, moved) {
-  const said = `Okay, ${rate} times. `;
-  if (cmd === 'normal') return `Back to my normal pace, ${rate} times. Go ahead.`;
+  // Oct 30 2026: 1x is called Normal everywhere, never "1 times".
+  const said = rate === 1 ? 'Okay, normal speed. ' : `Okay, ${rate} times. `;
+  if (cmd === 'normal') return rate === 1 ? 'Back to my normal pace. Go ahead.' : `Back to my normal pace, ${rate} times. Go ahead.`;
   if (cmd === 'faster' && rate >= RATE_MAX) return `${moved ? said : ''}That's as fast as I go! Go ahead.`;
   if (cmd === 'slower' && rate <= RATE_LADDER[0]) return `${moved ? said : ''}That's my slowest. Go ahead.`;
   return `${said}Go ahead.`;
@@ -3613,15 +3614,14 @@ function attachMediaStreams(server, users, cfg) {
             session.agentId   = outboundCtx.agentId   || session.agentId;
             session.agentName = outboundCtx.agentName || session.agentName;
             if (outboundCtx.voice) session.voice = outboundCtx.voice;
-            // Oct 30 2026: the rule is unchanged (an agent with a number beats the
-            // callee's saved rate); "normal" now returns to this agent's own number.
-            // With no number the callee keeps their own, and the number the
-            // constructor took from the callee's default character is gone.
+            // Oct 30 2026: the same as inbound, the callee's saved number (already
+            // listenerRate, from the constructor) beats the agent's, and "normal"
+            // clears it back to this agent's own number. The number the constructor
+            // took from the callee's default character is gone.
             session.builderTts = {
               voiceId: session.voice,
               rate: typeof outboundCtx.rate === 'number' ? outboundCtx.rate : null,
             };
-            if (typeof outboundCtx.rate === 'number') session.listenerRate = null;
             settleRate(session);
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }

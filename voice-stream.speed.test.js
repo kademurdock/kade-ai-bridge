@@ -124,7 +124,7 @@ test('past either end the speed stays put, and a saved 0.5 is not pushed up by "
   assert.strictEqual(nextRateStop(0.65, 'slower'), 0.65);
 });
 
-test('the confirmation says the number; the top and bottom keep their lines', () => {
+test('the confirmation says the number; 1x is spoken as normal; the top and bottom keep their lines', () => {
   assert.strictEqual(rateLine('faster', 1.2, true), 'Okay, 1.2 times. Go ahead.');
   assert.strictEqual(rateLine('slower', 0.9, true), 'Okay, 0.9 times. Go ahead.');
   assert.strictEqual(rateLine('faster', 1.5, true), "Okay, 1.5 times. That's as fast as I go! Go ahead.");
@@ -134,6 +134,18 @@ test('the confirmation says the number; the top and bottom keep their lines', ()
   assert.strictEqual(rateLine('normal', 1.2, true), 'Back to my normal pace, 1.2 times. Go ahead.');
   // Coming back up from below the bottom of the list is an ordinary step.
   assert.strictEqual(rateLine('faster', 0.75, true), 'Okay, 0.75 times. Go ahead.');
+  // Oct 30 2026: 1x is called Normal everywhere, never "1 times".
+  assert.strictEqual(rateLine('faster', 1, true), 'Okay, normal speed. Go ahead.');
+  assert.strictEqual(rateLine('slower', 1, true), 'Okay, normal speed. Go ahead.');
+  assert.strictEqual(rateLine('normal', 1, true), 'Back to my normal pace. Go ahead.');
+});
+
+test('no stop on the list is ever spoken as "1 times"', () => {
+  for (const rate of RATE_LADDER) {
+    for (const cmd of ['faster', 'slower', 'normal']) {
+      assert.ok(!/(^|[^.\d])1 times/.test(rateLine(cmd, rate, true)), `${cmd} at ${rate}`);
+    }
+  }
 });
 
 test('the hello speed is a number clamped to 0.5-1.5, and anything else is no choice', () => {
@@ -172,11 +184,26 @@ test("normal clears the listener's number and returns to the character's, saying
   assert.strictEqual(lastSaid().body.input, 'Back to my normal pace, 1.2 times. Go ahead.');
 });
 
-test('normal with no character number sends no speed at all and says 1 times', async () => {
+test('normal with no character number sends no speed at all and says no number', async () => {
   const s = webCall({ rate: 1.4 });
   await handleUtterance(s, 'normal speed');
   assert.ok(!('speed' in lastSaid().body));
-  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace, 1 times. Go ahead.');
+  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace. Go ahead.');
+});
+
+test('a step landing on 1x says normal speed and still sends the 1', async () => {
+  const s = webCall({ rate: 1.1 });
+  await handleUtterance(s, 'slow down');
+  assert.strictEqual(lastSaid().body.speed, 1);
+  assert.strictEqual(lastSaid().body.input, 'Okay, normal speed. Go ahead.');
+  assert.strictEqual(s.listenerRate, 1, 'a 1x they stepped to is still their number');
+});
+
+test('normal back to a character whose number is 1 says no number', async () => {
+  const s = webCall({ characterRate: 1, rate: 1.3 });
+  await handleUtterance(s, 'normal speed');
+  assert.strictEqual(lastSaid().body.speed, 1);
+  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace. Go ahead.');
 });
 
 test('saying faster at the top stays at the top with the old line', async () => {
@@ -396,13 +423,56 @@ const KIANA_14 = { voiceId: 'Kiana', rate: 1.4, at: Date.now() };
 const holly = (extra = {}) => ({ name: 'Holly', agentId: 'a-kiana', agentName: 'Kiana', ...extra });
 
 // ── outbound's rule, through the real start ───────────────────────────────────
-test('outbound keeps its rule: an agent with a number beats the callee, and normal returns to it', async () => {
+test("outbound: the callee's saved number beats the agent's, and normal clears it back to the agent's", async () => {
   const outboundCtx = { agentId: 'a-harley', agentName: 'Harley', voice: 'Harley', rate: 1.3, greeting: 'Hi', greetingBuf: Buffer.alloc(160, 0xff) };
-  await withPhoneStart({ row: holly({ rate: 0.9 }), outboundCtx }, async (s) => {
-    assert.strictEqual(s.rate, 1.3);
+  const row = holly({ rate: 0.9 });
+  await withPhoneStart({ row, outboundCtx }, async (s) => {
+    assert.strictEqual(s.rate, 0.9);
+    assert.strictEqual(s.listenerRate, 0.9);
+    assert.strictEqual(s.characterRate, 1.3, 'the agent keeps its number underneath');
     const said = await sayAfterGreeting(s, 'normal speed');
     assert.strictEqual(said.body.speed, 1.3);
     assert.strictEqual(said.body.voice, 'Harley');
+    assert.strictEqual(said.body.input, 'Back to my normal pace, 1.3 times. Go ahead.');
+    assert.strictEqual(s.listenerRate, null);
+    assert.strictEqual(row.rate, null, 'cleared on their row, the same as inbound');
+  });
+});
+
+test("outbound: a callee's saved 1x is a number too, and beats the agent's", async () => {
+  const outboundCtx = { agentId: 'a-harley', agentName: 'Harley', voice: 'Harley', rate: 1.3, greeting: 'Hi', greetingBuf: Buffer.alloc(160, 0xff) };
+  await withPhoneStart({ row: holly({ rate: 1 }), outboundCtx }, async (s) => {
+    assert.strictEqual(s.rate, 1);
+  });
+});
+
+test('outbound: a callee with no number hears the agent, and normal stays there', async () => {
+  const outboundCtx = { agentId: 'a-harley', agentName: 'Harley', voice: 'Harley', rate: 1.3, greeting: 'Hi', greetingBuf: Buffer.alloc(160, 0xff) };
+  await withPhoneStart({ row: holly(), outboundCtx }, async (s) => {
+    assert.strictEqual(s.rate, 1.3);
+    assert.strictEqual(s.listenerRate, null);
+    const said = await sayAfterGreeting(s, 'normal speed');
+    assert.strictEqual(said.body.speed, 1.3);
+  });
+});
+
+test("outbound: a step starts from the callee's number and saves on their row", async () => {
+  const outboundCtx = { agentId: 'a-harley', agentName: 'Harley', voice: 'Harley', rate: 1.3, greeting: 'Hi', greetingBuf: Buffer.alloc(160, 0xff) };
+  const row = holly({ rate: 0.9 });
+  await withPhoneStart({ row, outboundCtx }, async (s) => {
+    const said = await sayAfterGreeting(s, 'speak faster');
+    assert.strictEqual(said.body.speed, 1);
+    assert.strictEqual(said.body.input, 'Okay, normal speed. Go ahead.');
+    assert.strictEqual(row.rate, 1);
+  });
+});
+
+test("outbound: a spoken voice change keeps the callee's number on an agent-numbered call", async () => {
+  const outboundCtx = { agentId: 'a-harley', agentName: 'Harley', voice: 'Voice 7', rate: 1.3, greeting: 'Hi', greetingBuf: Buffer.alloc(160, 0xff) };
+  await withPhoneStart({ row: holly({ rate: 0.9 }), outboundCtx }, async (s) => {
+    const said = await sayAfterGreeting(s, 'switch to voice 12');
+    assert.strictEqual(said.body.voice, 'Voice 12');
+    assert.strictEqual(said.body.speed, 0.9);
   });
 });
 
@@ -450,10 +520,9 @@ test('a spoken voice change on an agent-numbered outbound call drops the agent n
 async function outboundVoice({ builderVoice, builderRate, personal, nameMatch = null, calleeRate }) {
   const block = (() => {
     const a = SERVER_SRC.indexOf('const builderTts = { voiceId: outVoice, rate: outRate };');
-    const endText = "const greetingRate = outRate ?? (typeof calleeRate === 'number' ? calleeRate : undefined);";
-    const z = SERVER_SRC.indexOf(endText, a);
+    const z = SERVER_SRC.indexOf('const greetingRate =', a);
     assert.ok(a > -1 && z > -1, 'the route block is where it was');
-    return SERVER_SRC.slice(a, z + endText.length);
+    return SERVER_SRC.slice(a, SERVER_SRC.indexOf(';', z) + 1);
   })();
   return vm.runInNewContext(
     `(async () => { let outVoice = builderVoice; let outRate = builderRate; ${block}; return { outVoice, outRate, greetingRate }; })()`,
@@ -486,17 +555,24 @@ test('the outbound route: a name match or the platform default carries no agent 
   assert.strictEqual(r.outRate, null);
 });
 
-test('the outbound greeting plays at the number the call will: the agent, else the callee, else 1x', async () => {
+test('the outbound greeting plays at the number the call will: the callee, else the agent on its own voice, else 1x', async () => {
   let r = await outboundVoice({ builderVoice: 'Harley', builderRate: 1.4, personal: null, calleeRate: 0.9 });
-  assert.strictEqual(r.greetingRate, 1.4, "the agent's rule is unchanged");
+  assert.strictEqual(r.greetingRate, 0.9, "the callee's number beats the agent's");
+  assert.strictEqual(r.outRate, 1.4, 'the call still remembers the agent number, for normal');
+  r = await outboundVoice({ builderVoice: 'Harley', builderRate: 1.4, personal: null, calleeRate: 1 });
+  assert.strictEqual(r.greetingRate, 1, 'a saved 1x is a number too');
+  r = await outboundVoice({ builderVoice: 'Harley', builderRate: 1.4, personal: null });
+  assert.strictEqual(r.greetingRate, 1.4);
   r = await outboundVoice({ builderVoice: 'Harley', builderRate: 1.4, personal: 'Their Pick', calleeRate: 0.9 });
   assert.strictEqual(r.greetingRate, 0.9);
   r = await outboundVoice({ builderVoice: 'Harley', builderRate: 1.4, personal: 'Their Pick' });
   assert.strictEqual(r.greetingRate, undefined);
+  r = await outboundVoice({ builderVoice: 'Harley', builderRate: null, personal: null });
+  assert.strictEqual(r.greetingRate, undefined);
 });
 
 test('the outbound route decides the number before the greeting is rendered or the call is remembered', () => {
-  const decided = SERVER_SRC.indexOf('const greetingRate = outRate ??');
+  const decided = SERVER_SRC.indexOf('const greetingRate =');
   assert.ok(decided > -1);
   assert.ok(decided < SERVER_SRC.indexOf('vsSynthesize(greetingText, outVoice, greetingRate)'));
   assert.ok(decided < SERVER_SRC.indexOf('vsSynthesize(greeting2Text, outVoice, greetingRate)'));
@@ -522,7 +598,7 @@ test("a phone caller with their own saved voice hears it at 1x, not at the chara
   await handleUtterance(s, 'normal speed');
   assert.ok(!('speed' in lastSaid().body));
   assert.strictEqual(lastSaid().body.voice, 'My Own Voice');
-  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace, 1 times. Go ahead.');
+  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace. Go ahead.');
 });
 
 test("a phone caller's own voice plays at their own number", () => {
@@ -582,7 +658,7 @@ test("a spoken voice change plays at 1x from the confirmation on, and normal sta
   assert.strictEqual(s.characterRate, null);
   await handleUtterance(s, 'normal speed');
   assert.ok(!('speed' in lastSaid().body));
-  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace, 1 times. Go ahead.');
+  assert.strictEqual(lastSaid().body.input, 'Back to my normal pace. Go ahead.');
   spoken = [];
   await handleUtterance(s, 'speak faster');
   assert.strictEqual(lastSaid().body.speed, 1.1);
