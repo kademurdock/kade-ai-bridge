@@ -2300,20 +2300,35 @@ app.post('/account-code-call', require('./account-code-call').accountCodeCallHan
 
 // Oct 29 2026: a phone-only account's sign-in and temporary password read aloud
 // (fork admin/accessRequests.js asks on approval, or when Kade calls again; see
-// account-welcome-call.js). BRIDGE_SECRET only. Twilio waits out a voicemail
-// greeting so the whole message lands on the recording (WELCOME_CALL_AMD=0 off).
-app.post('/account-welcome-call', require('./account-welcome-call').accountWelcomeCallHandler({
+// account-welcome-call.js). BRIDGE_SECRET only. Twilio listens for a voicemail
+// first and then fetches the script: a person hears the sign-in and password,
+// a voicemail only "your account is ready, we'll call you back" (Kade's call,
+// Oct 29; WELCOME_CALL_VOICEMAIL_PASSWORD=1 would leave the whole message).
+const welcomeCalls = require('./account-welcome-call');
+const welcomeStore = welcomeCalls.createWelcomeStore();
+app.post('/account-welcome-call', welcomeCalls.accountWelcomeCallHandler({
   secretOk: bridgeSecretOk,
-  placeCall: async (to, twiml) => {
+  publicUrl: PUBLIC_URL,
+  store: welcomeStore,
+  ready: () => Boolean(twilioClient),
+  placeCall: async (to, url) => {
     if (!twilioClient) throw new Error('Twilio is not configured');
-    const opts = { to, from: OUR_NUMBER, twiml, timeLimit: 300 };
-    if (process.env.WELCOME_CALL_AMD !== '0') opts.machineDetection = 'DetectMessageEnd';
-    const call = await twilioClient.calls.create(opts);
+    const call = await twilioClient.calls.create({
+      to, from: OUR_NUMBER, url, method: 'POST', timeLimit: 300,
+      machineDetection: 'DetectMessageEnd',
+    });
     return call.sid;
   },
 }));
-app.get('/account-welcome-call/:sid', require('./account-welcome-call').accountWelcomeStatusHandler({
+app.post('/account-welcome-call/twiml/:token', welcomeCalls.accountWelcomeTwimlHandler({
+  store: welcomeStore,
+  checkSignature: (req) => !TWILIO_TOKEN || !twilio.validateRequest ||
+    twilio.validateRequest(TWILIO_TOKEN, req.get('X-Twilio-Signature') || '',
+      `${PUBLIC_URL}/account-welcome-call/twiml/${req.params.token}`, req.body || {}),
+}));
+app.get('/account-welcome-call/:sid', welcomeCalls.accountWelcomeStatusHandler({
   secretOk: bridgeSecretOk,
+  store: welcomeStore,
   fetchCall: async (sid) => {
     if (!twilioClient) throw new Error('Twilio is not configured');
     return twilioClient.calls(sid).fetch();
