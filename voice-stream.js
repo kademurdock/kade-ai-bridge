@@ -522,13 +522,43 @@ function buildOutboundSuffix(ctx) {
 // Kept deliberately conservative: only short utterances that are clearly
 // commands, so "is a cheetah faster than a horse and a car and a bike" never
 // changes the pace. Inworld's synthesis range is 0.5-1.5.
-const RATE_STEP = 0.15;
+//
+// Oct 30 2026 (Kade: "Inworld originally just had a speed, 1x 1.2x whatever, up
+// and down"): one list everywhere, the same stops the site and the iPhone show.
+// Numbers already saved off the list (a phone caller's 1.25, a 0.5) keep working;
+// the next "faster" or "slower" moves them to the nearest stop that way.
+const RATE_LADDER = [0.75, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5];
 const RATE_MIN  = 0.5;
 const RATE_MAX  = 1.5;
-// The proxy's default speaking rate (its TTS_SPEAKING_RATE env, 1.1 today) --
-// used as the baseline for the FIRST faster/slower step of a call. Override
-// with PHONE_BASE_RATE if the proxy default ever changes.
-const BASE_RATE = parseFloat(process.env.PHONE_BASE_RATE || '1.1');
+// The start point when neither the listener nor the character has a number.
+// Override with PHONE_BASE_RATE if the proxy default ever changes.
+const BASE_RATE = parseFloat(process.env.PHONE_BASE_RATE || '1');
+
+// The next list stop from wherever the call is now. Past the end of the list
+// the speed stays put, so a saved 0.5 is not pushed up by asking for "slower".
+function nextRateStop(cur, dir) {
+  const from = Math.min(RATE_MAX, Math.max(RATE_MIN, cur));
+  const stop = dir === 'faster'
+    ? RATE_LADDER.find((s) => s > from + 1e-9)
+    : [...RATE_LADDER].reverse().find((s) => s < from - 1e-9);
+  return stop === undefined ? from : stop;
+}
+
+// What a confirmation says, played at the new speed: audible proof plus the number.
+function rateLine(cmd, rate, moved) {
+  const said = `Okay, ${rate} times. `;
+  if (cmd === 'normal') return `Back to my normal pace, ${rate} times. Go ahead.`;
+  if (cmd === 'faster' && rate >= RATE_MAX) return `${moved ? said : ''}That's as fast as I go! Go ahead.`;
+  if (cmd === 'slower' && rate <= RATE_LADDER[0]) return `${moved ? said : ''}That's my slowest. Go ahead.`;
+  return `${said}Go ahead.`;
+}
+
+// The listener's own number from a web or iPhone hello. Anything but a number
+// means they never chose one, and the character's speed plays.
+function helloListenerRate(speed) {
+  if (typeof speed !== 'number' || !Number.isFinite(speed)) return undefined;
+  return Math.min(RATE_MAX, Math.max(RATE_MIN, speed));
+}
 
 function extractRateCommand(text) {
   const t = (text || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1075,8 +1105,15 @@ class CallSession {
     this.voice       = user?.voice || agentTts?.voiceId || nameVoice || cfg.defaultVoice;
     // Speaking rate (Kade 2026-07-01): null = proxy default. Adjusted live by
     // saying "speak faster" / "slow down" etc.; persisted per caller like voice.
-    this.rate        = typeof user?.rate === 'number' ? user.rate
+    // Oct 30 2026 (Kade: "people can hear it how you intended, or they can slow
+    // or speed it to how they like"): two numbers, held apart. listenerRate is
+    // theirs and follows them across characters; characterRate belongs to whoever
+    // is talking. rate is the one that gets sent. A web ticket hands in the
+    // character's number itself (see the hello), so only user.rate is the listener's.
+    this.listenerRate  = typeof user?.rate === 'number' ? user.rate : null;
+    this.characterRate = user?.characterRate !== undefined ? user.characterRate
       : (typeof agentTts?.rate === 'number' ? agentTts.rate : null);
+    this.rate          = this.listenerRate ?? this.characterRate;
     this.history     = [];
     this.lcEmail     = user?.lcEmail || null;   // KADE Jul5: for Calls-history attribution
     // Part 291 review F12: false until the start handler knows this is a call
@@ -2121,22 +2158,14 @@ async function handleUtterance(session, text) {
     const rateCmd = extractRateCommand(text);
     if (rateCmd) {
       const cur = session.rate ?? BASE_RATE;
-      const next =
-        rateCmd === 'normal'
-          ? null
-          : Math.round(
-              Math.min(RATE_MAX, Math.max(RATE_MIN, cur + (rateCmd === 'faster' ? RATE_STEP : -RATE_STEP))) * 100,
-            ) / 100;
-      session.rate = next;
+      // "normal" clears the listener's number, which puts the character's back.
+      const next = rateCmd === 'normal' ? null : nextRateStop(cur, rateCmd);
+      session.listenerRate = next;
+      session.rate = session.listenerRate ?? session.characterRate;
       const u = session.cfg.users.get(session.from);
       if (u) { u.rate = next; session.cfg.saveUsers(); }
       // The confirmation itself plays at the NEW rate -- instant, audible proof.
-      const line =
-        rateCmd === 'normal' ? 'Back to my normal pace. Go ahead.'
-        : rateCmd === 'faster'
-          ? (next >= RATE_MAX ? "That's as fast as I go! Go ahead." : 'Okay -- a little faster. Go ahead.')
-          : (next <= RATE_MIN ? "That's my slowest. Go ahead." : 'Okay -- a little slower. Go ahead.');
-      await speak(session, line, session.voice);
+      await speak(session, rateLine(rateCmd, session.rate ?? BASE_RATE, next !== cur), session.voice);
       return;
     }
     // July 12 2026 (Kade: "unable to identify which voice is being used"):
@@ -2242,8 +2271,12 @@ async function handleUtterance(session, text) {
         ]).catch(() => null);
       }
       session.voice = prefVoice || (u && u.voice) || (agentTts && agentTts.voiceId) || nameVoice || session.cfg.defaultVoice;
-      session.rate  = (u && typeof u.rate === 'number') ? u.rate
-        : (agentTts && typeof agentTts.rate === 'number' ? agentTts.rate : null);
+      // Oct 30 2026: only the character's number changes hands. The listener's
+      // stays (a web caller has no row, so it lives on the session; a phone
+      // caller's saved rule stays per caller, across every character).
+      if (u && typeof u.rate === 'number') session.listenerRate = u.rate;
+      session.characterRate = agentTts && typeof agentTts.rate === 'number' ? agentTts.rate : null;
+      session.rate  = session.listenerRate ?? session.characterRate;
       await speak(session, `Switching to ${agent.name}! What's on your mind?`, session.voice);
     };
     // ── Two-step agent switching (July 2 2026, Kade's request) ──────────────
@@ -3547,7 +3580,13 @@ function attachMediaStreams(server, users, cfg) {
             session.agentId   = outboundCtx.agentId   || session.agentId;
             session.agentName = outboundCtx.agentName || session.agentName;
             if (outboundCtx.voice) session.voice = outboundCtx.voice;
-            if (typeof outboundCtx.rate === 'number') session.rate = outboundCtx.rate;
+            // Oct 30 2026: the rule is unchanged (an agent with a number beats the
+            // callee's saved rate); "normal" now returns to this agent's own number.
+            session.characterRate = typeof outboundCtx.rate === 'number' ? outboundCtx.rate : null;
+            if (typeof outboundCtx.rate === 'number') {
+              session.listenerRate = null;
+              session.rate = outboundCtx.rate;
+            }
             session.outboundSuffix = buildOutboundSuffix(outboundCtx);
           }
           // Part 291 review F12: only an inbound call is the caller's own. Twilio's
@@ -4253,7 +4292,13 @@ function attachWebVoice(server) {
           agentName:   t.agentName || cfg.defaultAgentName,
           accountType: t.accountType || null,
           voice:       t.voiceId || null, // fork resolves the builder voice; CallSession fallback chain covers the rest
-          rate:        (typeof t.rate === 'number' ? t.rate : undefined),
+          // Oct 30 2026: the ticket's rate is the CHARACTER's number and never was
+          // a listener's. msg.speed is the listener's, which the site has sent since
+          // it was built and the bridge never read. A ticket that names a voice has
+          // already decided (the fork's resolver), so no rate there stays no rate,
+          // never a cached one from the builder.
+          rate:        helloListenerRate(msg.speed),
+          characterRate: typeof t.rate === 'number' ? t.rate : (t.voiceId ? null : undefined),
           lcEmail:     t.email,
           userId:      t.uid || null,
         };
@@ -4368,7 +4413,10 @@ function attachWebVoice(server) {
             const tts = cfg.getAgentTts && cfg.getAgentTts(user.agentId);
             if (session && tts && tts.voiceId) {
               session.voice = tts.voiceId;
-              if (session.rate == null && typeof tts.rate === 'number') session.rate = tts.rate;
+              if (session.characterRate == null && typeof tts.rate === 'number') {
+                session.characterRate = tts.rate;
+                session.rate = session.listenerRate ?? session.characterRate;
+              }
             }
           }).catch(() => {});
         }
@@ -4527,4 +4575,7 @@ function attachWebVoice(server) {
 module.exports = { attachMediaStreams, attachWebVoice, synthesize, handleAmdResult };
 // Part 68 receipts: tone math exposed for the unit harness only — nothing
 // runtime imports _test.
-module.exports._test = { makeToneBuf, encodeUlaw, dtmfToneBuf, DTMF_GAP, DTMF_FREQS };
+module.exports._test = {
+  makeToneBuf, encodeUlaw, dtmfToneBuf, DTMF_GAP, DTMF_FREQS,
+  CallSession, WebCallSession, handleUtterance, nextRateStop, rateLine, helloListenerRate, RATE_LADDER, BASE_RATE,
+};
