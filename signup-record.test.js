@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { signupRecord } = require('./signup-record');
 
-const SOURCE = fs.readFileSync(require.resolve('./server.js'), 'utf8');
+const SOURCE = fs.readFileSync(require.resolve('./server.js'), 'utf8').replace(/\r\n/g, '\n'); // a Windows checkout may carry CRLF
 const DEFAULTS = { agentId: 'agent_default', agentName: 'Kiana' };
 
 test('a new number gets a fresh row, with the child flag when asked', () => {
