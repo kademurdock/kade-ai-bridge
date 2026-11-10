@@ -569,6 +569,7 @@ function startLive(session, speak) {
   try {
     const gws = new WebSocketClient(liveUrl());
     session._liveWs = gws;
+    session._liveStartAt = Date.now(); // Nov 10 2026: lets a repeated "live on" tell stuck from coming up
     session.liveOn = false; // true after setupComplete
     gws.on('open', () => {
       try { gws.send(JSON.stringify(buildSetupMessage(session))); } catch (e) { console.log('[video-live] setup send failed:', e.message); }
@@ -929,10 +930,27 @@ function stopLive(session, reason) {
 }
 
 /** WS {type:'live'} toggle from the client (client button not built yet). */
+const LIVE_STUCK_MS = parseInt(process.env.LIVE_STUCK_MS || '15000', 10);
 function handleLiveMsg(session, msg, speak) {
   try {
     if (!msg.on) { stopLive(session, 'off'); return; }
     if (!enabled()) { startLive(session, speak); return; } // sends the disabled notice
+    // Nov 10 2026: a second "live on" (a double tap, or "get my Spotter" said again while the
+    // first connection was still coming up) opened a second Google socket and left the first one
+    // open, with nobody reading it, until Google timed it out. One connection per call: while one
+    // is up or coming up, another "on" changes nothing. "Live off" then "on" still restarts it.
+    // The one exception: a connection that has been "coming up" for LIVE_STUCK_MS without ever
+    // completing its setup is stuck, and asking again replaces it (the stuck one is closed).
+    let stuckWs = null;
+    if (session._liveWs) {
+      const comingUpFor = Date.now() - (session._liveStartAt || 0);
+      if (session.liveOn || comingUpFor < LIVE_STUCK_MS) {
+        console.log('[video-live] live on asked again while a connection is up or coming up: keeping the one we have');
+        return;
+      }
+      console.log(`[video-live] live on asked again and the first connection never came up (${Math.round(comingUpFor / 1000)} s): replacing it`);
+      stuckWs = session._liveWs;
+    }
     if (!hasAck(session.userId) && !msg.ack) {
       const text = firstUseNotice(session);
       try { session.jsonSend({ type: 'live-notice', text }); } catch {}
@@ -963,6 +981,9 @@ function handleLiveMsg(session, msg, speak) {
       speak(session, `Hold on — I'm putting ${nm} on the line.`, session.voice).catch(() => {});
     }
     startLive(session, speak);
+    // The stuck socket no longer speaks for the call (session._liveWs is the new one), so closing
+    // it sets off no handback line.
+    if (stuckWs && stuckWs !== session._liveWs) { try { stuckWs.close(); } catch {} }
   } catch (e) {
     console.log('[video-live] toggle failed:', e && e.message);
   }
