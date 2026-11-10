@@ -125,6 +125,7 @@ const twilioClient = getTwilioClient();
 // users: phone (E.164) → { name, agentId, agentName, lcEmail?, lcPass? }
 // lcEmail/lcPass = real LibreChat account creds. Guests omit these and use admin token.
 const credstore = require('./credstore');
+const { signupRecord } = require('./signup-record');
 const USERS_FILE = path.join(
   process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
   'bridge-users.json'
@@ -2058,13 +2059,18 @@ app.post('/signup', (req, res) => {
   const digits = String(phone).replace(/\D/g, '');
   if (digits.length < 10) return res.status(400).json({ error: 'Enter a valid 10-digit US phone number.' });
   const e164 = digits.startsWith('1') ? '+' + digits : '+1' + digits;
-  const record = { name: name.trim(), agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME };
   // KADE July 3 2026: child accounts (711 signup code) carry the flag onto their
   // phone registration so calls get the same invisible clean note as the site.
-  if (req.body.accountType === 'child') record.accountType = 'child';
-  users.set(e164, record);
-  saveUsers();
-  console.log('[bridge] Self-registered ' + e164 + ' as "' + name.trim() + '"' + (record.accountType === 'child' ? ' (child account)' : ''));
+  // Nov 10 2026: this open form used to write a fresh row over a registered number, wiping that
+  // person's sign-in, voice and agent (signup-record.js). An existing row is kept; the answer is the
+  // same either way, so the form does not reveal who is registered.
+  const existing = users.get(e164);
+  const { record, created } = signupRecord(existing, { name, accountType: req.body.accountType }, { agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
+  if (created || JSON.stringify(record) !== JSON.stringify(existing)) {
+    users.set(e164, record);
+    saveUsers();
+  }
+  console.log('[bridge] Self-registered ' + e164 + (created ? ' as "' + name.trim() + '"' : ' (already registered: row kept)') + (record.accountType === 'child' ? ' (child account)' : ''));
   res.json({ ok: true, phone: e164 });
 });
 
@@ -3134,7 +3140,7 @@ function quietHoursBlocked(hhmm) {
 
 app.post('/wellness', (req, res) => {
   const b = req.body || {};
-  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' }); // Nov 10 2026: a bare compare let an empty secret match an unset one
   const existing = b.id ? wellness.get(String(b.id)) : null;
   if (b.id && !existing) return res.status(404).json({ error: 'No schedule with that id' });
 
@@ -3199,7 +3205,7 @@ app.get('/wellness', (req, res) => {
 
 app.post('/wellness/toggle', (req, res) => {
   const b = req.body || {};
-  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' }); // Nov 10 2026: a bare compare let an empty secret match an unset one
   const sub = wellness.get(String(b.id || ''));
   if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
   sub.enabled = b.enabled !== undefined ? !!b.enabled : !sub.enabled;
@@ -3221,7 +3227,7 @@ app.delete('/wellness', (req, res) => {
 
 app.post('/wellness/fire', async (req, res) => {
   const b = req.body || {};
-  if (b.secret !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!bridgeSecretOk(req, b.secret)) return res.status(403).json({ error: 'Unauthorized' }); // Nov 10 2026: a bare compare let an empty secret match an unset one
   const sub = wellness.get(String(b.id || ''));
   if (!sub) return res.status(404).json({ error: 'No schedule with that id' });
   try {
