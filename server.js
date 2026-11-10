@@ -82,6 +82,14 @@ function broadcastSecretOk(req, provided) {
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : (process.env.PUBLIC_URL || 'http://localhost:3000');
+// Nov 10 2026: every route Twilio posts to checks Twilio's signature in one place (twilio-gate.js).
+// Default mode is `log`: nothing is refused until TWILIO_WEBHOOK_GATE=enforce is set.
+const twilioGate = require('./twilio-gate');
+const twilioWebhookGate = twilioGate.createTwilioGate({
+  token: TWILIO_TOKEN, publicUrl: PUBLIC_URL, validateRequest: twilio.validateRequest,
+});
+app.use(twilioGate.TWILIO_PATHS, twilioWebhookGate);
+console.log(`[twilio-gate] mode ${twilioGate.gateMode()} on ${twilioGate.TWILIO_PATHS.join(', ')}`);
 // A phone bridge must not die because one async callback raced a hang-up.
 // Unhandled rejections get logged loudly and the process stays up; genuinely
 // unknown exceptions still exit(1) so Railway restarts us into a clean state.
