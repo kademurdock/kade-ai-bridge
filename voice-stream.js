@@ -236,6 +236,8 @@ const videoSight = require('./video-sight'); // caller camera -> agent vision (J
 videoSight.onAlert((session, alertText) => { watchAlertTurn(session, alertText).catch(() => {}); });
 const videoLive = require('./video-live'); // EXPERIMENTAL Gemini Live lane (July 16 2026) — hard-inert unless LIVE_ENABLED=true + GOOGLE_LIVE_API_KEY set
 const liveBilling = require('./live-billing'); // Part 295: the Spotter's real cost, from Google's usageMetadata
+const callLimits = require('./call-limits'); // Nov 10 2026: inbound phone calls end by themselves, announced first
+const sttKeeper = require('./stt-keeper');   // Nov 10 2026: a dropped Deepgram socket is opened again, and the caller is told
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1362,6 +1364,7 @@ function openDeepgramFlux(session, key) {
     if (msg.type !== 'TurnInfo') return;
 
     const text = String(msg.transcript || '').trim();
+    if (text) noteCallerHeard(session, 'words', text); // Nov 10 2026: the quiet-line watch (call-limits.js)
 
     if (msg.event === 'StartOfTurn') {
       // Deliberately NOT barging on StartOfTurn alone: on speakerphone her own
@@ -1566,6 +1569,7 @@ function openDeepgram(session) {
       const alt  = msg.channel?.alternatives?.[0];
       const text = (alt?.transcript || '').trim();
       if (!text) return;
+      noteCallerHeard(session, 'words', text); // Nov 10 2026: the quiet-line watch (call-limits.js)
       // Same single door as the flux path — grace window, echo gate, single-word
       // allow-list, and on app/web the room gate (confidence + screen-reader
       // chrome). nova hands back its word list on the alternative, not the
@@ -2083,7 +2087,14 @@ async function handleUtterance(session, text) {
   // July 12 2026: voicemail mode — the "person" is a recording. No turns,
   // no thinking sounds; handleAmdResult speaks one message and hangs up.
   if (session.voicemailMode) return;
+  // Nov 10 2026 (call-limits.js): the maximum-length goodbye is playing and the call is about to
+  // be ended; a new turn would only talk over it. (A QUIET-line goodbye is different: anything the
+  // caller says during it cancels the hang-up, so those utterances go on as normal.)
+  if (session._limits && session._limits.state.ending === 'max') return;
   session._lastUtteranceAt = Date.now();
+  // A finished utterance is the caller being there. The one exception is the branch below that
+  // drops an utterance as the character's own echo (busy, speaking, no barge-in registered).
+  if (!(session.busy && session.isSpeaking && !session.bargedIn)) noteCallerHeard(session, 'utterance');
   if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
   if (session._greetingLock) {
     // Callee spoke while the greeting was pending or playing (usually their
@@ -2947,6 +2958,14 @@ async function speak(session, text, voice) {
   try {
     const characterMetadata = speechMetadata(session.agentId, text);
     const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
+    // Nov 10 2026: A STALE ABORT FLAG MADE A SPOKEN LINE SILENT. A barge-in sets llmAbort, and
+    // only the end of a model turn clears it. A barge-in on a line spoken OUTSIDE a turn (a command's
+    // answer, a notice, the call-limit check-in) therefore left the flag set, and the next line
+    // spoken outside a turn (the "go ahead, I'm listening" recovery line is the usual one) played
+    // nothing: playBuffer stops at once on the flag, and then leaves isSpeaking stuck on, which
+    // makes the echo filter stricter on everything the caller says until the next real turn.
+    // With no turn in flight there is nothing left to abort, so the flag is stale: clear it.
+    if (!session.busy && session.llmAbort) session.llmAbort = false;
     noteSpoken(session, text); // for echo detection, see looksLikeEcho / echoReference
     await playBuffer(session, buf, { characterMetadata });
   } catch (e) { console.error('[voice-stream] speak error:', e.message); }
@@ -3509,6 +3528,136 @@ async function playRingback(session) {
   }
 }
 
+// ── Call limits and the listening keeper (Nov 10 2026) ───────────────────────
+// The rules live in call-limits.js and stt-keeper.js, each tested with a fake clock. What is here
+// is only the wiring: how a line is spoken on a real call, and how a real call is ended.
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const LIMIT_GAP_WAIT_MS = 60000; // how long a warning waits for the character to finish talking
+
+/** The caller was heard. 'words' = Deepgram heard words (not while the character talks: on a
+ * speakerphone that is its own voice coming back). 'utterance' and 'key' always count. `text` is
+ * what was heard, for the one case where it is weighed against the watch's own line. */
+function noteCallerHeard(session, how, text) {
+  const watch = session && session._limits;
+  if (!watch) return;
+  if (how === 'words') {
+    if (session._limitLine && Date.now() < (session._limitLineUntil || 0)) {
+      // One of the watch's own lines is playing or just played. This is exactly when a caller
+      // answers, so their words count at once, unless they are that line coming back off a
+      // speakerphone (most of the heard words are words of the line).
+      if (looksLikeEcho(text, session._limitLine, 0.5)) return;
+    } else if (session.isSpeaking || Date.now() - (session.lastSpokAt || 0) < 1500) {
+      return;
+    }
+  }
+  watch.noteHeard();
+}
+
+/** Speak one of the call-limit lines. A warning waits for a gap in the talk; the goodbye
+ * (`final`) does not. Resolves when the line has played (or could not be). */
+async function limitSay(session, line, opts = {}) {
+  const open = () => session.ws.readyState === WebSocket.OPEN;
+  if (!open()) return;
+  let buf;
+  try {
+    buf = await synthesize(line, session.voice, session.rate, session.media, session.pronunciationDictionary);
+  } catch (e) {
+    console.warn('[call-limits] could not make the line:', e.message);
+    return;
+  }
+  const waitUntil = Date.now() + (opts.final ? 0 : LIMIT_GAP_WAIT_MS);
+  while (open() && (session.isSpeaking || session.busy) && Date.now() < waitUntil) await sleepMs(100);
+  if (!open()) return;
+  if (session.isSpeaking || session.busy) {
+    // Still talking: stop it the way a barge-in does, and let the turn unwind before speaking.
+    session.sendClear();
+    session.llmAbort = true;
+    session.isSpeaking = false;
+    session.lastSpokAt = Date.now();
+    const until = Date.now() + 2500;
+    while (open() && session.busy && Date.now() < until) await sleepMs(50);
+    if (!open()) return;
+  }
+  session.llmAbort = false; // playBuffer stops on a stale abort flag; this line is a fresh thing to say
+  try { session.history.push({ role: 'assistant', content: line }); } catch {}
+  noteSpoken(session, line); // so its own echo is recognised as echo
+  session._limitLine = line;
+  session._limitLineUntil = Infinity;
+  try {
+    await playBuffer(session, buf);
+  } finally {
+    session._limitLineUntil = Date.now() + 3000; // an answer usually comes just after the line ends
+  }
+}
+
+/** End the call: Twilio's REST hang-up once the goodbye has drained, and if the call is somehow
+ * still up after that, close its stream (with <Connect><Stream> that ends the call too). */
+function limitHangUp(session, reason) {
+  const sid = session.callSid;
+  const cfg = session.cfg || {};
+  console.log(`[call-limits] hanging up ${session.streamSid} (${reason})`);
+  setTimeout(() => {
+    try { if (cfg.endCall && sid) cfg.endCall(sid); } catch (e) { console.warn('[call-limits] endCall failed:', e.message); }
+  }, 1200);
+  const closer = setTimeout(() => {
+    if (session.ws.readyState === WebSocket.OPEN) {
+      console.warn(`[call-limits] ${session.streamSid} still up after the hang-up request: closing its stream`);
+      try { session.ws.close(1000, 'call limit'); } catch {}
+    }
+  }, cfg.callLimitCloseMs || 10000);
+  if (closer.unref) closer.unref();
+}
+
+/** Arm the watch on an INBOUND phone call. cfg.callLimits (milliseconds) overrides the env for tests. */
+function armCallLimits(session) {
+  const cfg = (session.cfg && session.cfg.callLimits) || callLimits.limitsConfig();
+  if (!cfg.enabled) return;
+  const watch = callLimits.createCallWatch({
+    cfg,
+    isOpen: () => session.ws.readyState === WebSocket.OPEN,
+    isBusy: () => !!(session.isSpeaking || session.busy || session._ringbackActive || session._greetingLock || session._confirmPhase),
+    say: (line, opts) => limitSay(session, line, opts),
+    hangUp: (reason) => limitHangUp(session, reason),
+    label: session.streamSid,
+  });
+  session._limits = watch;
+  session._limitTimer = setInterval(() => {
+    try { watch.tick(); } catch (e) { console.warn('[call-limits] tick failed:', e.message); }
+  }, (session.cfg && session.cfg.callLimitTickMs) || 5000);
+  if (session._limitTimer.unref) session._limitTimer.unref();
+}
+
+function stopCallLimits(session) {
+  if (!session) return;
+  if (session._limitTimer) { clearInterval(session._limitTimer); session._limitTimer = null; }
+  if (session._limits) session._limits.stop();
+}
+
+/** A line about the listening socket. Never over a Spotter (Gemini hears the caller by itself and
+ * Deepgram is only captions there), never over the goodbye, and it waits a moment for a gap. */
+async function sttSay(session, line) {
+  try {
+    const open = () => session.ws.readyState === WebSocket.OPEN;
+    const until = Date.now() + 6000;
+    while (open() && (session.isSpeaking || session.busy) && Date.now() < until) await sleepMs(150);
+    if (!open() || session.liveOn || session._liveWs) return;
+    if (session._limits && session._limits.state.ending) return;
+    await speak(session, line, session.voice);
+  } catch (e) { /* a notice must never break a call */ }
+}
+
+/** One keeper per call; returns it so the caller can hand it the first socket. */
+function keepListening(session) {
+  session._stt = sttKeeper.createSttKeeper({
+    openSocket: () => openDeepgram(session),
+    isCallOpen: () => session.ws.readyState === WebSocket.OPEN,
+    onTrouble: () => { sttSay(session, sttKeeper.TROUBLE_LINE); },
+    onBack: () => { sttSay(session, sttKeeper.BACK_LINE); },
+    label: session.streamSid,
+  });
+  return session._stt;
+}
+
 // ── Attach to HTTP server ─────────────────────────────────────────────────────
 // ── Shared WS upgrade router (July 9 2026) ───────────────────────────────────
 // ws v8 in server+path mode 400-aborts EVERY non-matching upgrade (verified in
@@ -3587,6 +3736,7 @@ function attachMediaStreams(server, users, cfg) {
   wss.on('connection', (ws) => {
     console.log('[voice-stream] Twilio WS connected');
     let session = null;
+    let streamOver = false; // a 'stop' or a close arrived (matters while the socket gate is asking Twilio)
 
     ws.on('message', async (rawMsg) => {
       let msg;
@@ -3600,6 +3750,30 @@ function attachMediaStreams(server, users, cfg) {
           const { streamSid, callSid } = msg.start;
           const params = msg.start.customParameters || {};
           const from   = params.from || 'unknown';
+          // Nov 10 2026: THE CALL SOCKET GATE (call-socket-gate.js). Only Twilio's stream for a
+          // call this bridge answered or placed gets a session. Mode `log` (the default) changes
+          // nothing and waits for nothing: the check runs beside the call and only writes a line.
+          const socketGate = global._vsConfig.callSocketGate;
+          if (socketGate && socketGate.mode !== 'off') {
+            const claim = {
+              ticket: params.ticket, callSid, from, outbound: params.outbound === '1',
+              alreadyLive: !!(callSid && sessionsByCallSid.has(callSid)),
+            };
+            let verdict = socketGate.quick(claim);
+            if (verdict.verdict === 'ask') {
+              if (socketGate.mode === 'enforce') {
+                verdict = await socketGate.settle(claim, verdict.why);
+                if (streamOver || ws.readyState !== WebSocket.OPEN) return; // gone while we asked
+              } else {
+                socketGate.settle(claim, verdict.why).then((late) => socketGate.record(late, callSid)).catch(() => {});
+                verdict = null;
+              }
+            }
+            if (verdict && !socketGate.record(verdict, callSid)) {
+              try { ws.close(1008, 'not a call'); } catch {}
+              return;
+            }
+          }
           const user   = users.get(from);
           session = new CallSession(streamSid, callSid, from, user, ws, global._vsConfig);
           const outboundCtx = params.outbound === '1' && global._vsConfig.getOutboundCtx
@@ -3631,6 +3805,10 @@ function attachMediaStreams(server, users, cfg) {
           // estimate went to the person who answered; postVoiceChatUsage reads this.
           session.twilioOutbound = params.outbound === '1';
           session.billCaller = params.outbound !== '1' && !outboundCtx;
+          // Nov 10 2026: an inbound call ends by itself when the line stays quiet or the call runs
+          // very long, always announced first (call-limits.js). Outbound calls carry Twilio's own
+          // timeLimit and are not armed.
+          if (params.outbound !== '1' && !outboundCtx) armCallLimits(session);
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
 
           // July 12 2026: register by callSid so async callbacks (AMD) can
@@ -3709,7 +3887,7 @@ function attachMediaStreams(server, users, cfg) {
           session.pronunciationDictionary = getCachedDictionary(pronIdentity);
           if (!session.gate) refreshPronunciationDictionary(session, pronIdentity, global._vsConfig);
 
-          session.dgWs = openDeepgram(session);
+          session.dgWs = keepListening(session).watch(openDeepgram(session));
 
           const name      = user?.name || 'there';
           const agentName = session.agentName;
@@ -3917,6 +4095,10 @@ function attachMediaStreams(server, users, cfg) {
           const payload = msg.media?.payload;
           if (payload && session.dgWs?.readyState === WebSocket.OPEN) {
             session.dgWs.send(Buffer.from(payload, 'base64'));
+          } else if (payload && session._stt) {
+            // Nov 10 2026: the listening socket is gone. Open it again (paced; stt-keeper.js).
+            const fresh = session._stt.frame();
+            if (fresh) session.dgWs = fresh;
           }
           break;
         }
@@ -3926,6 +4108,7 @@ function attachMediaStreams(server, users, cfg) {
           // keypad press while the agent is talking cuts them off, same as
           // the app's Stop button. A press while quiet is ignored (butt-
           // dials should not be conversation events).
+          if (session) noteCallerHeard(session, 'key'); // a key press is the caller being there
           if (session && (session.isSpeaking || session.busy)) {
             console.log(`[voice-stream] DTMF barge (${msg.dtmf?.digit || '?'}) ${session.streamSid}`);
             session.bargedIn = true;
@@ -3937,6 +4120,7 @@ function attachMediaStreams(server, users, cfg) {
 
         case 'stop': {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
+          streamOver = true;
           if (session) {
             try { logCallTranscript(session); } catch (e) {}
             try { postVoiceChatUsage(session); } catch (e) {}
@@ -3948,6 +4132,8 @@ function attachMediaStreams(server, users, cfg) {
             session.isSpeaking = false;
             clearGateTimers(session);
             if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
+        stopCallLimits(session);
+        if (session._stt) session._stt.end();
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
           }
           session = null;
@@ -3957,6 +4143,7 @@ function attachMediaStreams(server, users, cfg) {
     });
 
     ws.on('close', () => {
+      streamOver = true;
       if (session) {
         try { logCallTranscript(session); } catch (e) {}
         try { postVoiceChatUsage(session); } catch (e) {}
@@ -3968,6 +4155,8 @@ function attachMediaStreams(server, users, cfg) {
         session.isSpeaking = false;
         clearGateTimers(session);
         if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
+        stopCallLimits(session);
+        if (session._stt) session._stt.end();
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
         session = null;
       }
@@ -4289,6 +4478,11 @@ function attachWebVoice(server) {
         // Twilio media case (which is what makes listening continuous:
         // the mic NEVER stops, even while the agent is talking).
         if (session && session.dgWs?.readyState === WebSocket.OPEN) session.dgWs.send(raw);
+        else if (session && session._stt) {
+          // Nov 10 2026: the listening socket is gone. Open it again (paced; stt-keeper.js).
+          const fresh = session._stt.frame();
+          if (fresh) session.dgWs = fresh;
+        }
         // LIVE lane: same 16k PCM16 chunks the mic already ships for Deepgram
         // get forwarded to Google (Deepgram stays open for captions + the
         // "live off" voice escape hatch — its turns are gated in handleUtterance).
@@ -4464,7 +4658,7 @@ function attachWebVoice(server) {
         session.pronunciationDictionary = getCachedDictionary(pronIdentity);
         refreshPronunciationDictionary(session, pronIdentity, cfg);
 
-        session.dgWs = openDeepgram(session);
+        session.dgWs = keepListening(session).watch(openDeepgram(session));
         session.jsonSend({ type: 'ready', agentName: session.agentName, voice: session.voice, callSid: session.callSid });
         session.sendState('listening');
         /* NO SPOKEN GREETING ON THIS LANE any more (Part 110) — the `ready`
@@ -4597,6 +4791,8 @@ function attachWebVoice(server) {
         session.isSpeaking = false;
         if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
         if (session._webTailTimer) { clearTimeout(session._webTailTimer); session._webTailTimer = null; }
+        stopCallLimits(session);
+        if (session._stt) session._stt.end();
         if (session.dgWs) { try { session.dgWs.close(); } catch {} }
         session = null;
       }
@@ -4616,4 +4812,5 @@ module.exports._test = {
   makeToneBuf, encodeUlaw, dtmfToneBuf, DTMF_GAP, DTMF_FREQS,
   CallSession, WebCallSession, handleUtterance, nextRateStop, rateLine, helloListenerRate, RATE_LADDER, BASE_RATE,
   sessionsByCallSid,
+  noteCallerHeard, limitSay, limitHangUp, armCallLimits, stopCallLimits, keepListening,
 };

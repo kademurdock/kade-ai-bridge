@@ -92,6 +92,9 @@ function createTwilioGate({ token, publicUrl, validateRequest, mode = gateMode()
     }
     if (ok) {
       seen.ok += 1;
+      // Nov 10 2026: a later handler may need to know this request is proven Twilio's (the call
+      // socket ticket in /voice-ws is only self-sufficient when it is). Set on success only.
+      req.twilioSignatureOk = true;
       return next();
     }
     // The pass / refuse decision is the same for both; only the count and the words differ.

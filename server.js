@@ -128,6 +128,17 @@ function getTwilioClient() {
   catch (e) { console.warn('[bridge] Twilio init failed:', e.message); return null; }
 }
 const twilioClient = getTwilioClient();
+// Nov 10 2026: the phone call socket (/ws/media) only gives a session to Twilio's stream for a
+// call this bridge answered or placed (call-socket-gate.js). Default mode is `log`: nothing is
+// refused until CALL_SOCKET_GATE=enforce is set. The ticket key is derived from a secret this
+// service already holds and never leaves it; Twilio's REST lookup of a call id is free.
+const callSocketGateLib = require('./call-socket-gate');
+const callSocketGate = callSocketGateLib.createCallSocketGate({
+  secret: BRIDGE_SECRET || TWILIO_TOKEN || '',
+  fetchCall: twilioClient ? (sid) => twilioClient.calls(sid).fetch() : null,
+});
+console.log(callSocketGateLib.socketGateStartupLine({ canAskTwilio: !!twilioClient }));
+console.log(require('./call-limits').limitsStartupLine());
 
 // ── Persistent user store ─────────────────────────────────────────────────────
 // users: phone (E.164) → { name, agentId, agentName, lcEmail?, lcPass? }
@@ -2161,6 +2172,9 @@ app.post('/voice-ws', (req, res) => {
   const stream  = connect.stream({ url: `wss://${wsHost}/ws/media` });
   stream.parameter({ name: 'from',    value: from });
   stream.parameter({ name: 'callSid', value: callSid });
+  // Nov 10 2026: the socket's proof that this stream is for a call the bridge answered. It counts
+  // by itself only when this very request carried Twilio's valid signature (twilio-gate.js).
+  stream.parameter({ name: 'ticket',  value: callSocketGate.mint({ callSid, from, outbound: false, signed: req.twilioSignatureOk === true }) });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -2688,6 +2702,8 @@ app.post('/voice-ws-outbound', (req, res) => {
   stream.parameter({ name: 'from',     value: userPhone });
   stream.parameter({ name: 'callSid',  value: callSid });
   stream.parameter({ name: 'outbound', value: '1' });
+  // Nov 10 2026: see /voice-ws. Bound to this call id, this number and this direction.
+  stream.parameter({ name: 'ticket',   value: callSocketGate.mint({ callSid, from: userPhone, outbound: true, signed: req.twilioSignatureOk === true }) });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -4263,6 +4279,7 @@ attachMediaStreams(server, users, {
   findCallbackContext,
   deliverFrontDeskMessage,
   fileAccessRequest: fileAccessRequestByPhone,
+  callSocketGate, // Nov 10 2026: /ws/media asks this before a call gets a session
 });
 
 // WEB VOICE (July 9 2026): browser streaming calls on /ws/web-voice — the
