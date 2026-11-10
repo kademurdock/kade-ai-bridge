@@ -25,9 +25,27 @@ test('a registered number keeps its sign-in, voice, rate, agent and name', () =>
   assert.notEqual(record, existing, 'a copy, so the caller decides when to store it');
 });
 
-test('the child flag can be added to an existing row, and is never taken off by the form', () => {
-  assert.equal(signupRecord({ name: 'Sky', agentId: 'a', agentName: 'A' }, { name: 'Sky', accountType: 'child' }, DEFAULTS).record.accountType, 'child');
+test('the child flag is never added to an existing row by the open form, and never taken off', () => {
+  // Review, Nov 10: the first version added it, so a stranger could make an adult's row a child row for good.
+  const adult = { name: 'Sky', agentId: 'a', agentName: 'A' };
+  const asked = signupRecord(adult, { name: 'Sky', accountType: 'child' }, DEFAULTS).record;
+  assert.equal('accountType' in asked, false);
+  assert.deepEqual(asked, adult);
+  const guest = signupRecord({ name: 'Friend', agentId: 'a', agentName: 'A' }, { name: 'Sky', accountType: 'child' }, DEFAULTS).record;
+  assert.equal('accountType' in guest, false, 'not on a guest row either');
   assert.equal(signupRecord({ name: 'Sky', agentId: 'a', agentName: 'A', accountType: 'child' }, { name: 'Sky' }, DEFAULTS).record.accountType, 'child');
+  assert.equal(signupRecord({ name: 'Sky', agentId: 'a', agentName: 'A', accountType: 'child' }, { name: 'Sky', accountType: 'adult' }, DEFAULTS).record.accountType, 'child');
+});
+
+test('a guest row the phone setup named "Friend" takes the real name from a later signup; nothing else moves', () => {
+  const guest = { name: 'Friend', agentId: 'agent_picked', agentName: 'Della', voice: 'fish:own', rate: 1.1 };
+  assert.deepEqual(signupRecord(guest, { name: ' Marian Smith ' }, DEFAULTS),
+    { record: { ...guest, name: 'Marian Smith' }, created: false });
+  // a real (even misheard) name is kept: renaming any guest row from the open form is not decided here
+  assert.equal(signupRecord({ name: 'Mary Ann', agentId: 'a', agentName: 'A' }, { name: 'Marian' }, DEFAULTS).record.name, 'Mary Ann');
+  // a row with a site sign-in keeps even the placeholder (linkAccount and /register own that row)
+  assert.equal(signupRecord({ name: 'Friend', agentId: 'a', agentName: 'A', lcEmail: 'f@example.test' }, { name: 'Marian' }, DEFAULTS).record.name, 'Friend');
+  assert.equal(signupRecord({ name: 'Friend', agentId: 'a', agentName: 'A', lcPass: 'p' }, { name: 'Marian' }, DEFAULTS).record.name, 'Friend');
 });
 
 test('a half-made row is completed, not replaced', () => {
@@ -64,6 +82,27 @@ test('POST /signup with a registered number answers the same and changes nothing
   assert.equal(res.code, 200);
   assert.deepEqual(res.body, { ok: true, phone: '+14175550142' }, 'the form reveals nothing about who is registered');
   assert.deepEqual(users.get('+14175550142'), kade, 'before the fix: { name: "Somebody Else", agentId, agentName } and the sign-in was gone');
+});
+
+test('POST /signup asking for a child account at a registered number changes nothing and saves nothing', () => {
+  const kade = { name: 'Kade', agentId: 'agent_own', agentName: 'Della', lcEmail: 'k@example.test', lcPass: 'secret', voice: 'fish:own' };
+  const users = new Map([['+14175550142', { ...kade }]]);
+  const h = signupHandler(users);
+  const res = h.post({ name: 'Stranger', phone: '417 555 0142', accountType: 'child' });
+  assert.deepEqual(res.body, { ok: true, phone: '+14175550142' });
+  assert.deepEqual(users.get('+14175550142'), kade, 'before the review fix the row gained accountType: "child" for good');
+  assert.equal(h.saved.length, 0);
+});
+
+test('POST /signup at a guest "Friend" row stores the typed name once, keeps the agent, adds no child flag', () => {
+  const users = new Map([['+14175550177', { name: 'Friend', agentId: 'agent_picked', agentName: 'Della' }]]);
+  const h = signupHandler(users);
+  assert.equal(h.post({ name: 'Marian Smith', phone: '4175550177', accountType: 'child' }).code, 200);
+  assert.deepEqual(users.get('+14175550177'), { name: 'Marian Smith', agentId: 'agent_picked', agentName: 'Della' });
+  assert.equal(h.saved.length, 1);
+  h.post({ name: 'Somebody Else', phone: '4175550177' });
+  assert.equal(users.get('+14175550177').name, 'Marian Smith', 'a real name is not replaced');
+  assert.equal(h.saved.length, 1);
 });
 
 test('POST /signup with a new number still registers it', () => {

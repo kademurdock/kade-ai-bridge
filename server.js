@@ -89,7 +89,7 @@ const twilioWebhookGate = twilioGate.createTwilioGate({
   token: TWILIO_TOKEN, publicUrl: PUBLIC_URL, validateRequest: twilio.validateRequest,
 });
 app.use(twilioGate.TWILIO_PATHS, twilioWebhookGate);
-console.log(`[twilio-gate] mode ${twilioGate.gateMode()} on ${twilioGate.TWILIO_PATHS.join(', ')}`);
+console.log(twilioGate.gateStartupLine({ token: TWILIO_TOKEN }));
 // A phone bridge must not die because one async callback raced a hang-up.
 // Unhandled rejections get logged loudly and the process stays up; genuinely
 // unknown exceptions still exit(1) so Railway restarts us into a clean state.
@@ -2074,11 +2074,14 @@ app.post('/signup', (req, res) => {
   // same either way, so the form does not reveal who is registered.
   const existing = users.get(e164);
   const { record, created } = signupRecord(existing, { name, accountType: req.body.accountType }, { agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
-  if (created || JSON.stringify(record) !== JSON.stringify(existing)) {
+  // Nov 10 2026 (review): on an existing row the form only fills in what is missing or replaces the
+  // placeholder name 'Friend' on a row with no sign-in. It never adds the child flag there.
+  const changed = created || JSON.stringify(record) !== JSON.stringify(existing);
+  if (changed) {
     users.set(e164, record);
     saveUsers();
   }
-  console.log('[bridge] Self-registered ' + e164 + (created ? ' as "' + name.trim() + '"' : ' (already registered: row kept)') + (record.accountType === 'child' ? ' (child account)' : ''));
+  console.log('[bridge] Self-registered ' + e164 + (created ? ' as "' + name.trim() + '"' : (changed ? ' (already registered: missing name or agent filled in)' : ' (already registered: row kept)')) + (record.accountType === 'child' ? ' (child account)' : ''));
   res.json({ ok: true, phone: e164 });
 });
 

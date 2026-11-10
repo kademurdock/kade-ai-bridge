@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const express = require('express');
 const twilio = require('twilio');
-const { createTwilioGate, gateMode, routeLabel, TWILIO_PATHS } = require('./twilio-gate');
+const { createTwilioGate, gateMode, gateStartupLine, routeLabel, TWILIO_PATHS } = require('./twilio-gate');
 
 const TOKEN = 'test-auth-token-0123456789abcdef';
 const PUBLIC = 'https://bridge.example.test';
@@ -60,7 +60,7 @@ test('enforce: a forged text is refused 403 and never reaches the handler; Twili
     // a signature is for one body: the same header on a changed text is refused
     const replay = await post('/sms', { ...SMS, Body: 'something else' }, { 'X-Twilio-Signature': twilio.getExpectedTwilioSignature(TOKEN, PUBLIC + '/sms', SMS) });
     assert.equal(replay.status, 403);
-    assert.deepEqual(gate.stats(), { mode: 'enforce', ok: 1, mismatch: 3, refused: 3 });
+    assert.deepEqual(gate.stats(), { mode: 'enforce', ok: 1, mismatch: 2, unsigned: 1, refused: 3, unchecked: 0 });
     assert.ok(logs.every((l) => !l.includes('4175550142') && !l.includes('hello there')), 'no number and no text in the log');
   });
 });
@@ -85,11 +85,76 @@ test('log (the default): nothing is refused, a mismatch is logged without the ca
     assert.equal((await signed('/sms', SMS)).status, 200);
     assert.equal(handled.length, 2);
     assert.equal(logs.length, 1);
-    assert.match(logs[0], /^\[twilio-gate\] mismatch on POST \/sms \(mode log: let through\)/);
+    assert.match(logs[0], /^\[twilio-gate\] unsigned POST \/sms, signature header: no \(mode log: let through\)/);
     for (let i = 0; i < 40; i++) await post('/voice/continue/CA0123456789abcdef0123456789abcdef', SMS);
-    assert.equal(logs.length, 20, 'at most 20 lines in ten minutes');
+    assert.equal(logs.length, 20, 'at most 20 lines of one kind in ten minutes');
     assert.ok(logs.some((l) => l.includes('/voice/continue/<sid>')), 'the call id is not printed');
     assert.equal(gate.stats().refused, 0);
+  });
+});
+
+test('review: an unsigned scanner hit and a real signed request that fails are told apart in the log and the counts', async () => {
+  await withApp('log', async ({ post, logs, handled, gate }) => {
+    const BAD = 'bm90IGEgcmVhbCBzaWduYXR1cmU=';
+    assert.equal((await post('/sms', SMS)).status, 200);
+    assert.equal((await post('/sms', SMS, { 'X-Twilio-Signature': BAD })).status, 200);
+    assert.equal(handled.length, 2, 'log mode lets both through, as before');
+    assert.equal(logs.length, 2);
+    assert.notEqual(logs[0], logs[1], 'before the review fix these two lines were byte-identical');
+    assert.match(logs[0], /^\[twilio-gate\] unsigned POST \/sms, signature header: no /);
+    assert.doesNotMatch(logs[0], /mismatch/, 'the watch rule greps for "mismatch": a scanner must not match it');
+    assert.match(logs[1], /^\[twilio-gate\] mismatch on POST \/sms, signature header: yes /);
+    assert.match(logs[1], /public URL is rebuilt wrongly/);
+    assert.ok(logs.every((l) => !l.includes(BAD)), 'the signature itself is never printed');
+    assert.deepEqual(gate.stats(), { mode: 'log', ok: 0, mismatch: 1, unsigned: 1, refused: 0, unchecked: 0 });
+    // a flood of unsigned probes uses up its own budget, not the lines a real mismatch needs
+    for (let i = 0; i < 40; i++) await post('/sms', SMS);
+    assert.equal(logs.length, 21, '20 unsigned lines and the one mismatch');
+    assert.equal((await post('/voice', SMS, { 'X-Twilio-Signature': BAD })).status, 200);
+    assert.equal(logs.length, 22);
+    assert.match(logs[21], /^\[twilio-gate\] mismatch on POST \/voice, signature header: yes /);
+  });
+  await withApp('enforce', async ({ post, logs }) => {
+    assert.equal((await post('/sms', SMS)).status, 403);
+    assert.equal((await post('/sms', SMS, { 'X-Twilio-Signature': 'bm90IGEgcmVhbCBzaWduYXR1cmU=' })).status, 403);
+    assert.match(logs[0], /^\[twilio-gate\] refused unsigned POST \/sms: signature header: no \(mode enforce\)$/);
+    assert.match(logs[1], /^\[twilio-gate\] refused POST \/sms: signature mismatch, signature header: yes \(mode enforce\)$/);
+  });
+});
+
+test('review: enforce with no token never claims to be enforcing (startup line, stand-down line, counter)', async () => {
+  assert.equal(gateStartupLine({ mode: 'enforce', token: 'x', paths: ['/sms'] }), '[twilio-gate] mode enforce on /sms');
+  assert.equal(gateStartupLine({ mode: 'log', token: 'x', paths: ['/sms', '/voice'] }), '[twilio-gate] mode log on /sms, /voice');
+  for (const token of [undefined, '']) {
+    assert.equal(gateStartupLine({ mode: 'enforce', token, paths: ['/sms'] }),
+      '[twilio-gate] mode enforce but NO TWILIO_AUTH_TOKEN: NOT CHECKING, every request passes on /sms');
+    assert.match(gateStartupLine({ mode: 'log', token, paths: ['/sms'] }), /^\[twilio-gate\] mode log but NO TWILIO_AUTH_TOKEN: NOT CHECKING/);
+  }
+  assert.equal(gateStartupLine({ mode: 'off', paths: ['/sms'] }), '[twilio-gate] mode off on /sms');
+  assert.match(gateStartupLine({ token: 'x' }), /on \/sms, \/voice, /, 'defaults to the real path list');
+  await withApp('enforce', async ({ post, logs, gate }) => {
+    assert.equal((await post('/sms', SMS)).status, 200, 'still let through: failing closed is the owner\'s decision');
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /mode is enforce but it is NOT CHECKING and refuses nothing/);
+    assert.deepEqual(gate.stats(), { mode: 'enforce', ok: 0, mismatch: 0, unsigned: 0, refused: 0, unchecked: 1 });
+  }, { token: '' });
+  const source = fs.readFileSync(require.resolve('./server.js'), 'utf8');
+  assert.ok(source.includes('console.log(twilioGate.gateStartupLine({ token: TWILIO_TOKEN }));'), 'server.js prints the honest line');
+  assert.doesNotMatch(source, /\[twilio-gate\] mode \$\{twilioGate\.gateMode\(\)\}/, 'the old line that printed the mode alone is gone');
+});
+
+test('review: the signed host is fixed; forwarded host headers are never trusted', async () => {
+  await withApp('enforce', async ({ post, signed, handled }) => {
+    const other = 'https://calls.example.test';
+    const forwarded = { Host: 'calls.example.test', 'X-Forwarded-Host': 'calls.example.test', 'X-Forwarded-Proto': 'https' };
+    const sigOther = twilio.getExpectedTwilioSignature(TOKEN, other + '/sms', SMS);
+    assert.equal((await post('/sms', SMS, { ...forwarded, 'X-Twilio-Signature': sigOther })).status, 403,
+      'signed for another host: refused, so enforce needs the Twilio console webhooks on the PUBLIC_URL host');
+    const sigHere = twilio.getExpectedTwilioSignature(TOKEN, PUBLIC + '/sms', SMS);
+    assert.equal((await post('/sms', SMS, { ...forwarded, 'X-Twilio-Signature': sigHere })).status, 200,
+      'signed for the public address: passes whatever Host the proxy shows');
+    assert.equal((await signed('/sms', SMS)).status, 200);
+    assert.equal(handled.length, 2);
   });
 });
 
