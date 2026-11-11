@@ -238,6 +238,7 @@ const videoLive = require('./video-live'); // EXPERIMENTAL Gemini Live lane (Jul
 const liveBilling = require('./live-billing'); // Part 295: the Spotter's real cost, from Google's usageMetadata
 const callLimits = require('./call-limits'); // Nov 10 2026: inbound phone calls end by themselves, announced first
 const sttKeeper = require('./stt-keeper');   // Nov 10 2026: a dropped Deepgram socket is opened again, and the caller is told
+const { beginCallMemoryFetch, applyCallMemories } = require('./call-memory'); // Nov 10 2026: a late memory bundle still lands, and only the newest one
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -2301,8 +2302,11 @@ async function handleUtterance(session, text) {
       // bucket (async; attaches when it lands).
       if (session.cfg.fetchCallMemories) {
         const su = session.cfg.users.get(session.from);
-        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id, { nudges: true })
-          .then((text) => { if (session) session.callerMemories = text || null; })
+        // Nov 10 2026: NOT awaited. The ticket makes this fetch the newest, so
+        // the pickup fetch for the previous agent cannot land on top of it.
+        const memTicket = beginCallMemoryFetch(session);
+        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id, { nudges: true, call: true })
+          .then((text) => { applyCallMemories(session, memTicket, text, { clearOnEmpty: true }); })
           .catch(() => {});
       }
       // July 12 2026: their own pick for the NEW agent leads the chain.
@@ -3883,12 +3887,16 @@ function attachMediaStreams(server, users, cfg) {
           // so this agent actually REMEMBERS them on the phone. Async — first
           // turn may go out without them; they attach the moment they land.
           if (!session.gate && global._vsConfig.fetchCallMemories) {
-            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId, { nudges: !session.outbound })
+            // Nov 10 2026: still NOT awaited -- the greeting below never waits
+            // on this. The fetch may now take up to ~6 s (call: true); when it
+            // lands, even after the greeting, the next turn carries it
+            // (memoryLine reads session.callerMemories fresh every turn).
+            const memTicket = beginCallMemoryFetch(session);
+            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId, { nudges: !session.outbound, call: true })
               .then((text) => {
-                if (text && session) {
-                  session.callerMemories = text;
-                  console.log(`[voice-stream] caller memories attached for ${from} (${text.length} chars)`);
-                }
+                const got = applyCallMemories(session, memTicket, text);
+                if (got.applied) console.log(`[voice-stream] caller memories attached for ${from} (${text.length} chars, ${got.ms} ms)`);
+                else if (text) console.log(`[voice-stream] caller memories not attached for ${from}: ${got.reason} (${got.ms} ms)`);
               })
               .catch(() => {});
           }
@@ -4659,12 +4667,14 @@ function attachWebVoice(server) {
         // didn't. Same fetch, and a web caller is live by definition, so
         // waiting family messages/reminders deliver here too (nudges: 1).
         if (cfg.fetchCallMemories) {
-          cfg.fetchCallMemories({ email: t.email, userId: t.uid }, user.agentId, { nudges: true })
+          // Nov 10 2026: NOT awaited; up to ~6 s (call: true); a late bundle
+          // lands on the next turn. Same rules as the phone lane above.
+          const memTicket = beginCallMemoryFetch(session);
+          cfg.fetchCallMemories({ email: t.email, userId: t.uid }, user.agentId, { nudges: true, call: true })
             .then((text) => {
-              if (text && session) {
-                session.callerMemories = text;
-                console.log(`[web-voice] caller memories attached for ${t.email} (${text.length} chars)`);
-              }
+              const got = applyCallMemories(session, memTicket, text);
+              if (got.applied) console.log(`[web-voice] caller memories attached for ${t.email} (${text.length} chars, ${got.ms} ms)`);
+              else if (text) console.log(`[web-voice] caller memories not attached for ${t.email}: ${got.reason} (${got.ms} ms)`);
             })
             .catch(() => {});
         }

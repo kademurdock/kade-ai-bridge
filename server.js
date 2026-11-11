@@ -27,6 +27,7 @@ const { openRouterCost, upstreamCost } = require('./or-cost');
 const googleWatch = require('./google-watch');
 const { pendingRing, canAnswerRing, DesktopPresence } = require('./desktop-calls');
 const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
+const { callMemoryTimeoutMs } = require('./call-memory'); // Nov 10 2026: how long a call waits for its memory bundle
 const desktopPresence = new DesktopPresence();
 
 const app  = express();
@@ -2280,8 +2281,13 @@ async function fetchCallMemories(identity, agentId, opts = {}) {
     if (identity.email) params.set('email', identity.email);
     if (identity.phone) params.set('phone', identity.phone);
     if (identity.userId) params.set('userId', identity.userId);
+    // Nov 10 2026: a call (opts.call) waits about 6 s, not 2.5 s. No call
+    // code awaits this, so the longer wait adds no voice delay; it only stops
+    // a slow bundle (and the reminders the site already marked delivered)
+    // being thrown away. Awaited callers (brief, research) keep 2.5 s.
+    // KADE_CALL_MEMORY_LONG_WAIT=0 restores 2.5 s everywhere. See call-memory.js.
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/call-memories?${params}`, {
-      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: 2500,
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: callMemoryTimeoutMs(opts),
     });
     return (r.data && r.data.text) || null;
   } catch { return null; }
