@@ -62,9 +62,9 @@ test('a phone pass carries the number for an inbound call only, and never says s
   assert.equal(odd.num, undefined, 'only a real E.164 number is sent');
 });
 
-test('web: only a ticket-verified session that is not a direct Spotter session is app voice', () => {
+test('web: a ticket-verified session is app voice (a direct Spotter session opened with the same ticket too)', () => {
   assert.deepEqual(lp.claimFor({ surface: 'web', lcEmail: 'a@example.invalid', agentId: 'k' }), { lane: 'app-voice', email: 'a@example.invalid', agentId: 'k' });
-  assert.equal(lp.claimFor({ surface: 'web', lcEmail: 'a@example.invalid', _spotterDirect: true }), null);
+  assert.equal(lp.claimFor({ surface: 'web', lcEmail: 'a@example.invalid', _spotterDirect: true }).lane, 'app-voice');
   assert.equal(lp.claimFor({ surface: 'web', lcEmail: null }), null);
   assert.equal(lp.claimFor(null), null);
 });

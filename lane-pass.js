@@ -76,15 +76,15 @@ function mintLanePass(claim, env = process.env, now = Date.now()) {
 
 /**
  * What this session may truthfully say about its lane.
- *   web session (opened with a verified ticket, which set lcEmail), not a direct Spotter session:
- *     app-voice with that email.
+ *   web session (opened with a verified ticket, which set lcEmail): app-voice with that email.
+ *     A direct Spotter session opened with the same ticket, so it is signed in too.
  *   Twilio session: phone, with the caller's number only on an inbound call.
  */
 function claimFor(session) {
   if (!session) return null;
   const agentId = session.agentId || undefined;
   if (session.surface === 'web') {
-    if (!session.lcEmail || session._spotterDirect === true) return null;
+    if (!session.lcEmail) return null;
     return { lane: 'app-voice', email: session.lcEmail, agentId };
   }
   const inbound = session.outbound !== true && session.twilioOutbound !== true;
