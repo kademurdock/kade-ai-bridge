@@ -74,6 +74,11 @@ test('the shipped fetchCallMemories hands axios the call wait only when opts.cal
   assert.strictEqual(seen[0].timeout, 2500, 'brief / research lane keeps the old wait');
   assert.strictEqual(seen[1].timeout, 6000, 'call lane waits longer');
   assert.ok(!/nudges=1/.test(seen[0].url) && /nudges=1/.test(seen[1].url));
+  /* review fix: the site is told how long a fetch that takes waiting messages waits */
+  assert.ok(/[?&]wait=6000(&|$)/.test(seen[1].url), 'a live call says it waits 6 s');
+  assert.ok(!/[?&]wait=/.test(seen[0].url), 'a fetch that takes no waiting messages says nothing');
+  assert.strictEqual(await ctx.fetchCallMemories({ userId: 'u1' }, 'agent_a', { nudges: true }), 'bundle');
+  assert.ok(/[?&]wait=2500(&|$)/.test(seen[2].url) && seen[2].timeout === 2500, 'an awaited fetch that takes them says 2.5 s');
 });
 
 test('awaited users of the bundle (brief, research) do not ask for the call wait', () => {

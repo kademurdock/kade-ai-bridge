@@ -2286,8 +2286,14 @@ async function fetchCallMemories(identity, agentId, opts = {}) {
     // a slow bundle (and the reminders the site already marked delivered)
     // being thrown away. Awaited callers (brief, research) keep 2.5 s.
     // KADE_CALL_MEMORY_LONG_WAIT=0 restores 2.5 s everywhere. See call-memory.js.
+    const waitMs = callMemoryTimeoutMs(opts);
+    // Review fix: when waiting messages ride (nudges=1) the site is told how
+    // long this fetch waits, so it hands them over only while the bridge is
+    // still listening and marks them delivered only then. A site that does not
+    // read "wait" ignores it.
+    if (opts.nudges) params.set('wait', String(waitMs));
     const r = await axios.get(`${FORK_USAGE_URL}/api/kade/call-memories?${params}`, {
-      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: callMemoryTimeoutMs(opts),
+      headers: { 'User-Agent': BROWSER_UA, 'X-Kade-Secret': USAGE_EVENT_SECRET }, timeout: waitMs,
     });
     return (r.data && r.data.text) || null;
   } catch { return null; }
