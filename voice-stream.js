@@ -1452,7 +1452,7 @@ function openDeepgramFlux(session, key) {
         const sinceSpoke = Date.now() - session.lastSpokAt;
         const echoPossible = session.isSpeaking || sinceSpoke < 3000;
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-        const isEcho = echoPossible && looksLikeEcho(full, echoReference(session), echoWindow ? 0.35 : 0.6);
+        const isEcho = echoPossible && utteranceIsEcho(session, full, echoWindow);
         if (!isEcho) handleUtterance(session, full);
         else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${full.slice(0, 60)}"`);
       };
@@ -1616,7 +1616,7 @@ function openDeepgram(session) {
         const sinceSpoke = Date.now() - session.lastSpokAt;
         const echoPossible = session.isSpeaking || sinceSpoke < 3000;
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-        const isEcho = echoPossible && looksLikeEcho(utterance, echoReference(session), echoWindow ? 0.35 : 0.6);
+        const isEcho = echoPossible && utteranceIsEcho(session, utterance, echoWindow);
         console.log(`[timing] speech_final +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms speaking=${!!session.isSpeaking})`);
         if (!isEcho) {
           updateMoodStats(session, {
@@ -1638,7 +1638,7 @@ function openDeepgram(session) {
       const sinceSpoke = Date.now() - session.lastSpokAt;
       const echoPossible = session.isSpeaking || sinceSpoke < 3000; // see speech_final note
       const echoWindow = session.isSpeaking || sinceSpoke < 1200;
-      const isEcho = echoPossible && looksLikeEcho(utterance, echoReference(session), echoWindow ? 0.35 : 0.6);
+      const isEcho = echoPossible && utteranceIsEcho(session, utterance, echoWindow);
       console.log(`[timing] UtteranceEnd +${session._bufStartedAt ? Date.now() - session._bufStartedAt : '?'}ms after first is_final (sinceSpoke=${sinceSpoke}ms) -- speech_final never came`);
       if (!isEcho) {
         updateMoodStats(session, {
@@ -3541,11 +3541,11 @@ function noteCallerHeard(session, how, text) {
   const watch = session && session._limits;
   if (!watch) return;
   if (how === 'words') {
-    if (session._limitLine && Date.now() < (session._limitLineUntil || 0)) {
+    if (limitLineActive(session)) {
       // One of the watch's own lines is playing or just played. This is exactly when a caller
-      // answers, so their words count at once, unless they are that line coming back off a
-      // speakerphone (most of the heard words are words of the line).
-      if (looksLikeEcho(text, session._limitLine, 0.5)) return;
+      // answers, so their words count at once, unless they are a long stretch of that line coming
+      // back off a speakerphone (limitLineEcho). A short answer always counts.
+      if (limitLineEcho(text, session._limitLine)) return;
     } else if (session.isSpeaking || Date.now() - (session.lastSpokAt || 0) < 1500) {
       return;
     }
@@ -3553,21 +3553,53 @@ function noteCallerHeard(session, how, text) {
   watch.noteHeard();
 }
 
+/* Review, Nov 10 2026. A caller who answered the check-in with words that are also words of the
+ * check-in ("Keep going", when the line said "we will keep going") was taken for the line's own
+ * echo: not counted by the watch, and the finished sentence dropped before it became a turn. Then
+ * hung up on. While one of the watch's lines is playing or has just played, heard words are that
+ * line's echo ONLY when they are a long stretch of it: five words or more, at least four in five
+ * of them words of the line. Anything shorter, or mostly other words, is the caller. The cost: a
+ * speakerphone that feeds the line back in short pieces keeps the call up, and only the maximum
+ * length ends it. That is the safe way round. */
+const LIMIT_ECHO_MIN_WORDS = 5;
+const LIMIT_ECHO_SHARE = 0.8;
+function limitLineActive(session) {
+  // Only while the watch's line is the LAST thing spoken: once a reply has started, its echo is
+  // judged by the ordinary rule again.
+  return !!(session && session._limitLine && Date.now() < (session._limitLineUntil || 0)
+    && session._currentSpokenText === session._limitLine);
+}
+function limitLineEcho(text, line) {
+  const heard = normalizeWords(text);
+  if (heard.length < LIMIT_ECHO_MIN_WORDS) return false;
+  const said = new Set(normalizeWords(line));
+  if (!said.size) return false;
+  return heard.filter((w) => said.has(w)).length / heard.length >= LIMIT_ECHO_SHARE;
+}
+/** The echo check for a FINISHED utterance (the three places Deepgram hands one over). Outside a
+ * call-limit line it is the old rule, unchanged. During or just after one, only limitLineEcho. */
+function utteranceIsEcho(session, utterance, echoWindow) {
+  if (limitLineActive(session)) return limitLineEcho(utterance, session._limitLine);
+  return looksLikeEcho(utterance, echoReference(session), echoWindow ? 0.35 : 0.6);
+}
+
 /** Speak one of the call-limit lines. A warning waits for a gap in the talk; the goodbye
- * (`final`) does not. Resolves when the line has played (or could not be). */
+ * (`final`) does not. Resolves true when the line has played, false when it could not be made or
+ * the call was gone: a warning that was not spoken must not start the hang-up clock. */
 async function limitSay(session, line, opts = {}) {
   const open = () => session.ws.readyState === WebSocket.OPEN;
-  if (!open()) return;
+  if (!open()) return false;
   let buf;
   try {
     buf = await synthesize(line, session.voice, session.rate, session.media, session.pronunciationDictionary);
   } catch (e) {
     console.warn('[call-limits] could not make the line:', e.message);
-    return;
+    return false;
   }
+  if (!buf || !buf.length) { console.warn('[call-limits] the line came back empty'); return false; }
   const waitUntil = Date.now() + (opts.final ? 0 : LIMIT_GAP_WAIT_MS);
   while (open() && (session.isSpeaking || session.busy) && Date.now() < waitUntil) await sleepMs(100);
-  if (!open()) return;
+  if (!open()) return false;
   if (session.isSpeaking || session.busy) {
     // Still talking: stop it the way a barge-in does, and let the turn unwind before speaking.
     session.sendClear();
@@ -3576,7 +3608,7 @@ async function limitSay(session, line, opts = {}) {
     session.lastSpokAt = Date.now();
     const until = Date.now() + 2500;
     while (open() && session.busy && Date.now() < until) await sleepMs(50);
-    if (!open()) return;
+    if (!open()) return false;
   }
   session.llmAbort = false; // playBuffer stops on a stale abort flag; this line is a fresh thing to say
   try { session.history.push({ role: 'assistant', content: line }); } catch {}
@@ -3588,6 +3620,7 @@ async function limitSay(session, line, opts = {}) {
   } finally {
     session._limitLineUntil = Date.now() + 3000; // an answer usually comes just after the line ends
   }
+  return true;
 }
 
 /** End the call: Twilio's REST hang-up once the goodbye has drained, and if the call is somehow
@@ -4813,4 +4846,5 @@ module.exports._test = {
   CallSession, WebCallSession, handleUtterance, nextRateStop, rateLine, helloListenerRate, RATE_LADDER, BASE_RATE,
   sessionsByCallSid,
   noteCallerHeard, limitSay, limitHangUp, armCallLimits, stopCallLimits, keepListening,
+  looksLikeEcho, limitLineEcho, limitLineActive, utteranceIsEcho, sttSay,
 };

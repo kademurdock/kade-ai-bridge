@@ -78,9 +78,12 @@ test.before(async () => {
       let input = '?';
       try { input = JSON.parse(raw).input; } catch {}
       world.said.push(input);
+      // A test may make the voice proxy fail on the check-in line a number of times.
+      if (world.failCheckIn > 0 && /Checking in/.test(input)) { world.failCheckIn -= 1; res.writeHead(500); res.end('speech is down'); return; }
       res.writeHead(200, { 'Content-Type': 'audio/basic' });
       // 0.3 s of silence per line; a test may ask for a longer check-in line to talk over.
-      res.end(Buffer.alloc(world.longCheckIn && /Checking in/.test(input) ? 16000 : 2400, 0xff));
+      const long = (world.longCheckIn && /Checking in/.test(input)) || (world.longBye && /That is all the time/.test(input));
+      res.end(Buffer.alloc(long ? 16000 : 2400, 0xff));
     });
   });
   // The model proxy: one short sentence per turn.
@@ -106,6 +109,9 @@ test.before(async () => {
 });
 
 test.after(async () => {
+  // Review: a test that failed with its call still up used to leave this hook waiting for ever
+  // (a hung run instead of a red one). Whatever happens below, the file ends.
+  setTimeout(() => process.exit(), 5000);
   for (const s of [httpServer, ttsServer, llmServer]) { try { s.closeAllConnections(); } catch {} await new Promise((r) => s.close(r)); }
   for (const c of dg.conns) { try { c.sock.terminate(); } catch {} }
   await new Promise((r) => dg.server.close(r));
@@ -301,29 +307,201 @@ test('A KEY PRESS counts as the caller being there', async () => {
   await until(() => world.said.slice(from).some((l) => /Checking in/.test(l)), 6000, 'the question');
   await sleep(450);
   call.ws.send(JSON.stringify({ event: 'dtmf', dtmf: { digit: '5' } }));
+  // Review: the goodbye itself is looked for. Without the key press it is asked for 0.75 s from
+  // now (the grace runs out); the old test only looked for the hang-up request, which comes later
+  // than its 1.2 s wait, so it proved nothing. (Not longer: a whole new quiet count ends at 1.9 s.)
   await sleep(1200);
+  assert.equal(world.said.slice(from).some((l) => /ending now/.test(l)), false, 'no goodbye was ever asked for');
   assert.equal(world.ended.includes(SID(12)), false);
   assert.equal(call.closed, null);
   await call.hangUp();
 });
 
-test('THE LONGEST CALL on a real socket: warned first, ended a full warning later, and words during the goodbye start no new turn', async () => {
-  gateWith('off'); limits({ maxMs: 1500, maxWarnMs: 700 });
-  const from = world.said.length;
-  const t0 = Date.now();
-  const call = await phone({ callSid: SID(13), params: { from: FROM, callSid: SID(13) } });
+// ── review, Nov 10 2026 ───────────────────────────────────────────────────────
+
+test('REVIEW, THE ANSWER RULE: a short answer is never the line\'s echo, even when every word of it is a word of the line; a long stretch of the line is', () => {
+  const { LINES } = require('./call-limits');
+  const { utteranceIsEcho, limitLineEcho, noteCallerHeard } = vs._test;
+  const c = { idleGraceMs: 60000, maxWarnMs: 120000 };
+  const answers = [
+    'Keep going', 'We will keep going', 'It has been quiet, keep going', // what the first wording invited
+    'Any word', 'Any key', 'Say any word', 'Press any key', 'Word', 'This call', // made of the new line's words
+    'Do not end this call', 'Please do not end this call', 'Call back', 'Right back', 'Bye',
+    "I'm still here", 'Yes', 'Hello?', "Wait, don't hang up", 'Stay on', 'Sure, go on', 'Okay',
+  ];
+  for (const [name, make] of Object.entries(LINES)) {
+    const line = make(c);
+    const session = { _limitLine: line, _limitLineUntil: Infinity, _currentSpokenText: line, isSpeaking: true, lastSpokAt: Date.now() };
+    let heard = 0;
+    session._limits = { noteHeard: () => { heard += 1; } };
+    for (const a of answers) {
+      assert.equal(utteranceIsEcho(session, a, true), false, `${name}: "${a}" was dropped as echo`);
+      const before = heard;
+      noteCallerHeard(session, 'words', a);
+      assert.equal(heard, before + 1, `${name}: "${a}" did not count as the caller`);
+    }
+    // The line itself, and any long piece of it, coming back off a speakerphone.
+    const words = line.replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/);
+    for (const piece of [line, words.slice(0, 6).join(' '), words.slice(-7).join(' ')]) {
+      assert.equal(limitLineEcho(piece, line), true, `${name}: "${piece}" should be echo`);
+      const before = heard;
+      noteCallerHeard(session, 'words', piece);
+      assert.equal(heard, before, `${name}: the line's own words counted as the caller`);
+    }
+    // A reply has started since: the ordinary echo rule is back.
+    session._currentSpokenText = 'Glad you are here.';
+    assert.equal(utteranceIsEcho(session, 'you are here', true), true);
+  }
+  // Outside a limit line, words heard while the character is talking do not count (its own voice).
+  let n = 0;
+  const talking = { _limits: { noteHeard: () => { n += 1; } }, isSpeaking: true, lastSpokAt: Date.now() };
+  noteCallerHeard(talking, 'words', 'some words off the speaker');
+  assert.equal(n, 0);
+  noteCallerHeard({ ...talking, isSpeaking: false, lastSpokAt: Date.now() - 5000 }, 'words', 'hello');
+  assert.equal(n, 1);
+});
+
+test('REVIEW: the caller answers the check-in at once with words of the check-in itself ("Any word."): a real turn, no hang-up', async () => {
+  gateWith('off'); limits({ idleMs: 700, idleGraceMs: 900 });
+  const from = world.said.length; const asksBefore = world.asks.length;
+  const call = await phone({ callSid: SID(30), params: { from: FROM, callSid: SID(30) } });
   call.start();
   const since = () => world.said.slice(from);
-  await until(() => since().some((l) => /this call has to end/.test(l)), 6000, 'the warning');
-  const warnedAt = Date.now();
-  await until(() => since().some((l) => /That is all the time this call gets/.test(l)), 6000, 'the goodbye');
-  assert.ok(Date.now() - warnedAt >= 700, 'never sooner than a full warning period after the warning');
-  const asksBefore = world.asks.length;
-  hear('Wait, one more thing.');
-  await until(() => world.ended.includes(SID(13)), 4000, 'hang-up');
-  assert.equal(world.asks.length, asksBefore, 'no model turn was started over the goodbye');
-  assert.ok(Date.now() - t0 >= 1500);
-  await until(() => call.closed !== null, 3000, 'closed');
+  await until(() => since().some((l) => /Checking in/.test(l)), 6000, 'the check-in');
+  const session = sessions.get(SID(30));
+  await until(() => session._limitLine && session._limitLineUntil !== Infinity, 3000, 'the check-in finished playing');
+  hear('Any word.'); // straight away, inside the echo window
+  await until(() => world.asks.length > asksBefore, 3000, 'the answer became a real turn');
+  await sleep(1800);
+  assert.equal(since().some((l) => /ending now/.test(l)), false, 'no goodbye');
+  assert.equal(world.ended.includes(SID(30)), false, 'not hung up');
+  assert.equal(call.closed, null);
+  await call.hangUp();
+});
+
+test('REVIEW: words heard OVER the check-in, never a finished sentence ("keep going"), still keep the call', async () => {
+  gateWith('off'); limits({ idleMs: 700, idleGraceMs: 900 });
+  world.longCheckIn = true;
+  try {
+    const from = world.said.length;
+    const call = await phone({ callSid: SID(31), params: { from: FROM, callSid: SID(31) } });
+    call.start();
+    const since = () => world.said.slice(from);
+    await until(() => since().some((l) => /Checking in/.test(l)), 6000, 'the check-in');
+    const session = sessions.get(SID(31));
+    await until(() => session.isSpeaking && session._limitLineUntil === Infinity, 2000, 'the check-in is playing');
+    lastDg().sock.send(JSON.stringify({ type: 'TurnInfo', event: 'Update', transcript: 'this call', words: [] }));
+    await sleep(2000 + 900 + 1500); // the rest of the line, the grace, and room for a goodbye
+    assert.equal(since().some((l) => /ending now/.test(l)), false, 'no goodbye');
+    assert.equal(world.ended.includes(SID(31)), false);
+    await call.hangUp();
+  } finally { world.longCheckIn = false; }
+});
+
+test('REVIEW: the check-in coming back off a speakerphone is not a caller: no turn, and the quiet call is still ended', async () => {
+  gateWith('off'); limits({ idleMs: 700, idleGraceMs: 1500 }); // the echo is over before the goodbye, as on a real call
+  world.longCheckIn = true;
+  try {
+    const from = world.said.length;
+    const call = await phone({ callSid: SID(32), params: { from: FROM, callSid: SID(32) } });
+    call.start();
+    const since = () => world.said.slice(from);
+    await until(() => since().some((l) => /Checking in/.test(l)), 6000, 'the check-in');
+    const session = sessions.get(SID(32));
+    await until(() => session.isSpeaking && session._limitLineUntil === Infinity, 2000, 'the check-in is playing');
+    const line = session._limitLine;
+    const asksBefore = world.asks.length;
+    const heardSoFar = line.split(' ').slice(0, 9).join(' ');
+    lastDg().sock.send(JSON.stringify({ type: 'TurnInfo', event: 'Update', transcript: heardSoFar, words: [] }));
+    await until(() => session._limitLineUntil !== Infinity, 4000, 'the check-in finished');
+    hear(line); // the whole line as a finished "sentence", just after it ended
+    await until(() => since().some((l) => /ending now/.test(l)), 4000, 'the goodbye still came');
+    await until(() => world.ended.includes(SID(32)), 4000, 'and the hang-up');
+    assert.equal(world.asks.length, asksBefore, 'the echo never became a model turn');
+    await until(() => call.closed !== null, 3000, 'closed');
+  } finally { world.longCheckIn = false; }
+});
+
+test('REVIEW: the voice proxy fails on the check-in: it is asked again, and no goodbye comes until a check-in was really played', async () => {
+  gateWith('off'); limits({ idleMs: 700, idleGraceMs: 600, warnRetryMs: 300 });
+  world.failCheckIn = 1;
+  try {
+    const from = world.said.length;
+    const call = await phone({ callSid: SID(33), params: { from: FROM, callSid: SID(33) } });
+    call.start();
+    const since = () => world.said.slice(from);
+    const checkIns = () => since().filter((l) => /Checking in/.test(l)).length;
+    await until(() => checkIns() >= 1, 6000, 'the first check-in, which fails');
+    await until(() => checkIns() >= 2, 4000, 'the check-in is asked again');
+    const secondAt = Date.now();
+    assert.equal(since().some((l) => /ending now/.test(l)), false, 'no goodbye before a check-in was heard');
+    assert.equal(world.ended.includes(SID(33)), false);
+    await until(() => since().some((l) => /ending now/.test(l)), 4000, 'the goodbye, after the spoken check-in');
+    assert.ok(Date.now() - secondAt >= 600, 'a full grace after the check-in that played');
+    await until(() => world.ended.includes(SID(33)), 4000, 'hang-up');
+    await until(() => call.closed !== null, 3000, 'closed');
+  } finally { world.failCheckIn = 0; }
+});
+
+test('REVIEW: a call-limit line is really played even when an old interruption left the stop flag set', async () => {
+  gateWith('off'); limits(null);
+  const call = await phone({ callSid: SID(34), params: { from: FROM, callSid: SID(34) } });
+  call.start();
+  await until(() => sessions.has(SID(34)), 500, 'session');
+  const session = sessions.get(SID(34));
+  await until(() => call.media > 0 && !session.isSpeaking && !session.busy && !session._greetingLock, 5000, 'the greeting is over');
+  await sleep(200);
+  session.llmAbort = true; // what a barge-in outside a model turn leaves behind
+  const mediaBefore = call.media;
+  const ok = await vs._test.limitSay(session, 'Quick heads up: a line for the test.');
+  assert.equal(ok, true, 'limitSay reports the line as spoken');
+  assert.ok(call.media > mediaBefore, 'and its audio reached the phone');
+  await call.hangUp();
+});
+
+test('REVIEW: the hearing-trouble line is never spoken over a Spotter, and is spoken without one', async () => {
+  gateWith('off'); limits(null);
+  const call = await phone({ callSid: SID(35), params: { from: FROM, callSid: SID(35) } });
+  call.start();
+  await until(() => sessions.has(SID(35)), 500, 'session');
+  const session = sessions.get(SID(35));
+  await until(() => call.media > 0 && !session.isSpeaking && !session.busy && !session._greetingLock, 5000, 'the greeting is over');
+  const from = world.said.length;
+  session._liveWs = { readyState: 3, close() {}, terminate() {}, send() {}, on() {}, removeAllListeners() {} };
+  await vs._test.sttSay(session, 'A trouble line for the test.');
+  assert.equal(world.said.slice(from).some((l) => /trouble line/.test(l)), false, 'not over a Spotter');
+  session._liveWs = null;
+  await vs._test.sttSay(session, 'A trouble line for the test.');
+  assert.equal(world.said.slice(from).some((l) => /trouble line/.test(l)), true, 'spoken on an ordinary call');
+  await call.hangUp();
+});
+
+test('THE LONGEST CALL on a real socket: warned first, ended a full warning later, and words during the goodbye start no new turn', async () => {
+  gateWith('off'); limits({ maxMs: 1500, maxWarnMs: 700 });
+  // Review: the goodbye is 2 s long here. The bridge holds a finished sentence 0.9 s before acting
+  // on it; with the old 0.3 s goodbye the call was already closed by then, so the test passed with
+  // the guard in handleUtterance taken out.
+  world.longBye = true;
+  try {
+    const from = world.said.length;
+    const t0 = Date.now();
+    const call = await phone({ callSid: SID(13), params: { from: FROM, callSid: SID(13) } });
+    call.start();
+    const since = () => world.said.slice(from);
+    await until(() => since().some((l) => /this call has to end/.test(l)), 6000, 'the warning');
+    const warnedAt = Date.now();
+    await until(() => since().some((l) => /That is all the time this call gets/.test(l)), 6000, 'the goodbye');
+    assert.ok(Date.now() - warnedAt >= 700, 'never sooner than a full warning period after the warning');
+    const asksBefore = world.asks.length;
+    hear('Wait, one more thing.');
+    await sleep(1400); // past the 0.9 s hold, the goodbye still playing
+    assert.equal(call.closed, null, 'the goodbye is still playing');
+    assert.equal(world.asks.length, asksBefore, 'no model turn was started over the goodbye');
+    await until(() => world.ended.includes(SID(13)), 5000, 'hang-up');
+    assert.equal(world.asks.length, asksBefore);
+    assert.ok(Date.now() - t0 >= 1500);
+    await until(() => call.closed !== null, 3000, 'closed');
+  } finally { world.longBye = false; }
 });
 
 test('AN OUTBOUND CALL is not armed: a quiet callee (a business hold) is never asked and never cut by this watch', async () => {

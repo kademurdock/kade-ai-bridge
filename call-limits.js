@@ -19,7 +19,12 @@
  *                                          about to end and that calling right back is fine. The
  *                                          hang-up comes this long after the warning was SPOKEN,
  *                                          never sooner, even if the warning had to wait its turn.
- *   CALL_LIMITS=0                          switches the whole watch off. A limit set to 0 is off.
+ *   CALL_LIMITS=1                          switches the watch ON. Anything else, or unset, is OFF.
+ *                                          A limit set to 0 is off.
+ *
+ * SHIPPED OFF (review and ship, Nov 10 2026). This watch can end a real call, and it has never been
+ * heard on one. So it does nothing until CALL_LIMITS=1 is set on the bridge service; CALL_LIMITS=0
+ * or removing the variable turns it back off.
  *
  * What counts as the caller being there: a finished utterance (always), words Deepgram hears while
  * the character is not talking (so the character's own voice on a speakerphone does not count), or
@@ -49,9 +54,13 @@ function num(v, dflt) {
 
 /** The limits in milliseconds, from the environment. Bad or negative values fall back to defaults. */
 function limitsConfig(env = process.env) {
-  const off = String(env.CALL_LIMITS || '').trim() === '0';
-  const idleMs = Math.round(num(env.CALL_IDLE_MINUTES, 10) * MIN);
-  const maxMs = Math.round(num(env.CALL_MAX_MINUTES, 120) * MIN);
+  const off = !['1', 'on', 'true', 'yes'].includes(String(env.CALL_LIMITS || '').trim().toLowerCase());
+  // Review: a tiny positive value (0.01) used to mean a check-in every second or so. A limit that
+  // is on is never shorter than one quiet minute, or a two minute call. 0 still means off.
+  let idleMs = Math.round(num(env.CALL_IDLE_MINUTES, 10) * MIN);
+  if (idleMs > 0) idleMs = Math.max(MIN, idleMs);
+  let maxMs = Math.round(num(env.CALL_MAX_MINUTES, 120) * MIN);
+  if (maxMs > 0) maxMs = Math.max(2 * MIN, maxMs);
   let maxWarnMs = Math.round(num(env.CALL_MAX_WARN_SECONDS, 120) * 1000);
   // A warning needs room to be heard and acted on, and cannot be longer than the call.
   if (maxMs > 0) maxWarnMs = Math.max(15000, Math.min(maxWarnMs, Math.floor(maxMs / 2)));
@@ -74,9 +83,15 @@ function spokenSpan(ms) {
  * natural answers to "are you there?" are "yes", "I'm here", "I'm still here", "hello", "wait",
  * "don't hang up". So these lines use NONE of those words: no "still", "here", "there", "I'm",
  * "yes", "hello", "wait", "hang up". An answer can then never be mistaken for the question's echo.
- * call-limits.test.js holds this as a rule. */
+ * call-limits.test.js holds this as a rule.
+ *
+ * Review, Nov 10 2026: the first check-in said "Say anything and we will keep going", which handed
+ * the caller a phrase made of the line's own words; "Keep going" was then taken for the line's echo
+ * and the caller was ignored. The line no longer offers a phrase to say back, the invitation comes
+ * LAST (so an answer lands after the line, not over it), and voice-stream.js now only calls heard
+ * words this line's echo when they are a long stretch of it (limitLineEcho). */
 const LINES = {
-  idleWarn: (c) => `Checking in: it has been quiet for a while. Say anything and we will keep going. Otherwise this call will end in ${spokenSpan(c.idleGraceMs)}.`,
+  idleWarn: (c) => `Checking in: it has been quiet for a while. This call will end in ${spokenSpan(c.idleGraceMs)} unless you say any word or press any key.`,
   idleEnd: () => `Nobody answered, so this call is ending now. Call back any time. Bye!`,
   maxWarn: (c) => `Quick heads up: we have been on the phone a long while, and this call has to end in ${spokenSpan(c.maxWarnMs)}. You can call right back and we will pick up where we left off.`,
   maxEnd: () => `That is all the time this call gets, so it is ending now. Call right back any time. Bye for now!`,
@@ -87,6 +102,11 @@ const ANSWER_WORDS = ['still', 'here', 'there', "i'm", 'im', 'yes', 'yeah', 'hel
 const WARN_WAIT_MS = 30000;
 /* How long the goodbye may wait for the character to finish a sentence. */
 const END_WAIT_MS = 15000;
+/* A warning that could not be spoken (the voice service failed on that one line) is not a warning
+ * given. It is tried again this long later, WARN_TRIES times in all, before the slow "speech is
+ * down" path below is allowed to end the call. cfg.warnRetryMs overrides the wait for tests. */
+const WARN_RETRY_MS = 15000;
+const WARN_TRIES = 3;
 
 /**
  * One watch for one call.
@@ -96,6 +116,7 @@ const END_WAIT_MS = 15000;
  *   isBusy  () => the character is speaking, thinking, or the greeting is still playing
  *   say     async (line, { final }) => speak it to the caller; resolves when it has been heard.
  *           `final` means the goodbye: the implementation may stop whatever is playing first.
+ *           Resolving `false`, or throwing, means the line could NOT be spoken.
  *   hangUp  (reason) => end the call ('idle' | 'max')
  *   log     console-like
  * The owner calls tick() on a timer (a few seconds apart), noteHeard() when the caller is heard,
@@ -109,6 +130,10 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
     lastActiveAt: startedAt,  // the line in use: the caller heard, or the character busy
     idleWarnedAt: 0,          // when the spoken check-in was started
     idleWarnDoneAt: 0,        // when it finished playing
+    idleWarnFails: 0,         // check-ins in a row that could not be spoken
+    idleRetryAt: 0,           // when a failed check-in may be tried again
+    maxWarnFails: 0,
+    maxRetryAt: 0,
     maxDueSince: 0,           // when the max warning first came due (it may wait for a gap)
     maxWarnedAt: 0,           // when the max warning was started
     maxWarnDoneAt: 0,
@@ -130,6 +155,8 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
     const t = now();
     st.lastHeardAt = t;
     st.lastActiveAt = t;
+    st.idleWarnFails = 0;
+    st.idleRetryAt = 0;
     if (st.idleWarnedAt) {
       st.idleWarnedAt = 0;
       st.idleWarnDoneAt = 0;
@@ -139,10 +166,12 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
 
   async function speak(line, opts, onDone) {
     st.saying = true;
-    try { await say(line, opts || {}); } catch (e) { log.warn(`${tag} could not speak a line: ${e && e.message}`); }
+    let ok = true;
+    try { if ((await say(line, opts || {})) === false) ok = false; } catch (e) { ok = false; log.warn(`${tag} could not speak a line: ${e && e.message}`); }
     st.saying = false;
-    if (onDone) onDone(now());
+    if (onDone) onDone(now(), ok);
   }
+  const retryMs = cfg.warnRetryMs > 0 ? cfg.warnRetryMs : WARN_RETRY_MS;
 
   function end(reason) {
     if (st.ending || st.stopped) return;
@@ -177,10 +206,20 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
       if (!st.maxWarnedAt && t >= startedAt + cfg.maxMs - cfg.maxWarnMs) {
         if (!st.maxDueSince) st.maxDueSince = t;
         // Wait for a gap so the warning does not talk over a reply; after WARN_WAIT_MS say it anyway.
-        if (!st.saying && (!busy || t - st.maxDueSince >= WARN_WAIT_MS)) {
+        if (!st.saying && t >= st.maxRetryAt && (!busy || t - st.maxDueSince >= WARN_WAIT_MS)) {
           st.maxWarnedAt = t;
           log.log(`${tag} max length warning (${spokenSpan(cfg.maxWarnMs)} left)`);
-          speak(LINES.maxWarn(cfg), {}, (doneAt) => { st.maxWarnDoneAt = doneAt; });
+          speak(LINES.maxWarn(cfg), {}, (doneAt, ok) => {
+            if (ok) { st.maxWarnDoneAt = doneAt; return; }
+            // Not heard, so not given: try again shortly. After WARN_TRIES the warning stays
+            // "started, never finished" and the slow path below ends the call.
+            st.maxWarnFails += 1;
+            if (st.maxWarnFails < WARN_TRIES) {
+              st.maxWarnedAt = 0;
+              st.maxRetryAt = doneAt + retryMs;
+              log.warn(`${tag} the length warning could not be spoken (try ${st.maxWarnFails} of ${WARN_TRIES}): trying again`);
+            }
+          });
         }
       }
       // The hang-up is a full warning period after the warning was SPOKEN, never sooner.
@@ -197,12 +236,24 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
       if (!st.idleWarnedAt) {
         // Not while the max warning is being said or was just said: one thing at a time.
         const justWarned = st.maxWarnedAt && (!st.maxWarnDoneAt || t - st.maxWarnDoneAt < 5000);
-        if (!busy && !st.saying && !justWarned && t - st.lastActiveAt >= cfg.idleMs) {
+        if (!busy && !st.saying && !justWarned && t >= st.idleRetryAt && t - st.lastActiveAt >= cfg.idleMs) {
           st.idleWarnedAt = t;
           st.idleWarnDoneAt = 0;
           const warnedAt = t;
           log.log(`${tag} quiet for ${Math.round((t - st.lastActiveAt) / 1000)} s: asking if the caller is still there`);
-          speak(LINES.idleWarn(cfg), {}, (doneAt) => { if (st.idleWarnedAt === warnedAt) st.idleWarnDoneAt = doneAt; });
+          speak(LINES.idleWarn(cfg), {}, (doneAt, ok) => {
+            if (st.idleWarnedAt !== warnedAt) return; // the caller was heard meanwhile
+            if (ok) { st.idleWarnDoneAt = doneAt; st.idleWarnFails = 0; return; }
+            // Not heard, so not asked: the grace must not start. Try again shortly. After
+            // WARN_TRIES the check-in stays "started, never finished" and the slow path below
+            // (speech is down) ends the call.
+            st.idleWarnFails += 1;
+            if (st.idleWarnFails < WARN_TRIES) {
+              st.idleWarnedAt = 0;
+              st.idleRetryAt = doneAt + retryMs;
+              log.warn(`${tag} the check-in could not be spoken (try ${st.idleWarnFails} of ${WARN_TRIES}): trying again`);
+            }
+          });
         }
       } else if (st.idleWarnDoneAt && t >= st.idleWarnDoneAt + cfg.idleGraceMs) {
         // noteHeard() clears idleWarnedAt, so reaching here means nothing was heard since the question.
@@ -220,10 +271,10 @@ function createCallWatch({ cfg, now = () => Date.now(), isOpen, isBusy, say, han
 
 /** The one startup line: what the limits are, in words a log reader can check. */
 function limitsStartupLine(cfg = limitsConfig()) {
-  if (!cfg.enabled) return '[call-limits] off (CALL_LIMITS=0 or both limits 0): inbound calls have no time limit';
+  if (!cfg.enabled) return '[call-limits] off (set CALL_LIMITS=1 to turn on; or both limits are 0): inbound calls have no time limit';
   const idle = cfg.idleMs > 0 ? `quiet line: asks after ${cfg.idleMs / MIN} min, hangs up ${cfg.idleGraceMs / 1000} s later` : 'quiet line: off';
   const max = cfg.maxMs > 0 ? `longest call: ${cfg.maxMs / MIN} min, warned ${cfg.maxWarnMs / 1000} s before` : 'longest call: off';
   return `[call-limits] inbound phone calls. ${idle}. ${max}.`;
 }
 
-module.exports = { limitsConfig, createCallWatch, spokenSpan, limitsStartupLine, LINES, ANSWER_WORDS, WARN_WAIT_MS, END_WAIT_MS };
+module.exports = { limitsConfig, createCallWatch, spokenSpan, limitsStartupLine, LINES, ANSWER_WORDS, WARN_WAIT_MS, END_WAIT_MS, WARN_RETRY_MS, WARN_TRIES };
