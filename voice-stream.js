@@ -566,6 +566,15 @@ function helloListenerRate(speed) {
   return Math.min(RATE_MAX, Math.max(RATE_MIN, speed));
 }
 
+// Nov 11 2026: the website shows a character's face on this call (hello `faces: true`), so the
+// bridge asks the voice proxy for Inworld's mouth shapes. They ride inside each WAV as a `kdtm`
+// chunk between fmt and data (wavDurationMs walks past it; the browser reads it). The proxy adds
+// them only on its buffered Inworld lane: never Fish, never the phone. No billed characters and
+// no change to the audio. BRIDGE_FACE_TIMINGS=0 (read per call) stops the ask.
+function helloFaceTimings(msg) {
+  return !!msg && msg.faces === true && process.env.BRIDGE_FACE_TIMINGS !== '0';
+}
+
 // Oct 30 2026 (Kade: "a default voice speed for the default agent voice we choose
 // when we build an agent"): a character's number belongs to its own builder voice.
 // A listener's own pick, a name match or the platform default play at the
@@ -2668,7 +2677,7 @@ async function streamReply(session, userText) {
         : applyDirectionCarry(sentence, dirState);
     const characterMetadata = hasSpeech && synthInput ? speechMetadata(session.agentId, synthInput) : null;
     const synthPromise = hasSpeech && synthInput
-      ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary).catch((e) => {
+      ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings }).catch((e) => {
           console.error('[voice-stream] synthesis prefetch error:', e.message);
           return null;
         })
@@ -2944,7 +2953,7 @@ async function streamReply(session, userText) {
 }
 
 // ── Synthesize → μ-law 8kHz ───────────────────────────────────────────────────
-async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
+async function synthesize(text, voice, rate, format = 'mulaw', dictionary, opts = {}) {
   const cfg = global._vsConfig;
   const input = fixPronunciation(text, dictionary).slice(0, 4096);
   const useVoice = voice || cfg.defaultVoice;
@@ -2954,7 +2963,10 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
   if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
   const res = await streamPost(
     `${cfg.ttsProxyUrl}/v1/audio/speech${format === 'mulaw' ? '?telephony=1' : ''}`,
-    { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...speechHeaders(format === 'mulaw' ? 'bridge-phone' : 'bridge-voice') },
+    {
+      'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...speechHeaders(format === 'mulaw' ? 'bridge-phone' : 'bridge-voice'),
+      ...(opts && opts.timing && format === 'wav' ? { 'x-kade-tts-timing': '1' } : {}), // a face is shown (helloFaceTimings)
+    },
     body
   );
   return new Promise((resolve, reject) => {
@@ -2976,7 +2988,7 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary) {
 async function speak(session, text, voice) {
   try {
     const characterMetadata = speechMetadata(session.agentId, text);
-    const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary);
+    const buf = await synthesize(text, voice || session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings });
     // Nov 10 2026: A STALE ABORT FLAG MADE A SPOKEN LINE SILENT. A barge-in sets llmAbort, and
     // only the end of a model turn clears it. A barge-in on a line spoken OUTSIDE a turn (a command's
     // answer, a notice, the call-limit check-in) therefore left the flag set, and the next line
@@ -3610,7 +3622,7 @@ async function limitSay(session, line, opts = {}) {
   if (!open()) return false;
   let buf;
   try {
-    buf = await synthesize(line, session.voice, session.rate, session.media, session.pronunciationDictionary);
+    buf = await synthesize(line, session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings });
   } catch (e) {
     console.warn('[call-limits] could not make the line:', e.message);
     return false;
@@ -4647,6 +4659,7 @@ function attachWebVoice(server) {
         // 'push' (Stop-button-only interrupts); a client that WANTS the old
         // voice-activated cutting can say so in its hello.
         if (msg.bargeMode === 'auto' || msg.bargeMode === 'push') session.bargeMode = msg.bargeMode;
+        session.faceTimings = helloFaceTimings(msg); // Nov 11 2026: a face is shown, ask for mouth shapes
         // KADE July 22 2026 (call continuity): when the app starts a call
         // FROM an open conversation it sends that conversation's id; the
         // post-call ingest then APPENDS the transcript into it instead of
@@ -4898,7 +4911,7 @@ module.exports = { attachMediaStreams, attachWebVoice, synthesize, handleAmdResu
 module.exports._test = {
   makeToneBuf, encodeUlaw, dtmfToneBuf, DTMF_GAP, DTMF_FREQS,
   CallSession, WebCallSession, handleUtterance, nextRateStop, rateLine, helloListenerRate, RATE_LADDER, BASE_RATE,
-  sessionsByCallSid,
+  sessionsByCallSid, helloFaceTimings, wavDurationMs,
   noteCallerHeard, limitSay, limitHangUp, armCallLimits, stopCallLimits, keepListening,
   looksLikeEcho, limitLineEcho, limitLineActive, utteranceIsEcho, sttSay,
 };
