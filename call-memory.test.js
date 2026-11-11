@@ -101,8 +101,10 @@ test('every call-lane fetch is fire-and-forget and asks for the call wait', () =
     assert.ok(!/\bawait\b/.test(line), `call fetch must not be awaited (line ${i + 1})`);
     assert.ok(!/=\s*(session\.cfg|global\._vsConfig|cfg)\.fetchCallMemories/.test(line), `call fetch result must not be kept to await later (line ${i + 1})`);
     assert.ok(/call:\s*true/.test(line), `call fetch must ask for the call wait (line ${i + 1})`);
-    assert.ok(/^\s*\.then\(/.test(lines[i + 1]), `call fetch continues in .then (line ${i + 2})`);
-    assert.ok(/beginCallMemoryFetch\(session\)/.test(lines[i - 1]), `call fetch takes a ticket (line ${i})`);
+    /* Nov 11 2026 review fix: the fetch now sits inside a .then that first waits on the call gate
+     * (session.callerCheck), so the ticket and the .then are a few lines away. */
+    assert.ok(lines.slice(i + 1, i + 5).some((l) => /^\s*\.then\(/.test(l)), `call fetch continues in .then (line ${i + 2})`);
+    assert.ok(lines.slice(Math.max(0, i - 5), i).some((l) => /beginCallMemoryFetch\(session\)/.test(l)), `call fetch takes a ticket (line ${i})`);
   }
   // The bundle is only ever READ synchronously off the session.
   assert.ok(!/await[^\n]*callerMemories/.test(VOICE), 'nothing awaits callerMemories');

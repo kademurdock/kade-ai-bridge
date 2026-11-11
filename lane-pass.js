@@ -14,6 +14,10 @@
  *   app-voice  this session opened with a valid web voice ticket for this email (verifyWebTicket).
  *   phone      a Twilio call; for an inbound call, the number Twilio says it came from, so the site
  *              can pair that number with a spoken code. A phone pass never says "signed in".
+ *              Review fix (Nov 11 2026): the number rides only when the call socket gate PROVED the
+ *              socket is Twilio's stream for that call (a ticket minted for a signed webhook, or
+ *              Twilio's own word): session.callerVerified. With the gate in log mode a forged
+ *              socket still gets through, so its claimed `from` must never become a pairing.
  * The signature is over a fixed prefix plus the body, so a pass can never be passed off as a web
  * voice ticket, nor a ticket as a pass. It lives two minutes.
  *
@@ -88,7 +92,8 @@ function claimFor(session) {
     return { lane: 'app-voice', email: session.lcEmail, agentId };
   }
   const inbound = session.outbound !== true && session.twilioOutbound !== true;
-  return { lane: 'phone', num: inbound ? session.from : undefined, email: session.lcEmail || undefined, agentId };
+  const proven = session.callerVerified === true;
+  return { lane: 'phone', num: inbound && proven ? session.from : undefined, email: session.lcEmail || undefined, agentId };
 }
 
 /** The `messages` entry that carries the pass, or null (switch off, no secret, nothing to say). */

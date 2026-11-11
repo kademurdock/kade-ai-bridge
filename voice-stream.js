@@ -2318,7 +2318,9 @@ async function handleUtterance(session, text) {
         // Nov 10 2026: NOT awaited. The ticket makes this fetch the newest, so
         // the pickup fetch for the previous agent cannot land on top of it.
         const memTicket = beginCallMemoryFetch(session);
-        session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id, { nudges: true, call: true })
+        // Nov 11 2026 review fix: never for a socket the call gate proved is not a real call.
+        Promise.resolve(session.callerCheck || true)
+          .then((ok) => (ok ? session.cfg.fetchCallMemories({ email: session.lcEmail || (su && su.lcEmail), phone: session.from }, agent.id, { nudges: true, call: true }) : ''))
           .then((text) => { applyCallMemories(session, memTicket, text, { clearOnEmpty: true }); })
           .catch(() => {});
       }
@@ -3804,6 +3806,12 @@ function attachMediaStreams(server, users, cfg) {
           // call this bridge answered or placed gets a session. Mode `log` (the default) changes
           // nothing and waits for nothing: the check runs beside the call and only writes a line.
           const socketGate = global._vsConfig.callSocketGate;
+          // Nov 11 2026 review fix (home agent card 2): what the gate PROVED about this socket.
+          // callerProof is 'ticket' or 'twilio' only when the socket is Twilio's stream for this call;
+          // provenFake when the gate showed it is not (in log mode it is still let through).
+          let callerProof = null;
+          let provenFake = false;
+          let lateCheck = null;
           if (socketGate && socketGate.mode !== 'off') {
             const claim = {
               ticket: params.ticket, callSid, from, outbound: params.outbound === '1',
@@ -3815,7 +3823,8 @@ function attachMediaStreams(server, users, cfg) {
                 verdict = await socketGate.settle(claim, verdict.why);
                 if (streamOver || ws.readyState !== WebSocket.OPEN) return; // gone while we asked
               } else {
-                socketGate.settle(claim, verdict.why).then((late) => socketGate.record(late, callSid)).catch(() => {});
+                lateCheck = socketGate.settle(claim, verdict.why).then((late) => { socketGate.record(late, callSid); return late; });
+                lateCheck.catch(() => {});
                 verdict = null;
               }
             }
@@ -3823,6 +3832,8 @@ function attachMediaStreams(server, users, cfg) {
               try { ws.close(1008, 'not a call'); } catch {}
               return;
             }
+            if (verdict && verdict.verdict === 'pass' && (verdict.how === 'ticket' || verdict.how === 'twilio')) callerProof = verdict.how;
+            if (verdict && verdict.verdict === 'refuse') provenFake = true;
           }
           const user   = users.get(from);
           session = new CallSession(streamSid, callSid, from, user, ws, global._vsConfig);
@@ -3859,6 +3870,19 @@ function attachMediaStreams(server, users, cfg) {
           // very long, always announced first (call-limits.js). Outbound calls carry Twilio's own
           // timeLimit and are not armed.
           if (params.outbound !== '1' && !outboundCtx) armCallLimits(session);
+          {
+            const s = session;
+            s.callerVerified = Boolean(callerProof);
+            // The caller's memories are fetched only for a socket the gate has not proved fake
+            // (a ticket check is immediate; Twilio's word comes within its lookup time). A real
+            // call whose ticket failed still gets them once Twilio vouches; no reply waits on this.
+            s.callerCheck = lateCheck
+              ? lateCheck.then((late) => {
+                if (late && late.verdict === 'pass' && late.how === 'twilio') s.callerVerified = true;
+                return !(late && late.verdict === 'refuse');
+              }).catch(() => true)
+              : Promise.resolve(!provenFake);
+          }
           console.log(`[voice-stream] START sid=${streamSid} from=${from} user=${user?.name || 'unknown'}${outboundCtx ? ' OUTBOUND' : ''}`);
 
           // July 12 2026: register by callSid so async callbacks (AMD) can
@@ -3905,7 +3929,14 @@ function attachMediaStreams(server, users, cfg) {
             // lands, even after the greeting, the next turn carries it
             // (memoryLine reads session.callerMemories fresh every turn).
             const memTicket = beginCallMemoryFetch(session);
-            global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, session.agentId, { nudges: !session.outbound, call: true })
+            // Nov 11 2026 review fix: never for a socket the call gate proved is not a real call.
+            const pickup = session;
+            Promise.resolve(pickup.callerCheck || true)
+              .then((ok) => {
+                if (ok) return global._vsConfig.fetchCallMemories({ email: user?.lcEmail, phone: from }, pickup.agentId, { nudges: !pickup.outbound, call: true });
+                console.warn('[voice-stream] caller memories withheld: the call gate says this socket is not a real call');
+                return '';
+              })
               .then((text) => {
                 const got = applyCallMemories(session, memTicket, text);
                 if (got.applied) console.log(`[voice-stream] caller memories attached for ${from} (${text.length} chars, ${got.ms} ms)`);

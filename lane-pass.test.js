@@ -46,19 +46,24 @@ test('the same vectors the site test checks', () => {
 });
 
 test('a phone pass carries the number for an inbound call only, and never says signed in', () => {
-  const inbound = siteVerify(lp.mintLanePass(lp.claimFor({ surface: 'phone', from: '+15550100123', agentId: 'a' }), ENV, NOW), 'offline-test-secret', NOW);
+  const inbound = siteVerify(lp.mintLanePass(lp.claimFor({ surface: 'phone', from: '+15550100123', agentId: 'a', callerVerified: true }), ENV, NOW), 'offline-test-secret', NOW);
   assert.equal(inbound.lane, 'phone');
   assert.equal(inbound.num, '+15550100123');
+  /* Review fix: a socket the call gate did not prove (log mode lets a forged one through) never
+   * sends its claimed number, so it can never pair or be taken for a paired phone. */
+  const unproven = siteVerify(lp.mintLanePass(lp.claimFor({ surface: 'phone', from: '+15550100123', agentId: 'a' }), ENV, NOW), 'offline-test-secret', NOW);
+  assert.equal(unproven.lane, 'phone');
+  assert.equal(unproven.num, undefined);
   assert.equal(inbound.email, undefined, 'an unregistered number names nobody');
   for (const s of [
-    { surface: 'phone', from: '+15550100123', outbound: true },
-    { surface: 'phone', from: '+15550100123', twilioOutbound: true },
+    { surface: 'phone', from: '+15550100123', outbound: true, callerVerified: true },
+    { surface: 'phone', from: '+15550100123', twilioOutbound: true, callerVerified: true },
   ]) {
     const p = siteVerify(lp.mintLanePass(lp.claimFor(s), ENV, NOW), 'offline-test-secret', NOW);
     assert.equal(p.lane, 'phone');
     assert.equal(p.num, undefined, 'a call the platform placed has no caller number to pair');
   }
-  const odd = siteVerify(lp.mintLanePass(lp.claimFor({ surface: 'phone', from: 'unknown' }), ENV, NOW), 'offline-test-secret', NOW);
+  const odd = siteVerify(lp.mintLanePass(lp.claimFor({ surface: 'phone', from: 'unknown', callerVerified: true }), ENV, NOW), 'offline-test-secret', NOW);
   assert.equal(odd.num, undefined, 'only a real E.164 number is sent');
 });
 
@@ -141,4 +146,13 @@ test('askStreamBody puts the pass first and leaves the words the proxy builds un
   assert.equal(none.messages, messages);
   const boom = run({ lanePassEntry: () => { throw new Error('x'); } })({}, { agentId: 'k', messages });
   assert.equal(boom.messages, messages);
+});
+
+test('review fix: voice-stream marks a caller proved only by the call gate, and holds memories from a proven fake', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'voice-stream.js'), 'utf8');
+  assert.match(src, /if \(verdict && verdict\.verdict === 'pass' && \(verdict\.how === 'ticket' \|\| verdict\.how === 'twilio'\)\) callerProof = verdict\.how;/);
+  assert.match(src, /s\.callerVerified = Boolean\(callerProof\);/);
+  assert.match(src, /if \(late && late\.verdict === 'pass' && late\.how === 'twilio'\) s\.callerVerified = true;/);
+  assert.match(src, /: Promise\.resolve\(!provenFake\);/);
+  assert.equal((src.match(/Promise\.resolve\((?:pickup|session)\.callerCheck \|\| true\)/g) || []).length, 2, 'both memory fetches wait on the gate');
 });
