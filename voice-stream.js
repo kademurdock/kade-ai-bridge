@@ -26,6 +26,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const { speechMetadata, sendCharacterMetadata } = require('./character-audio');
 const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
+const lanePass = require('./lane-pass'); // Nov 11 2026: signed-in app voice vs a phone call, told to the site
 const path = require('path');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1095,7 +1096,19 @@ function streamPost(urlStr, headers, body) {
 // metadata.viaFork (true only for these sessions) is exact: the fork zeroes
 // that call's estimate because the real turns already billed the caller.
 function askStreamBody(session, fields) {
-  return session && session.billCaller === true ? { ...fields, billCaller: true } : fields;
+  const out = session && session.billCaller === true ? { ...fields, billCaller: true } : fields;
+  return withLanePass(session, out);
+}
+
+// Nov 11 2026 (home agent card 2): every ask-stream turn tells the site how it
+// arrived (lane-pass.js): signed-in app voice, or a phone call with the caller's
+// number. A pass the site cannot use changes nothing; a failure here sends the
+// turn exactly as before. KADE_LANE_PASS=0 stops it.
+function withLanePass(session, fields) {
+  let entry = null;
+  try { entry = lanePass.lanePassEntry(session); } catch { entry = null; }
+  if (!entry || !fields || !Array.isArray(fields.messages)) return fields;
+  return { ...fields, messages: [entry, ...fields.messages] };
 }
 
 // ── Per-call session ──────────────────────────────────────────────────────────

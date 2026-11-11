@@ -25,11 +25,13 @@ function grab(anchor, endAnchor, { inclusive = true } = {}) {
 }
 
 const ASK_STREAM_BODY = grab('function askStreamBody(session, fields) {', '\n}\n');
+const WITH_LANE_PASS = grab('function withLanePass(session, fields) {', '\n}\n');
 
 function context(extra = {}) {
-  const ctx = { String, Boolean, Array, Object, Math, Date, Number, JSON, console: { log() {}, warn() {} }, process: { env: {} }, ...extra };
+  /* Nov 11 2026: askStreamBody also adds the lane pass (lane-pass.js); here it has nothing to say. */
+  const ctx = { String, Boolean, Array, Object, Math, Date, Number, JSON, console: { log() {}, warn() {} }, process: { env: {} }, lanePass: { lanePassEntry: () => null }, ...extra };
   vm.createContext(ctx);
-  vm.runInContext(ASK_STREAM_BODY + '\nthis.askStreamBody = askStreamBody;', ctx);
+  vm.runInContext(ASK_STREAM_BODY + '\n' + WITH_LANE_PASS + '\nthis.askStreamBody = askStreamBody;', ctx);
   return ctx;
 }
 
