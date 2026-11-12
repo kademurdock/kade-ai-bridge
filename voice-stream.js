@@ -5181,6 +5181,9 @@ function attachWebVoice(server) {
         // Manual Stop button: same path as a voice barge-in. The client
         // already flushed its local queue; this kills generation + marks
         // the turn so the next utterance is a clean new turn.
+        // Nov 2026 (DESC-2): while the Spotter has the call, Stop ends the Spotter's current turn too
+        // (Live audio never sets isSpeaking/busy, so the branch below did nothing for it).
+        if (session.liveOn) { try { videoLive.muteLiveTurn(session); } catch {} }
         if (session.isSpeaking || session.busy) {
           session.bargedIn = true;
           bargeIn(session);
@@ -5223,6 +5226,13 @@ function attachWebVoice(server) {
           try { if (session.videoOn) { videoSight.stopVideo(session, 'live-handoff'); postVideoUsage(session); session.videoSeconds = 0; session.videoCostUSD = 0; } } catch {}
         };
         videoLive.handleLiveMsg(session, msg, speak);
+        return;
+      }
+      if (msg.type === 'camera') {
+        // Nov 2026 (DESC-4): the phone's camera stopped (it locked, or another
+        // app took it) or came back. Only the Live lane needs telling: the
+        // snapshot lane already skips frames older than 20 s.
+        if (session.liveOn) { try { videoLive.noteCamera(session, msg.on === true); } catch {} }
         return;
       }
       if (msg.type === 'frame') {

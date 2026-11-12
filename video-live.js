@@ -666,6 +666,7 @@ function adoptResumed(session, ngws) {
   session._livePendingWs = null;
   session._liveOldClosed = false;
   session._liveWs = ngws;
+  endLiveTurn(session); // DESC-2: the old connection's turn end will never be read (see handleGoogleMessage)
   session._liveResumes = Number(session._liveResumes || 0) + 1;
   // The old connection's cost is settled as its own segment, the new one starts.
   try { liveBilling.endSegment(session); liveBilling.flush(session, 'resume').catch(() => {}); liveBilling.startSegment(session); } catch {}
@@ -688,6 +689,40 @@ function resumeFailed(session, ngws, why) {
     session._liveOldClosed = false;
     stopLive(session, 'closed');
   }
+}
+
+/* Stop pressed while the Spotter talks (Nov 2026, audit DESC-2). The client flushed what it had,
+ * but Google keeps streaming the turn, which used to start playing again a moment later. The rest
+ * of the open turn is dropped here. Only an open turn is muted, so a Stop between turns never
+ * swallows the next answer. Proactive audio may still start a new turn later; "stop" said aloud
+ * still works too.
+ *
+ * The mute fails open. Audio parts inside one turn arrive back to back, so a gap longer than
+ * LIVE_TURN_GAP_MS (default 4000) between two audio parts means a new turn: a mute whose turn
+ * end was lost lifts there instead of silencing the next answer. LIVE_STOP_MUTE=0 turns the
+ * mute off (Stop then does what it did before: the client's own flush only). */
+const LIVE_TURN_GAP_MS = () => {
+  const n = parseInt(process.env.LIVE_TURN_GAP_MS || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 4000;
+};
+
+/** The Spotter's turn is over (or its connection is gone): nothing is open, nothing is muted. */
+function endLiveTurn(session) {
+  session._liveTurnOpen = false;
+  session._liveMuted = false;
+}
+
+/** Returns true when an open Spotter turn was muted. */
+function muteLiveTurn(session) {
+  if (process.env.LIVE_STOP_MUTE === '0') return false;
+  if (!session.liveOn || !session._liveTurnOpen) return false;
+  if (Date.now() - (session._liveAudioAt || 0) > LIVE_TURN_GAP_MS()) { endLiveTurn(session); return false; }
+  if (!session._liveMuted) {
+    session._liveMuted = true;
+    console.log(`[video-live] Stop pressed: muting the rest of this turn (user=${session.userId})`);
+  }
+  try { session.sendClear && session.sendClear(); } catch {}
+  return true;
 }
 
 function handleGoogleMessage(session, raw, gws) {
@@ -758,6 +793,7 @@ function handleGoogleMessage(session, raw, gws) {
     /* Ready the silence watchdog. It arms on the caller's first speech (see
      * noteCallerSpoke), is cleared by the first model audio, and fires at
      * most once per call. */
+    endLiveTurn(session); // DESC-2
     session._liveFirstAudioAt = 0;
     session._liveSilenceWarned = false;
     session._liveCallerFirstAt = 0;
@@ -778,6 +814,15 @@ function handleGoogleMessage(session, raw, gws) {
   if (Array.isArray(parts)) {
     for (const p of parts) {
       if (p.inlineData && p.inlineData.data) {
+        // DESC-2: track the open turn; a Stop mutes the rest of it.
+        const audioAt = Date.now();
+        if (session._liveMuted && audioAt - (session._liveAudioAt || 0) > LIVE_TURN_GAP_MS()) {
+          console.warn(`[video-live] Stop mute outlived its turn; unmuting (user=${session.userId})`);
+          session._liveMuted = false;
+        }
+        session._liveAudioAt = audioAt;
+        session._liveTurnOpen = true;
+        if (session._liveMuted) continue; // Stop was pressed: the rest of this turn is not played
         if (!session._liveFirstAudioAt) {
           session._liveFirstAudioAt = Date.now();
           if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
@@ -803,7 +848,7 @@ function handleGoogleMessage(session, raw, gws) {
   // handleUtterance) so the post-call transcript/mint/memory see both halves.
   const sc = msg.serverContent;
   if (sc) {
-    if (sc.outputTranscription && typeof sc.outputTranscription.text === 'string') {
+    if (sc.outputTranscription && typeof sc.outputTranscription.text === 'string' && !session._liveMuted) {
       session._liveModelText = (session._liveModelText || '') + sc.outputTranscription.text;
     }
     if (sc.turnComplete || sc.generationComplete || sc.interrupted) {
@@ -825,6 +870,7 @@ function handleGoogleMessage(session, raw, gws) {
           });
         } catch {}
       }
+      endLiveTurn(session); // DESC-2
     }
     if (sc.interrupted) {
       // SPOTTER GREETING GRACE (July 21 2026, same ask as the phone-greeting
@@ -865,14 +911,56 @@ function forwardAudio(session, b64pcm16k, pcm) {
 function forwardFrame(session, b64jpeg) {
   const gws = session._liveWs;
   if (!session.liveOn || !gws || gws.readyState !== 1) return;
+  // Nov 2026 (audit DESC-3): never forward something that is not a picture the apps could have made
+  // (they send 768 px JPEGs, at most about 450 KB of base64; the snapshot lane caps at 400 KB), and
+  // never queue a picture behind a backed-up Google socket. The next one is newer.
+  // LIVE_FRAME_GUARD=0 forwards every frame as before.
+  if (process.env.LIVE_FRAME_GUARD !== '0') {
+    const tooBig = typeof b64jpeg !== 'string' || b64jpeg.length > 600 * 1024;
+    if (tooBig || gws.bufferedAmount > 512 * 1024) {
+      if (!session._liveFrameDropLogged) {
+        session._liveFrameDropLogged = true;
+        console.log(`[video-live] dropped a camera frame (${tooBig ? 'not a string or over 600 KB' : 'Google socket backed up'}); later drops on this call are not logged`);
+      }
+      return;
+    }
+  }
+  session._liveCameraLostAt = 0; // DESC-4: a picture arrived, so the camera is back: re-arm the note
   try {
     gws.send(JSON.stringify({ realtimeInput: { video: { mimeType: 'image/jpeg', data: b64jpeg } } }));
   } catch { /* fail-soft */ }
 }
 
+/* CAMERA LOST (Nov 2026, audit DESC-4). When the phone locks, iOS stops the camera while the
+ * call's audio carries on. Gemini keeps the last pictures in its context and would describe them
+ * as now. Told once per stop, it says so in its own voice (the app is in the background, where
+ * VoiceOver says nothing). New frames after the camera returns speak for themselves and re-arm
+ * the note. Sent as realtimeInput.text: on the 3.x Live models clientContent is for seeding
+ * history, not for a turn in the middle of a call. Not yet tried against Google: replay on
+ * staging first. Kill switch: LIVE_CAMERA_NOTE=0. LIVE_CAMERA_NOTE_VIA=client sends the
+ * clientContent form instead. */
+const LIVE_CAMERA_LOST =
+  '(Automatic note from the app, not spoken by me: my camera just stopped sending pictures, maybe because my phone locked. ' +
+  'You cannot see anything right now. Tell me that in one short sentence, and do not describe things ' +
+  'or give directions from earlier pictures until new ones arrive.)';
+function noteCamera(session, on) {
+  if (on) { session._liveCameraLostAt = 0; return false; }
+  if (process.env.LIVE_CAMERA_NOTE === '0') return false;
+  const gws = session._liveWs;
+  if (!session.liveOn || !gws || gws.readyState !== 1 || session._liveCameraLostAt) return false;
+  session._liveCameraLostAt = Date.now();
+  const payload = process.env.LIVE_CAMERA_NOTE_VIA === 'client'
+    ? { clientContent: { turns: [{ role: 'user', parts: [{ text: LIVE_CAMERA_LOST }] }], turnComplete: true } }
+    : { realtimeInput: { text: LIVE_CAMERA_LOST } };
+  try { gws.send(JSON.stringify(payload)); } catch { /* fail-soft */ }
+  console.log(`[video-live] the caller's camera stopped; the Spotter was told (user=${session.userId})`);
+  return true;
+}
+
 function stopLive(session, reason) {
   if (session._liveTick) { clearInterval(session._liveTick); session._liveTick = null; }
   if (session._liveWatch) { clearTimeout(session._liveWatch); session._liveWatch = null; }
+  session._liveCameraLostAt = 0; // DESC-4: the next "live on" starts with the note armed
   // Sep 29 2026: a resumed connection still being set up goes with the call,
   // and the handle is this call's only: the next "live on" starts fresh.
   if (session._liveResumeTimer) { clearTimeout(session._liveResumeTimer); session._liveResumeTimer = null; }
@@ -887,6 +975,7 @@ function stopLive(session, reason) {
     try { session.history.push({ role: 'assistant', content: session._liveModelText.trim(), lane: 'live' }); } catch {}
   }
   session._liveModelText = '';
+  endLiveTurn(session); // DESC-2
   if (session.liveOn && session._liveTickAt) {
     const secs = (Date.now() - session._liveTickAt) / 1000;
     addSeconds(session.userId, secs);
@@ -991,6 +1080,7 @@ function handleLiveMsg(session, msg, speak) {
 
 module.exports = {
   shouldWarnLiveSilence, noteCallerWords,
-  LIVE_SILENT_LINE, enabled, handleLiveMsg, forwardAudio, forwardFrame, stopLive, minutesLeft, effectiveSpotter };
+  LIVE_SILENT_LINE, LIVE_CAMERA_LOST, enabled, handleLiveMsg, forwardAudio, forwardFrame, noteCamera, stopLive, minutesLeft, effectiveSpotter,
+  muteLiveTurn };
 // Exported for the pre-push test harness only — not called across modules.
 module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive, liveSilenceDueAt, pcmRms, noteCallerAudio };
