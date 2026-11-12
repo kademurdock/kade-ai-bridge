@@ -4950,6 +4950,17 @@ function attachWebVoice(server) {
           } catch {}
           return;
         }
+        /* SEC-7 (Nov 12 2026): a ringOnly ticket was minted for answering one ring and nothing else.
+         * The ring check below then binds it to that character (canAnswerCallRing compares t.agentId).
+         * Ship this BEFORE the fork's KADE_WEB_VOICE_RING_TICKETS=1. No switch: no client sends
+         * ringOnly tickets today, so this refuses nothing until the fork mints them. */
+        if (t.ringOnly === true && !Object.prototype.hasOwnProperty.call(msg, 'callRingId')) {
+          try {
+            ws.send(JSON.stringify({ type: 'error', message: 'This incoming call has expired or was already answered.' }));
+            ws.close(4403, 'ring only');
+          } catch {}
+          return;
+        }
         if (Object.prototype.hasOwnProperty.call(msg, 'callRingId') &&
             (msg.spotterDirect === true || typeof cfg.canAnswerCallRing !== 'function' ||
              !cfg.canAnswerCallRing(msg.callPlanId, t.uid, t.agentId, msg.callRingId))) {
