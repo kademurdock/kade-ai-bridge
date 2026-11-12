@@ -870,8 +870,9 @@ app.get('/users', (req, res) => {
 });
 
 // ── Push notifications (APNs) ───────────────────────────────────────────────────
-// Device tokens come from the native iOS app (POST /push-register, no secret —
-// a device token carries no privileges). Sending is admin-only (BRIDGE_SECRET),
+// Device tokens come from the apps (POST /push-register). Registering a bare token needs
+// nothing; LINKING it to a user needs that user's own access token (push-auth.js,
+// PUSH_REGISTER_AUTH=off|log|enforce, PUSH_REGISTER_ENFORCE_FROM). Sending is admin-only (BRIDGE_SECRET),
 // except the guardrailed agent path (see runNotify below).
 // APNs auth is an ES256 JWT signed with the .p8 key; built-ins only (http2+crypto).
 //
@@ -969,6 +970,12 @@ function sendApnsPush(deviceToken, title, body, opts = {}) {
  * her Firebase project) and everything else through APNs. Result shape is
  * identical, so every call site keeps its 200-counts and 410-prune as is. */
 const fcm = require('./fcm');
+const pushAuth = require('./push-auth'); // IOS-19 (Nov 12 2026): a device links only to the user its token proves
+const PUSH_JWT_SECRET = process.env.LIBRECHAT_JWT_SECRET || process.env.JWT_SECRET || '';
+{
+  const from = pushAuth.enforceFromMs();
+  console.log(`[push-auth] /push-register mode ${pushAuth.pushAuthMode()}${from !== null ? `, enforce from ${new Date(from).toISOString()}` : (process.env.PUSH_REGISTER_ENFORCE_FROM ? ' (PUSH_REGISTER_ENFORCE_FROM unreadable, ignored)' : '')}${PUSH_JWT_SECRET ? '' : ' -- NO LIBRECHAT_JWT_SECRET: nothing can be verified or refused'}`);
+}
 function sendPush(deviceToken, title, body, opts = {}) {
   const meta = pushTokens.get(deviceToken);
   // Final boundary also covers broadcasts, direct-token sends and call rings.
@@ -990,7 +997,7 @@ function sendPush(deviceToken, title, body, opts = {}) {
 app.options('/push-register', (req, res) => {
   res.set('Access-Control-Allow-Origin', 'https://kademurdock.com');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.sendStatus(204);
 });
 app.post('/push-register', (req, res) => {
@@ -1003,15 +1010,26 @@ app.post('/push-register', (req, res) => {
   const isAndroid = platformIn === 'android' || fcm.looksLikeFcmToken(rawToken);
   const token = isAndroid ? rawToken : rawToken.toLowerCase();
   if (isAndroid ? !fcm.looksLikeFcmToken(token) : !/^[0-9a-f]{16,256}$/.test(token)) return res.status(400).json({ error: 'invalid token' });
-  const userId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
+  const claimedUserId = req.body && req.body.userId ? String(req.body.userId).trim().slice(0, 64) : '';
   // An explicit null/empty userId means sign-out. Legacy callers that omit
   // the field still preserve their link. Remove signed-out tokens entirely
   // so neither personal messages nor broadcasts reach a logged-out device.
-  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'userId') && !userId) {
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'userId') && !claimedUserId) {
     pushTokens.delete(token);
     savePushTokens();
     return res.json({ ok: true, count: pushTokens.size, linked: false, unregistered: true });
   }
+  // IOS-19: the body's userId is only a claim. The link goes to the user the bearer proves.
+  const link = pushAuth.decidePushLink({
+    bearer: req.headers && req.headers.authorization,
+    bodyUserId: claimedUserId,
+    secret: PUSH_JWT_SECRET,
+  });
+  if (link.how === 'would-refuse' || link.how === 'refused' || link.how === 'unverified' || link.mismatch) {
+    console.warn(`[push-auth] ${link.how === 'jwt' ? 'body userId differs from the signed-in user; linked to the signed-in user' : link.how} (${link.reason || 'mismatch'}) platform=${platformIn}`);
+  }
+  if (link.refuse) return res.status(401).json({ error: 'sign in again to link this device' });
+  const userId = link.userId;
   const platform = isAndroid ? 'android' : platformIn;
   const existing = pushTokens.get(token);
   // Part 75 (Aug 21 2026): the app's Settings ringtone picker rides the same
