@@ -241,6 +241,7 @@ const callLimits = require('./call-limits'); // Nov 10 2026: inbound phone calls
 const sttKeeper = require('./stt-keeper');   // Nov 10 2026: a dropped Deepgram socket is opened again, and the caller is told
 const { beginCallMemoryFetch, applyCallMemories } = require('./call-memory'); // Nov 10 2026: a late memory bundle still lands, and only the newest one
 const heardCut = require('./heard-cut'); // Nov 11 2026: a barged-in turn keeps only what was heard (BRIDGE_HEARD_ONLY=0 = whole reply)
+const turnGrace = require('./turn-grace'); // Nov 12 2026: adaptive post-turn grace (FLUX_ADAPTIVE_GRACE, shadow by default)
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1565,7 +1566,22 @@ function openDeepgramFlux(session, key) {
         if (!isEcho) handleUtterance(session, full);
         else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${full.slice(0, 60)}"`);
       };
-      const grace = parseInt(process.env.FLUX_POST_TURN_GRACE_MS || '900', 10);
+      // Nov 12 2026 (audit phase 4, pick 1): an adaptive grace, SHADOW by default (turn-grace.js).
+      // FLUX_ADAPTIVE_GRACE unset/shadow = today's grace plus one log line, 1 = use it, 0 = off.
+      const baseGrace = parseInt(process.env.FLUX_POST_TURN_GRACE_MS || '900', 10);
+      // A carry plus new words means they resumed inside the grace: remember it for this call.
+      if (carry && turnText) session._graceStitches = (session._graceStitches || 0) + 1;
+      const picked = turnGrace.pick({
+        text: full,
+        eotConfidence: msg.end_of_turn_confidence,
+        base: baseGrace,
+        stitches: session._graceStitches || 0,
+        capMs: parseInt(process.env.FLUX_CARRY_MAX_MS || '2500', 10),
+      });
+      const grace = picked.ms;
+      if (picked.mode !== 'off') {
+        console.log(`[timing ${session.streamSid}] grace ${picked.ms}ms (${picked.cls}, would be ${picked.wouldBe}ms, conf ${msg.end_of_turn_confidence === undefined ? 'absent' : msg.end_of_turn_confidence}, stitches ${session._graceStitches || 0}, ${picked.mode})`);
+      }
       if (grace > 0) {
         // KADE July 22 2026 — THE SPEED BUG. The 900ms stitch-grace was
         // UNBOUNDED: any noise that opened a turn (speakerphone, the
