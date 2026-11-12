@@ -240,6 +240,7 @@ const liveBilling = require('./live-billing'); // Part 295: the Spotter's real c
 const callLimits = require('./call-limits'); // Nov 10 2026: inbound phone calls end by themselves, announced first
 const sttKeeper = require('./stt-keeper');   // Nov 10 2026: a dropped Deepgram socket is opened again, and the caller is told
 const { beginCallMemoryFetch, applyCallMemories } = require('./call-memory'); // Nov 10 2026: a late memory bundle still lands, and only the newest one
+const heardCut = require('./heard-cut'); // Nov 11 2026: a barged-in turn keeps only what was heard (BRIDGE_HEARD_ONLY=0 = whole reply)
 
 // KADE July 4 2026 ("debug that last conversation"): live call 17:16 — Wild
 // Blanks dealt fine (tool call), then "Five" got THREE consecutive turns with
@@ -1213,6 +1214,7 @@ class CallSession {
   }
 
   sendClear() {
+    this._lastClearAt = Date.now(); // heard-cut: when the caller's audio stopped
     this.twSend({ event: 'clear', streamSid: this.streamSid });
   }
 }
@@ -1229,7 +1231,76 @@ function bargeIn(session) {
   session.llmAbort = true;
   session.isSpeaking = false;
   session.lastSpokAt = Date.now(); // echo window measures from the real stop, not a stale timestamp
+  // Nov 11 2026 (heard-cut): a turn that already finished, whose last audio was still playing.
+  const done = session._lastCut;
+  if (done && done.doneAt && !done.stopAt && Date.now() - done.doneAt < 30000 && heardCut.heardOnlyOn()) {
+    done.endedAt = Date.now();
+    applyHeardCut(session, done);
+  }
   armBargeRecovery(session);
+}
+
+// ── Keep only what was heard (Nov 11 2026, heard-cut.js) ──────────────────────
+// An interrupted turn used to go into session.history whole: memory, the next model turn and the
+// Call History transcript (the fork's stored conversation is minted from that transcript) all
+// believed the caller heard every word. Now the turn is stored from the pieces whose audio started:
+//   phone   -> Twilio marks after each piece say when it finished playing; the cut piece is timed
+//              from the end of the piece before it (or from when it was sent) to the clear;
+//   app/web -> the client's {type:'heard', seq, ms} report after a clear names the clip that was
+//              playing and how far it got; with no report yet, the bridge's own playhead guess.
+// A report that lands after the turn was stored corrects it in place (amendHeardCut).
+function heardStopAt(session, cut) {
+  // The clear that stopped the audio. A clear from BEFORE the first piece was sent was the
+  // thinking filler being cut for the real reply, not the interruption.
+  const firstSend = cut.units.reduce((m, u) => (u.sendAt && (!m || u.sendAt < m) ? u.sendAt : m), 0);
+  const clearAt = session._lastClearAt || 0;
+  if (clearAt >= cut.startedAt && (!firstSend || clearAt >= firstSend)) return clearAt;
+  return cut.endedAt;
+}
+
+function applyHeardCut(session, cut) {
+  try {
+    if (!cut.endedAt) cut.endedAt = Date.now();
+    if (!cut.stopAt) cut.stopAt = heardStopAt(session, cut);
+    const report = session.media === 'wav' ? (session._heardReport || null) : null;
+    if (session.media === 'wav') heardCut.placeWeb(cut.units, report, cut.stopAt);
+    else heardCut.placePhone(cut.units, cut.stopAt);
+    const r = heardCut.buildHeardText(cut.units, { lostText: cut.lostText });
+    cut.reportUsed = report && report.at >= cut.stopAt ? report : null;
+    if (r.cut) {
+      cut.entry.content = r.text;
+      cut.entry.heardCut = true;
+      cut.entry.generatedChars = cut.whole.length; // billing still counts what the model wrote
+    } else {
+      cut.entry.content = cut.whole;
+      delete cut.entry.heardCut;
+      delete cut.entry.generatedChars;
+    }
+    const heardPieces = cut.units.filter((u) => u.heard && u.heard !== 'none').length;
+    console.log(`[voice-stream] heard-cut ${session.streamSid}: ${heardPieces}/${cut.units.length} pieces started, cut=${r.cut}, ${cut.reportUsed ? 'client report' : session.media === 'wav' ? 'playhead guess' : 'twilio marks/clock'}, kept ${cut.entry.content.length}/${cut.whole.length} chars`);
+  } catch (e) {
+    cut.entry.content = cut.whole; // never lose the turn over this
+    console.warn('[voice-stream] heard-cut failed, whole reply kept:', e.message);
+  }
+}
+
+// A client heard report that arrived after its turn was stored: correct that entry in place.
+function amendHeardCut(session) {
+  const cut = session._lastCut;
+  const report = session._heardReport;
+  if (!cut || !cut.entry || !report || session.media !== 'wav') return;
+  if (!cut.stopAt || report.at < cut.stopAt || report.at - cut.stopAt > 15000) return;
+  if (cut.reportUsed === report) return;
+  applyHeardCut(session, cut);
+}
+
+// Twilio echoes a mark once the audio sent before it has PLAYED (and returns any unplayed marks
+// at once after a clear, which applyHeardCut ignores by time).
+function noteTwilioMark(session, name) {
+  const units = session && session._turnUnits;
+  if (!units || typeof name !== 'string' || !name.startsWith('kh-')) return;
+  const u = units.find((x) => x.markName === name);
+  if (u && !u.markAt) u.markAt = Date.now();
 }
 
 // ── False-barge-in recovery (KADE July 3 2026 night, "she died mid-blackjack") ──
@@ -2532,6 +2603,14 @@ async function streamReply(session, userText) {
   const streamer = new SentenceStreamer();
   let fullReply = '';
   let playChain = Promise.resolve();
+  // Nov 11 2026 (heard-cut.js): every piece handed to playback this turn, in order, with where its
+  // audio went; and whether the reply had text that never became a piece. A barged-in turn is
+  // stored from these, not from fullReply. session._turnUnits lets the Twilio mark handler find them.
+  const turnUnits = [];
+  const turnStartedAt = Date.now();
+  session._turnUnits = turnUnits;
+  let lostText = false;
+  let llmDone = false;
 
   // Thinking-gap filler: starts its own delay timer now; only actually speaks/
   // plays anything if the real reply hasn't produced a sentence within
@@ -2567,7 +2646,10 @@ async function streamReply(session, userText) {
   const TURN_SPOKEN_CAP = parseInt(process.env.PHONE_TURN_SPOKEN_CAP || '10000', 10);
 
   const processUnit = (sentence) => {
-    if (session.llmAbort) return;
+    if (session.llmAbort) { lostText = true; return; }
+    // A stored interrupted turn ends "(cut off here; ...)"; a model that copies it must never say it.
+    if (heardCut.hasCutMark(sentence)) sentence = heardCut.stripCutMarks(sentence);
+    const unitRaw = sentence;
     if (INJECTION_ECHO_RE.test(sentence)) {
       echoDropped++;
       console.warn(`[voice-stream] INJECTION-ECHO suppressed (#${echoDropped}) for ${session.streamSid}: "${String(sentence).slice(0, 80)}"`);
@@ -2704,8 +2786,10 @@ async function streamReply(session, userText) {
         return null;
       });
     }
+    const unit = { raw: unitRaw, hasSpeech: !!(hasSpeech && synthInput) };
     playChain = playChain.then(async () => {
-      if (session.llmAbort) return;
+      if (session.llmAbort) { lostText = true; return; }
+      turnUnits.push(unit);
       if (ramblePromise) {
         const hintBuf = await ramblePromise;
         if (hintBuf && !session.llmAbort) await playBuffer(session, hintBuf);
@@ -2724,6 +2808,7 @@ async function streamReply(session, userText) {
               fillerCtx.firstAudioReady = true;
               if (session._turnT0) console.log(`[timing ${session.streamSid}] first-audio +${Date.now() - session._turnT0}ms after turn-start (web clip)`);
             }
+            if (!unit.cueAt) unit.cueAt = Date.now();
             await playBufferWav(session, webClip, { noCaption: true });
           }
           continue;
@@ -2738,6 +2823,7 @@ async function streamReply(session, userText) {
             await new Promise((r) => setTimeout(r, 100));
           }
         }
+        if (!unit.cueAt) unit.cueAt = Date.now();
         await playBuffer(session, clip);
       }
       const mulawBuf = await synthPromise;
@@ -2756,7 +2842,7 @@ async function streamReply(session, userText) {
           }
         }
         noteSpoken(session, sentence); // for echo detection, see looksLikeEcho / echoReference
-        await playBuffer(session, mulawBuf, { characterMetadata });
+        await playBuffer(session, mulawBuf, { characterMetadata, unit });
       }
       // Touch-tones AFTER the words (an IVR hears digits any time its menu is
       // talking, and this keeps "I'll press two now" honest). Phone lane only
@@ -2812,7 +2898,7 @@ async function streamReply(session, userText) {
     } catch (e) { return raw; }
   };
   streamer.on('sentence', (sentence) => {
-    if (session.llmAbort) return;
+    if (session.llmAbort) { lostText = true; return; }
     // Sound cues / tables / END CALL units are control payloads -- never scrub.
     if (sentence.indexOf('[sound:') === -1 && sentence.indexOf('[table:') === -1 && !/\[END CALL\]/i.test(sentence) && !/\[(PRESS\b|SAY NOTHING)/i.test(sentence)) {
       sentence = scrubSentence(sentence);
@@ -2891,7 +2977,7 @@ async function streamReply(session, userText) {
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
           const raw = line.slice(6).trim();
-          if (raw === '[DONE]') { clearInterval(stallCheck); resolve(); return; }
+          if (raw === '[DONE]') { if (!session.llmAbort) llmDone = true; clearInterval(stallCheck); resolve(); return; }
           try {
             const d = JSON.parse(raw);
             if (d.error) { clearInterval(stallCheck); reject(new Error(d.error)); return; }
@@ -2905,7 +2991,7 @@ async function streamReply(session, userText) {
           } catch {}
         }
       });
-      res.on('end', () => { clearInterval(stallCheck); resolve(); });
+      res.on('end', () => { if (!session.llmAbort) llmDone = true; clearInterval(stallCheck); resolve(); });
       res.on('error', (e) => { clearInterval(stallCheck); reject(e); });
       const checkAbort = setInterval(() => {
         if (session.llmAbort) { clearInterval(checkAbort); clearInterval(stallCheck); res.destroy(); resolve(); }
@@ -2930,8 +3016,25 @@ async function streamReply(session, userText) {
     try { await speak(session, line, session.voice); } catch {}
   }
   if (fullReply) {
-    session.history.push({ role: 'assistant', content: fullReply.replace(/\[END CALL\]/gi, '').trim() });
+    const whole = fullReply.replace(/\[END CALL\]/gi, '').trim();
+    const entry = { role: 'assistant', content: whole };
+    // Nov 11 2026: an interrupted turn keeps only what was heard (heard-cut.js). A turn that ran to
+    // the end is stored exactly as before.
+    if (heardCut.heardOnlyOn()) {
+      if (session.llmAbort) {
+        if (_chunkBuf) lostText = true;
+        const cut = { entry, units: turnUnits, lostText: lostText || !llmDone, startedAt: turnStartedAt, whole };
+        applyHeardCut(session, cut);
+        session._lastCut = cut;
+      } else {
+        // The turn is done but its audio may still be playing: a web turn returns WEB_LEAD_MS before
+        // the last clip ends. A barge-in in that tail still cuts this entry (see bargeIn).
+        session._lastCut = { entry, units: turnUnits, lostText: false, startedAt: turnStartedAt, whole, doneAt: Date.now() };
+      }
+    }
+    session.history.push(entry);
   }
+  if (session._turnUnits === turnUnits) session._turnUnits = null;
   const turnWasAborted = session.llmAbort;
   session.llmAbort = false;
   if (session.endCallRequested && session.outbound && session.cfg.endCall) {
@@ -3037,6 +3140,16 @@ async function playBufferWav(session, wavBuf, opts = {}) {
   if (session.sendState) session.sendState('speaking');
   sendCharacterMetadata(session, opts.characterMetadata);
   try { session.ws.send(wavBuf, { binary: true }); } catch { return; }
+  // heard-cut: every WAV sent is numbered, the client numbers every WAV it receives the same way,
+  // and its {type:'heard', seq, ms} report names a clip by that number.
+  session._webClipSeq = (session._webClipSeq || 0) + 1;
+  if (opts.unit) {
+    opts.unit.seq = session._webClipSeq;
+    opts.unit.sendAt = Date.now();
+    opts.unit.startEst = Math.max(session._webPlayheadEnd || 0, Date.now());
+    opts.unit.durMs = durMs;
+    opts.unit.timedWords = heardCut.kdtmWords(wavBuf);
+  }
   session._webPlayheadEnd = Math.max(session._webPlayheadEnd || 0, Date.now()) + durMs;
   // Return WEB_LEAD_MS early so the playChain synthesizes/ships the NEXT clip
   // while this one is still sounding (the client queues it seamlessly)...
@@ -3075,6 +3188,13 @@ async function playBuffer(session, mulawBuf, opts = {}) {
   const start = Date.now();
   let frameIdx = 0;
   const totalFrames = Math.ceil(mulawBuf.length / FRAME_BYTES);
+  const unit = opts.unit || null; // heard-cut: a piece of a reply, timed for barge-in
+  if (unit) {
+    unit.sendAt = start;
+    unit.durMs = totalFrames * 20;
+    session._markSeq = (session._markSeq || 0) + 1;
+    unit.markName = `kh-${session._markSeq}`;
+  }
 
   // PACING FIX (July 1 2026, round 2): the old loop sent ONE 20ms frame per
   // setTimeout tick, i.e. it tried to hit a 20ms deadline in real time,
@@ -3107,6 +3227,10 @@ async function playBuffer(session, mulawBuf, opts = {}) {
     if (frameIdx < totalFrames) {
       await new Promise(r => setTimeout(r, 100)); // top up the cushion ~10x/sec
     }
+  }
+  // heard-cut: a mark after the piece's last frame. Twilio echoes it when the piece has played.
+  if (unit && frameIdx >= totalFrames && !session.llmAbort && heardCut.heardOnlyOn()) {
+    session.twSend({ event: 'mark', streamSid: session.streamSid, mark: { name: unit.markName } });
   }
 
   // All frames are queued at Twilio; hold isSpeaking until they've actually
@@ -4200,6 +4324,12 @@ function attachMediaStreams(server, users, cfg) {
           break;
         }
 
+        case 'mark': {
+          // Nov 11 2026 (heard-cut): a piece of a reply finished playing on the caller's phone.
+          if (session) noteTwilioMark(session, msg.mark && msg.mark.name);
+          break;
+        }
+
         case 'dtmf': {
           // KADE July 24 2026: the phone caller's interrupt button — any
           // keypad press while the agent is talking cuts them off, same as
@@ -4368,6 +4498,7 @@ class WebCallSession extends CallSession {
   twSend() {}
   sendMedia() {}
   sendClear() {
+    this._lastClearAt = Date.now(); // heard-cut: when the client was told to stop playing
     this._webPlayheadEnd = 0;
     if (this._webTailTimer) { clearTimeout(this._webTailTimer); this._webTailTimer = null; }
     this.jsonSend({ type: 'clear' });
@@ -4461,7 +4592,9 @@ async function postVoiceChatUsage(session) {
     let prior = 0;
     for (const m of hist) {
       const len = String(m.content).length;
-      if (m.role !== 'user' && m.lane !== 'live' && !m.seeded) { inChars += OVERHEAD + prior; outChars += len; }
+      // Nov 11 2026: an interrupted turn stores only what was heard; the model still wrote it all.
+      const wrote = Math.max(len, Number(m.generatedChars) || 0);
+      if (m.role !== 'user' && m.lane !== 'live' && !m.seeded) { inChars += OVERHEAD + prior; outChars += wrote; }
       prior += len;
     }
     const inTok = Math.ceil(inChars / 4);
@@ -4817,6 +4950,20 @@ function attachWebVoice(server) {
       }
 
       if (!session) return;
+      /* Nov 11 2026 (heard-cut): after it stops playing (a 'clear', or its own Stop button) the
+       * client says how far it got: { type: 'heard', seq, ms }. seq = the number of the WAV clip
+       * that was playing, counting every WAV binary frame this socket has delivered from 1 (0 = none
+       * yet); ms = how much of that clip had played. Clips before seq played whole, clips after it
+       * never started. An interrupted turn is stored from it (see applyHeardCut). */
+      if (msg.type === 'heard') {
+        const seq = Number(msg.seq);
+        const ms = Number(msg.ms);
+        if (Number.isInteger(seq) && seq >= 0 && seq <= 1e7 && Number.isFinite(ms) && ms >= 0) {
+          session._heardReport = { seq, ms: Math.min(Math.round(ms), 600000), at: Date.now() };
+          amendHeardCut(session);
+        }
+        return;
+      }
       if (msg.type === 'barge') {
         // Manual Stop button: same path as a voice barge-in. The client
         // already flushed its local queue; this kills generation + marks
@@ -4914,4 +5061,5 @@ module.exports._test = {
   sessionsByCallSid, helloFaceTimings, wavDurationMs,
   noteCallerHeard, limitSay, limitHangUp, armCallLimits, stopCallLimits, keepListening,
   looksLikeEcho, limitLineEcho, limitLineActive, utteranceIsEcho, sttSay,
+  streamReply, playBuffer, playBufferWav, applyHeardCut, amendHeardCut, noteTwilioMark, bargeIn,
 };
