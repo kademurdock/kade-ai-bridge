@@ -1066,7 +1066,7 @@ function dtmfToneBuf(d) {
 }
 
 // ── HTTP(S) helper ────────────────────────────────────────────────────────────
-function streamPost(urlStr, headers, body) {
+function streamPost(urlStr, headers, body, signal) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const lib = u.protocol === 'https:' ? https : http;
@@ -1085,6 +1085,16 @@ function streamPost(urlStr, headers, body) {
       req.destroy(new Error(`no response from ${u.hostname} within 25s`));
     });
     req.on('error', reject);
+    // GW-11 (Nov 12 2026): a piece whose turn was barged, stopped or hung up closes its request
+    // instead of waiting the clip out. (The provider call itself only stops once the proxy acts
+    // on the closed socket: GW-9.) The listener comes off when the request is finished, so a
+    // late abort of a done piece touches nothing.
+    if (signal) {
+      const stop = () => req.destroy(Object.assign(new Error('turn abandoned'), { name: 'AbortError' }));
+      if (signal.aborted) { stop(); return; }
+      signal.addEventListener('abort', stop, { once: true });
+      req.once('close', () => signal.removeEventListener('abort', stop));
+    }
     req.write(payload);
     req.end();
   });
@@ -2650,7 +2660,22 @@ async function streamReply(session, userText) {
   // pathology backstop only (10K chars ≈ 4-5 min of speech), not a leash.
   const TURN_SPOKEN_CAP = parseInt(process.env.PHONE_TURN_SPOKEN_CAP || '10000', 10);
 
-  const processUnit = (sentence) => {
+  // GW-11 (Nov 12 2026): wait for a clip OR for the turn to be abandoned, whichever comes first
+  // (50 ms poll, like checkAbort below). Resolves null when the turn was abandoned or the clip failed.
+  // BRIDGE_SYNTH_CANCEL=0 waits every clip out and never closes its request, as before.
+  const synthCancel = process.env.BRIDGE_SYNTH_CANCEL !== '0';
+  const settleOrAbort = (p, onAbort) => (!synthCancel ? Promise.resolve(p).catch(() => null) : new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearInterval(t); resolve(v); };
+    const t = setInterval(() => {
+      if (!session.llmAbort || done) return;
+      try { onAbort(); } catch { /* fail-soft */ }
+      finish(null);
+    }, 50);
+    Promise.resolve(p).then(finish, () => finish(null));
+  }));
+
+  const processUnit = (sentence, how = {}) => {
     if (session.llmAbort) { lostText = true; return; }
     // A stored interrupted turn ends "(cut off here; ...)"; a model that copies it must never say it.
     if (heardCut.hasCutMark(sentence)) sentence = heardCut.stripCutMarks(sentence);
@@ -2763,9 +2788,16 @@ async function streamReply(session, userText) {
         ? sentence.replace(/%%%[\s\S]*?%%%/g, ' ').replace(/\s+/g, ' ').trim()
         : applyDirectionCarry(sentence, dirState);
     const characterMetadata = hasSpeech && synthInput ? speechMetadata(session.agentId, synthInput) : null;
+    const unitAbort = new AbortController(); // GW-11: this piece's own TTS request
+    // GW-10 (Nov 12 2026): the solo first piece of a phone turn is played as it arrives.
+    const streamIt = how.first === true && PHONE_STREAM_FIRST && session.media === 'mulaw';
     const synthPromise = hasSpeech && synthInput
-      ? synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings }).catch((e) => {
-          console.error('[voice-stream] synthesis prefetch error:', e.message);
+      ? (streamIt
+          ? synthesizeStream(synthInput, session.voice, session.rate, session.pronunciationDictionary, { signal: synthCancel ? unitAbort.signal : undefined })
+          : synthesize(synthInput, session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings, signal: synthCancel ? unitAbort.signal : undefined })
+        ).catch((e) => {
+          // An abandoned piece is not an error: stay quiet so real TTS failures stand out.
+          if (!unitAbort.signal.aborted) console.error('[voice-stream] synthesis prefetch error:', e.message);
           return null;
         })
       : Promise.resolve(null);
@@ -2793,10 +2825,11 @@ async function streamReply(session, userText) {
     }
     const unit = { raw: unitRaw, hasSpeech: !!(hasSpeech && synthInput) };
     playChain = playChain.then(async () => {
-      if (session.llmAbort) { lostText = true; return; }
+      // GW-11/GW-10: an abandoned piece closes its TTS request (and releases a streamed opener).
+      if (session.llmAbort) { lostText = true; unitAbort.abort(); return; }
       turnUnits.push(unit);
       if (ramblePromise) {
-        const hintBuf = await ramblePromise;
+        const hintBuf = await settleOrAbort(ramblePromise, () => {}); // shared cached clip: stop waiting, never cancel it
         if (hintBuf && !session.llmAbort) await playBuffer(session, hintBuf);
       }
       for (const cue of gameCues) {
@@ -2831,8 +2864,9 @@ async function streamReply(session, userText) {
         if (!unit.cueAt) unit.cueAt = Date.now();
         await playBuffer(session, clip);
       }
-      const mulawBuf = await synthPromise;
-      if (mulawBuf && !session.llmAbort) {
+      const synthOut = await settleOrAbort(synthPromise, () => unitAbort.abort()); // GW-11
+      const streamed = !!synthOut && !Buffer.isBuffer(synthOut); // GW-10: a feed, not a whole clip
+      if (synthOut && !session.llmAbort) {
         if (!fillerCtx.firstAudioReady) {
           fillerCtx.firstAudioReady = true;
           // Session 22: THE first-audio receipt that actually fires on a
@@ -2847,7 +2881,10 @@ async function streamReply(session, userText) {
           }
         }
         noteSpoken(session, sentence); // for echo detection, see looksLikeEcho / echoReference
-        await playBuffer(session, mulawBuf, { characterMetadata, unit });
+        if (streamed) await playMulawStream(session, synthOut, { unit });
+        else await playBuffer(session, synthOut, { characterMetadata, unit });
+      } else if (streamed) {
+        synthOut.destroy(); // GW-10: an opener nobody will hear lets the proxy go
       }
       // Touch-tones AFTER the words (an IVR hears digits any time its menu is
       // talking, and this keeps "I'll press two now" honest). Phone lane only
@@ -2909,7 +2946,7 @@ async function streamReply(session, userText) {
       sentence = scrubSentence(sentence);
       if (!sentence) return; // whole sentence was tell -- skip it, keep _firstShipped state
     }
-    if (!_firstShipped) { _firstShipped = true; processUnit(sentence); return; }
+    if (!_firstShipped) { _firstShipped = true; processUnit(sentence, { first: true }); return; }
     if (sentence.indexOf('[sound:') !== -1 || sentence.indexOf('[table:') !== -1 || /\[END CALL\]/i.test(sentence) || /\[(PRESS\b|SAY NOTHING)/i.test(sentence)) {
       flushChunk();
       processUnit(sentence);
@@ -3077,7 +3114,8 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary, opts 
       'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...speechHeaders(format === 'mulaw' ? 'bridge-phone' : 'bridge-voice'),
       ...(opts && opts.timing && format === 'wav' ? { 'x-kade-tts-timing': '1' } : {}), // a face is shown (helloFaceTimings)
     },
-    body
+    body,
+    opts && opts.signal // GW-11: streamReply's per-piece abort; every other caller passes none
   );
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -3091,7 +3129,155 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary, opts 
       resolve(buf);
     });
     res.on('error', reject);
+    // GW-11: a response cut off before its end (abandoned piece, dropped socket) must settle, never hang.
+    res.on('close', () => { if (!res.complete) reject(new Error('synth abandoned')); });
   });
+}
+
+// ── GW-10 (Nov 12 2026): the first piece of a phone turn plays while it is still being made ──────
+// PHONE_STREAM_FIRST=0 restores the buffered first piece. The proxy streams telephony only once its
+// own GW-10 half is live (TTS_STREAM_TELEPHONY); until then it answers this request buffered, which
+// the feed below takes as one burst, so the bridge may ship first.
+const PHONE_STREAM_FIRST = process.env.PHONE_STREAM_FIRST !== '0';
+
+// Resolves once the first audio bytes are in hand (so the typing filler keeps going until real speech
+// exists) with a FEED: { queue, ended, failed, wake, destroy() }. The feed owns the response's
+// listeners from the first byte on, so nothing that arrives between this resolving and playback
+// starting (the filler's clear + 100 ms, sound cues) is lost. The proxy's buffered telephony answer
+// (Fish, scenes, several chunks, a stream that fell back) is the same thing arriving in one burst.
+// Resolves null for an empty answer; rejects on an HTTP error or a death before any audio.
+async function synthesizeStream(text, voice, rate, dictionary, opts = {}) {
+  const cfg = global._vsConfig;
+  const input = fixPronunciation(text, dictionary).slice(0, 4096);
+  const useVoice = voice || cfg.defaultVoice;
+  const t0 = Date.now();
+  console.log(`[voice-stream] synth request (streamed): ${input.length} chars, voice "${useVoice}"${typeof rate === 'number' ? `, rate ${rate}` : ''}`);
+  const body = { model: cfg.ttsModel, input, voice: useVoice };
+  if (typeof rate === 'number') body.speed = rate; // proxy clamps to 0.5-1.5
+  const res = await streamPost(
+    `${cfg.ttsProxyUrl}/v1/audio/speech?telephony=1`,
+    { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...speechHeaders('bridge-phone'), 'x-kade-tts-stream': '1' },
+    body,
+    opts && opts.signal // GW-11: the piece's abort also cuts a streamed opener
+  );
+  return new Promise((resolve, reject) => {
+    if (res.statusCode >= 400) {
+      const parts = [];
+      res.on('data', (c) => parts.push(c));
+      res.on('end', () => reject(new Error(`TTS proxy ${res.statusCode}: ${Buffer.concat(parts).toString('utf8').slice(0, 200)}`)));
+      res.on('error', reject);
+      res.on('close', () => { if (!res.complete) reject(new Error('synth abandoned')); });
+      return;
+    }
+    const feed = {
+      queue: [], bytes: 0, ended: false, failed: null, wake: null,
+      destroy() { feed.ended = true; feed.queue.length = 0; try { res.destroy(); } catch { /* already gone */ } },
+    };
+    let settled = false;
+    const poke = () => { const w = feed.wake; feed.wake = null; if (w) w(); };
+    const finish = (err) => {
+      if (err && !feed.failed) feed.failed = err;
+      if (!feed.ended) {
+        feed.ended = true;
+        if (settled) console.log(`[voice-stream] synth ok (streamed): ${feed.bytes} bytes in ${Date.now() - t0}ms${err ? `, ended early (${err.message})` : ''}`);
+      }
+      if (!settled) { settled = true; if (err) reject(err); else resolve(null); }
+      poke();
+    };
+    res.on('data', (c) => {
+      if (feed.ended) return;
+      feed.queue.push(c);
+      feed.bytes += c.length;
+      if (!settled) {
+        settled = true;
+        console.log(`[voice-stream] synth first bytes (streamed): +${Date.now() - t0}ms`);
+        resolve(feed);
+      }
+      poke();
+    });
+    res.on('end', () => finish());
+    res.on('close', () => finish(res.complete ? null : new Error('cut off before its end')));
+    res.on('error', (e) => finish(e));
+  });
+}
+
+// Plays a feed as 20 ms mu-law frames with playBuffer's rules: a LEAD_MS cushion at Twilio, 0xFF
+// (true mu-law silence) padding on the last frame, the heard-cut mark only after the LAST frame,
+// isSpeaking held until the audio has played.
+async function playMulawStream(session, feed, opts = {}) {
+  if (session.ws.readyState !== WebSocket.OPEN) { feed.destroy(); return; }
+  session.finalBuf       = '';
+  session.partialBuf     = '';
+  session.isSpeaking     = true;
+  session.speakStartedAt = Date.now();
+  session.bargedIn       = false;
+  const unit = opts.unit || null;
+  const start = Date.now();
+  if (unit) {
+    unit.sendAt = start;
+    session._markSeq = (session._markSeq || 0) + 1;
+    unit.markName = `kh-${session._markSeq}`;
+  }
+  const LEAD_MS = 600;        // the same cushion playBuffer keeps at Twilio
+  let playheadEnd = start;    // wall-clock end of everything queued at Twilio
+  let pending = Buffer.alloc(0);
+  let frames = 0;
+  let underruns = 0;
+  let dry = false;
+  let complete = false;       // every frame of the piece was sent
+  for (;;) {
+    if (session.llmAbort || !session.isSpeaking || session.ws.readyState !== WebSocket.OPEN) break;
+    if (feed.queue.length) pending = Buffer.concat([pending, ...feed.queue.splice(0)]);
+    const now = Date.now();
+    if (playheadEnd < now) {  // Twilio ran dry: the next frame plays when it lands
+      if (frames && !dry) { dry = true; underruns++; }
+      playheadEnd = now;
+    }
+    while (pending.length >= FRAME_BYTES && playheadEnd - now < LEAD_MS) {
+      session.sendMedia(pending.subarray(0, FRAME_BYTES));
+      pending = pending.subarray(FRAME_BYTES);
+      playheadEnd += 20;
+      frames++;
+      dry = false;
+    }
+    if (feed.ended && !feed.queue.length && pending.length < FRAME_BYTES) {
+      if (pending.length) { // pad with 0xFF, never 0x00 (playBuffer's "pop between sections" lesson)
+        session.sendMedia(Buffer.concat([pending, Buffer.alloc(FRAME_BYTES - pending.length, 0xff)]));
+        pending = Buffer.alloc(0);
+        playheadEnd += 20;
+        frames++;
+      }
+      complete = true;
+      break;
+    }
+    await new Promise((r) => { feed.wake = r; setTimeout(r, pending.length >= FRAME_BYTES ? 100 : 40); });
+  }
+  if (unit) {
+    if (complete) {
+      unit.durMs = frames * 20;
+    } else {
+      // heard-cut needs the piece's WHOLE length, not what was sent before the cut. All of it has
+      // usually arrived by then; if the stream was still coming, never guess shorter than the words.
+      const queued = feed.queue.reduce((n, c) => n + c.length, 0);
+      const got = Math.ceil((frames * FRAME_BYTES + pending.length + queued) / FRAME_BYTES) * 20;
+      unit.durMs = feed.ended && !feed.failed ? got : Math.max(got, String(unit.raw || '').length * 60);
+    }
+  }
+  if (!complete) feed.destroy(); // barge-in or a closed line: let the proxy go
+  if (underruns) console.log(`[voice-stream] streamed opener ran dry ${underruns}x for ${session.streamSid} (${frames} frames)`);
+  // heard-cut: a mark after the piece's last frame. Twilio echoes it when the piece has played.
+  if (unit && complete && !session.llmAbort && heardCut.heardOnlyOn()) {
+    session.twSend({ event: 'mark', streamSid: session.streamSid, mark: { name: unit.markName } });
+  }
+  while (!session.llmAbort && session.isSpeaking && session.ws.readyState === WebSocket.OPEN) {
+    const remaining = playheadEnd - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(remaining, 100)));
+  }
+  if (!session.llmAbort) {
+    session.isSpeaking = false;
+    session.lastSpokAt = Date.now();
+  }
 }
 
 // ── Speak (one-shot, not streamed) ────────────────────────────────────────────
@@ -3343,6 +3529,13 @@ async function fetchLlmOpener(session, user) {
     ? `[PHONE CALL SYSTEM NOTE] ${name} is calling you on the phone right now and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello greeting ${name} by name (work your own name in too) — like a real friend answering the phone. Hard rules: 16 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.`
     : '[PHONE CALL SYSTEM NOTE] Someone from a number you do not recognize is calling and you are picking up. Reply with ONLY your pickup line: one short, fresh, NATURAL in-character hello introducing yourself by name and noting you do not recognize the number, working in naturally that they can say sign me up any time to get their own account. Hard rules: 30 words max, NO catchphrases or signature slogans, no questions, no invitation to speak yet, no emoji, no quotes, plain speakable text only.';
 
+  // GW-5 (Nov 12 2026): when the timeout wins, the request is closed so the proxy stops the site job
+  // (it used to run later to nobody, billed, with the caller's first real turn queued behind it).
+  // Before the response exists the abort signal closes the request (GW-11's streamPost signal);
+  // after, the response is destroyed. GREETING_CANCEL=0 lets a late greeting run on as before.
+  const greetAbort = process.env.GREETING_CANCEL === '0' ? null : new AbortController();
+  let greetRes = null;
+  let gaveUp = false;
   const attempt = (async () => {
     const res = await streamPost(
       `${session.cfg.proxyUrl}/librechat/ask-stream`,
@@ -3352,10 +3545,15 @@ async function fetchLlmOpener(session, user) {
         'User-Agent': BROWSER_UA,
         Accept: 'text/event-stream',
       },
-      askStreamBody(session, { agentId: session.agentId, messages: [{ role: 'user', content: instruction }], userEmail: session.lcEmail || undefined })
+      askStreamBody(session, { agentId: session.agentId, messages: [{ role: 'user', content: instruction }], userEmail: session.lcEmail || undefined }),
+      greetAbort ? greetAbort.signal : undefined
     );
+    if (gaveUp && greetAbort) { res.destroy(); return null; } // the timeout fired as the response arrived
+    greetRes = res;
     let text = '';
     await new Promise((resolve, reject) => {
+      // A destroyed response emits only 'close' (no 'end', no 'error'): settle on it too.
+      res.on('close', resolve);
       let buf = '';
       res.on('data', (chunk) => {
         buf += chunk.toString();
@@ -3383,9 +3581,17 @@ async function fetchLlmOpener(session, user) {
     if (text.length < 4 || text.length > 220) return null;
     return text;
   })();
+  attempt.catch(() => {}); // a late rejection after the race is over must never be unhandled
 
   const timeout = new Promise((resolve) =>
-    setTimeout(() => resolve(null), GREETING_LLM_TIMEOUT_MS));
+    setTimeout(() => {
+      gaveUp = true;
+      if (greetAbort) {
+        try { greetAbort.abort(); } catch { /* fail-soft */ }
+        if (greetRes) { try { greetRes.destroy(); } catch { /* already gone */ } }
+      }
+      resolve(null);
+    }, GREETING_LLM_TIMEOUT_MS));
   try {
     return await Promise.race([attempt, timeout]);
   } catch (e) {
@@ -5069,4 +5275,5 @@ module.exports._test = {
   noteCallerHeard, limitSay, limitHangUp, armCallLimits, stopCallLimits, keepListening,
   looksLikeEcho, limitLineEcho, limitLineActive, utteranceIsEcho, sttSay,
   streamReply, playBuffer, playBufferWav, applyHeardCut, amendHeardCut, noteTwilioMark, bargeIn,
+  streamPost, synthesizeStream, playMulawStream, fetchLlmOpener, // Nov 12 2026 audit: GW-11, GW-10, GW-5
 };
