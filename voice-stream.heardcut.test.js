@@ -155,6 +155,53 @@ test('a copied "(cut off ...)" in the model\'s reply is never sent to the voice'
   assert.ok(!sent.filter((x) => typeof x === 'string').some((x) => x.includes('cut off')), 'not in captions');
 });
 
+test('a copied "(cut off ...)" is not stored either, on a turn nobody interrupted', async () => {
+  REPLY = `${S1} ${CUT_MARK} ${S2}`;
+  const s = webSession();
+  await streamReply(s, 'Go on.');
+  const a = lastAssistant(s);
+  assert.ok(!a.content.includes('cut off'), a.content);
+  assert.ok(a.content.includes('Alpha') && a.content.includes('lima'), a.content);
+  assert.strictEqual(a.heardCut, undefined);
+});
+
+test('a later turn\'s heard report never re-cuts the earlier cut turn (barge in B within 15 s)', async () => {
+  const s = webSession();
+  const turnA = streamReply(s, 'Tell me two things.');
+  const u2 = await bargeWebAt(s, 1, 300);
+  s._heardReport = { seq: u2.seq, ms: 300, at: Date.now() };
+  amendHeardCut(s);
+  await turnA;
+  const a = lastAssistant(s);
+  assert.ok(!a.content.includes('lima') && a.content.includes(CUT_MARK), a.content);
+  const turnB = streamReply(s, 'Wait what?');
+  const b1 = await bargeWebAt(s, 0, 200);
+  s._heardReport = { seq: b1.seq, ms: 200, at: Date.now() };
+  amendHeardCut(s); // what the 'heard' socket handler does while B is still unwinding
+  await turnB;
+  assert.ok(!a.content.includes('lima') && a.content.includes(CUT_MARK), 'A keeps its own cut: ' + a.content);
+  const b = lastAssistant(s);
+  assert.notStrictEqual(b, a);
+  assert.ok(b.content.includes(CUT_MARK) && !b.content.includes('lima'), 'B is cut by its own report: ' + b.content);
+});
+
+test('Stop on turn B after a tail barge on done turn A: A keeps its trimmed tail', async () => {
+  REPLY = `${S1} ${S2}`;
+  const s = webSession();
+  await streamReply(s, 'Tell me.'); // done sending; the last clip still has its lead time to play
+  const u2 = s._lastCut.units[1];
+  await until(() => Date.now() >= u2.startEst + 300);
+  s.bargedIn = true; bargeIn(s);
+  s._heardReport = { seq: u2.seq, ms: 300, at: Date.now() }; amendHeardCut(s);
+  const a = lastAssistant(s);
+  assert.ok(!a.content.includes('lima'), a.content);
+  const turnB = streamReply(s, 'Huh?');
+  const b1 = await bargeWebAt(s, 0, 200);
+  s._heardReport = { seq: b1.seq, ms: 200, at: Date.now() }; amendHeardCut(s); // Stop: barge then heard, same tick
+  await turnB;
+  assert.ok(!a.content.includes('lima'), 'A must not regain unheard words: ' + a.content);
+});
+
 test('phone: Twilio marks follow each piece; the cut piece is timed from the mark before it', async () => {
   let s;
   const ws = openWs((x) => {

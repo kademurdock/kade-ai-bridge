@@ -1233,7 +1233,9 @@ function bargeIn(session) {
   session.lastSpokAt = Date.now(); // echo window measures from the real stop, not a stale timestamp
   // Nov 11 2026 (heard-cut): a turn that already finished, whose last audio was still playing.
   const done = session._lastCut;
-  if (done && done.doneAt && !done.stopAt && Date.now() - done.doneAt < 30000 && heardCut.heardOnlyOn()) {
+  // Only while no newer turn is running: a barge during the next turn is about that turn.
+  if (done && done.doneAt && !done.stopAt && Date.now() - done.doneAt < 30000 && heardCut.heardOnlyOn()
+      && (!session._turnUnits || session._turnUnits === done.units)) {
     done.endedAt = Date.now();
     applyHeardCut(session, done);
   }
@@ -1289,6 +1291,9 @@ function amendHeardCut(session) {
   const cut = session._lastCut;
   const report = session._heardReport;
   if (!cut || !cut.entry || !report || session.media !== 'wav') return;
+  // A newer turn is running: this report is about THAT turn (the Stop button sends barge, then heard,
+  // in one tick), and its own end picks the report up. Never re-cut an older turn with it.
+  if (session._turnUnits && session._turnUnits !== cut.units) return;
   if (!cut.stopAt || report.at < cut.stopAt || report.at - cut.stopAt > 15000) return;
   if (cut.reportUsed === report) return;
   applyHeardCut(session, cut);
@@ -3016,7 +3021,9 @@ async function streamReply(session, userText) {
     try { await speak(session, line, session.voice); } catch {}
   }
   if (fullReply) {
-    const whole = fullReply.replace(/\[END CALL\]/gi, '').trim();
+    // A cut marker the model copied is never stored either (it is already kept out of speech and
+    // captions), so a turn nobody interrupted never carries one.
+    const whole = heardCut.stripCutMarks(fullReply.replace(/\[END CALL\]/gi, '')).trim();
     const entry = { role: 'assistant', content: whole };
     // Nov 11 2026: an interrupted turn keeps only what was heard (heard-cut.js). A turn that ran to
     // the end is stored exactly as before.
