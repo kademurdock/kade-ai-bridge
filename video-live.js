@@ -937,7 +937,7 @@ function forwardFrame(session, b64jpeg) {
  * VoiceOver says nothing). New frames after the camera returns speak for themselves and re-arm
  * the note. Sent as realtimeInput.text: on the 3.x Live models clientContent is for seeding
  * history, not for a turn in the middle of a call. Not yet tried against Google: replay on
- * staging first. Kill switch: LIVE_CAMERA_NOTE=0. LIVE_CAMERA_NOTE_VIA=client sends the
+ * staging first. So it is OFF unless LIVE_CAMERA_NOTE=1 (lead review, Nov 12 2026). LIVE_CAMERA_NOTE_VIA=client sends the
  * clientContent form instead. */
 const LIVE_CAMERA_LOST =
   '(Automatic note from the app, not spoken by me: my camera just stopped sending pictures, maybe because my phone locked. ' +
@@ -945,7 +945,7 @@ const LIVE_CAMERA_LOST =
   'or give directions from earlier pictures until new ones arrive.)';
 function noteCamera(session, on) {
   if (on) { session._liveCameraLostAt = 0; return false; }
-  if (process.env.LIVE_CAMERA_NOTE === '0') return false;
+  if (process.env.LIVE_CAMERA_NOTE !== '1') return false;
   const gws = session._liveWs;
   if (!session.liveOn || !gws || gws.readyState !== 1 || session._liveCameraLostAt) return false;
   session._liveCameraLostAt = Date.now();

@@ -11,7 +11,7 @@ const path = require('path');
 
 process.env.RAILWAY_VOLUME_MOUNT_PATH = fs.mkdtempSync(path.join(os.tmpdir(), 'vlive-camera-'));
 delete process.env.KADE_USAGE_EVENT_SECRET;
-delete process.env.LIVE_CAMERA_NOTE;
+process.env.LIVE_CAMERA_NOTE = '1';
 delete process.env.LIVE_CAMERA_NOTE_VIA;
 delete process.env.LIVE_FRAME_GUARD;
 const vl = require('./video-live');
@@ -62,11 +62,14 @@ test('nothing is sent when live is off or the Google socket is not open', () => 
   assert.strictEqual(a.sent.length + b.sent.length, 0);
 });
 
-test('LIVE_CAMERA_NOTE=0 turns the note off; LIVE_CAMERA_NOTE_VIA=client sends a clientContent turn', () => {
-  process.env.LIVE_CAMERA_NOTE = '0';
+test('LIVE_CAMERA_NOTE unset or 0 turns the note off; LIVE_CAMERA_NOTE_VIA=client sends a clientContent turn', () => {
+  delete process.env.LIVE_CAMERA_NOTE;
   const a = liveSession();
   assert.strictEqual(vl.noteCamera(a.session, false), false);
-  delete process.env.LIVE_CAMERA_NOTE;
+  process.env.LIVE_CAMERA_NOTE = '0';
+  const a2 = liveSession();
+  assert.strictEqual(vl.noteCamera(a2.session, false), false);
+  process.env.LIVE_CAMERA_NOTE = '1';
   process.env.LIVE_CAMERA_NOTE_VIA = 'client';
   const b = liveSession();
   vl.noteCamera(b.session, false);
