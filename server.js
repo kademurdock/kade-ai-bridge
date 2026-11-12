@@ -332,15 +332,25 @@ function parseSpokenEmail(text) {
 }
 
 // ── Agent cache ───────────────────────────────────────────────────────────────
-let _agentCache = null, _agentCacheExp = 0;
+// Nov 12 2026 (GW-7): stale-while-revalidate, see agent-cache.js. A call turn
+// never waits on this list once it has loaded. AGENT_CACHE_SWR=0 restores the
+// old cache (every turn awaits the fetch once the hour is up or after a failure).
+const { createAgentCache } = require('./agent-cache');
+const fetchAgentList = async () => {
+  const r = await axios.get(`${PROXY_URL}/librechat/agents`, {
+    headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
+    timeout: 15000,
+  });
+  return r.data && r.data.agents;   // not an array -> the cache keeps the old list
+};
+const agentCache = createAgentCache({ fetchList: fetchAgentList });
+let _agentCache = null, _agentCacheExp = 0; // AGENT_CACHE_SWR=0 only
 async function getAgents() {
+  if (process.env.AGENT_CACHE_SWR !== '0') return agentCache.get();
   if (_agentCache && Date.now() < _agentCacheExp) return _agentCache;
   try {
-    const r = await axios.get(`${PROXY_URL}/librechat/agents`, {
-      headers: { Authorization: `Bearer ${PROXY_SECRET}`, 'User-Agent': BROWSER_UA },
-      timeout: 15000,
-    });
-    _agentCache    = (r.data.agents || []);
+    const list = await fetchAgentList();
+    _agentCache    = Array.isArray(list) ? list : [];
     _agentCacheExp = Date.now() + 60 * 60 * 1000;
     console.log(`[bridge] Agent cache: ${_agentCache.length} public agents`);
   } catch (e) {
