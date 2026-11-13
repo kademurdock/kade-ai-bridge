@@ -54,7 +54,8 @@ test('explicit sign-out removes a token, while legacy omitted IDs preserve it', 
   const ctx = { app: {post:(route,fn)=>handlers.set(route,fn)},
     pushTokens:new Map([[token,{userId:'family',platform:'ios'}]]),
     fcm:{looksLikeFcmToken:()=>false}, savePushTokens:()=>{}, CALL_RINGTONES:{}, console:{log() {}, warn() {}},
-    pushAuth:require('./push-auth'), PUSH_JWT_SECRET:'test-secret' };
+    pushAuth:require('./push-auth'), PUSH_JWT_SECRET:'test-secret',
+    pushAuthTally:require('./push-auth').createPushAuthTally() }; // Nov 13 2026 (sweep 8.7): registrations are counted
   vm.createContext(ctx);
   const start=src.indexOf("app.post('/push-register'");
   vm.runInContext(src.slice(start,src.indexOf('// Admin: send a push',start)),ctx);

@@ -190,6 +190,8 @@ function serverHarness(initial = health(), env = {}) {
     balanceStatusForSpeech: () => ({ section: {} }), crashStatusForSpeech: () => ({ section: {}, okToday: true }),
     voiceReportForSpeech: async () => ({ section: {} }), slopStatsForSpeech: async () => ({ section: {} }),
     BATTERY: null, JEV: null,
+    // Nov 13 2026 (sweep 8.7): the admin status carries the push-auth counts
+    pushAuth: require('./push-auth'), pushAuthTally: require('./push-auth').createPushAuthTally(),
   };
   vm.createContext(context);
   vm.runInContext(sourceBetween('const MEMORY_KEEPER_DEAD_H =', '/* ── VOICE REPORT') + '\nthis.tick = memoryKeeperAlarmTick; this.speech = memoryHealthForSpeech;', context);

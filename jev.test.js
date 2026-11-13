@@ -157,6 +157,7 @@ function gateRig(jevObj) {
     '\nthis.handleGateTurn = handleGateTurn;';
   const events = [];
   const ctx = { String, console: quiet, JEV: jevObj,
+    textReceipt: (s) => JSON.stringify(s), // Nov 13 2026 (sweep 8.6): the gate's log line carries a receipt, not the caller's words
     GATE_CALLBACK_RE: vc.GATE_CALLBACK_RE, GATE_MESSAGE_RE: vc.GATE_MESSAGE_RE, GATE_ACCOUNT_RE: vc.GATE_ACCOUNT_RE,
     GATE_DONE_RE: vc.GATE_DONE_RE, GATE_MORE_RE: vc.GATE_MORE_RE, REG_YES_RE: vc.REG_YES_RE, REG_INTENT_RE: vc.REG_INTENT_RE,
     speak: async (s, line) => { events.push(['speak', line]); },
