@@ -383,10 +383,30 @@ const AI_TELL_LEAD_BANS = [
   /^\s*certainly[!.,:]\s*/i,
   /^\s*i['’]d\s+be\s+happy\s+to\s+(?:help\s+(?:you\s+)?)?(?:with\s+that\s*)?[!.,:]\s*/i,
 ];
+// Nov 13 2026, SELF-KNOWLEDGE (Kade's ruling; the fork's api/server/utils/stripAiTells.js, same
+// rules so calls match chat). A character knows it is an AI and says so plainly when somebody
+// sincerely asks. The old rules cut any sentence holding "I'm an AI" or starting "I don't have
+// a body" before speech, so on a call "Hon, I am an AI, ..." was spoken as "Hon,". With the
+// switch on only the hedge forms go: "As an AI, ..." at the start of a clause, "as an AI
+// language model" anywhere, "I'm just an AI", "I'm an AI language model / assistant" and the
+// "I don't have feelings / opinions" disclaimers. KADE_SELF_KNOWLEDGE=0 puts the three earlier
+// rules back byte for byte. Same variable name as the fork: set it the same on both services.
+// Read once at load, so a flip needs a restart.
+const KADE_SELF_KNOWLEDGE = process.env.KADE_SELF_KNOWLEDGE !== '0';
+const AI_SELF_SENTENCE_BANS = KADE_SELF_KNOWLEDGE
+  ? [
+      /(?:^|(?<=\n[ \t]*)|(?<=[.!?,;:—–-]["”’)]?\s+)|(?<=\b(?:but|and|so|well)\s+))as an ai\b[^.!?]*[.!?]|\bas an ai[ \t]+language model\b[^.!?]*[.!?]/gi,
+      /\bi(?:['’]m| am)\s+(?:just|only|merely)\s+an ai\b[^.!?]*[.!?]/gi,
+      /\bi(?:['’]m| am)\s+an ai[ \t]+(?:language[ \t]+model|assistant|model|chatbot)\b[^.!?]*[.!?]/gi,
+      /\bi\s+don['’]t\s+have\s+(?:personal\s+)?(?:feelings|opinions|emotions|experiences)\b[^.!?]*[.!?]/gi,
+    ]
+  : [
+      /\bas an ai(?:\s+language model)?\b[^.!?]*[.!?]/gi,
+      /\bi(?:'m| am)\s+(?:just\s+)?an ai\b[^.!?]*[.!?]/gi,
+      /\bi\s+don['’]t\s+have\s+(?:personal\s+)?(?:feelings|opinions|emotions|experiences|a body)\b[^.!?]*[.!?]/gi,
+    ];
 const AI_TELL_SENTENCE_BANS = [
-  /\bas an ai(?:\s+language model)?\b[^.!?]*[.!?]/gi,
-  /\bi(?:'m| am)\s+(?:just\s+)?an ai\b[^.!?]*[.!?]/gi,
-  /\bi\s+don['’]t\s+have\s+(?:personal\s+)?(?:feelings|opinions|emotions|experiences|a body)\b[^.!?]*[.!?]/gi,
+  ...AI_SELF_SENTENCE_BANS,
   /\bas of my last (?:knowledge\s+)?(?:update|training)[^.!?]*[.!?]/gi,
   /\bi\s+don['’]t\s+have\s+access\s+to\s+real-?time[^.!?]*[.!?]/gi,
   /\bi\s+(?:can(?:'|no)?t|am unable to)\s+browse[^.!?]*[.!?]/gi,
