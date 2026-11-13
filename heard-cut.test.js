@@ -134,3 +134,62 @@ test('the marker survives the transcript scrub, so Call History and the merged c
   assert.ok(keep(`%%%warm%%% Okay, here is the first ${hc.CUT_MARK}`).endsWith(hc.CUT_MARK));
   assert.strictEqual(keep(hc.CUT_NONE), hc.CUT_NONE);
 });
+
+/* Nov 13 2026 (sweep 1.3, second pass): a piece whose AUDIO broke off (unit.cutMs) in a turn that went on. */
+test('buildFeedCutText: the cut piece is trimmed and marked in place, and the pieces after it are kept', () => {
+  const units = [
+    { raw: 'So the thing about your fence is that it leans a little to the east.', durMs: 4200, cutMs: 1400 },
+    { raw: 'I would brace it before winter.' },
+    { raw: 'Want the short list? [END CALL]' },
+  ];
+  const whole = units.map((u) => u.raw).join(' ');
+  const r = hc.buildFeedCutText(units);
+  assert.strictEqual(r.cut, true);
+  assert.ok(r.text.length < whole.length, 'shorter than what was written');
+  assert.ok(r.text.startsWith('So the thing about'), r.text);
+  assert.ok(!r.text.includes('to the east'), r.text);
+  assert.ok(r.text.includes(`${hc.CUT_GAP} I would brace it before winter. Want the short list?`), r.text);
+  assert.ok(!r.text.includes(hc.CUT_MARK), 'the turn was not interrupted, so there is no closing marker');
+  assert.strictEqual(hc.hasCutMark(r.text), true, 'the gap marker is a cut marker: speech and captions drop it');
+  assert.strictEqual(hc.stripCutMarks(r.text).includes('cut off'), false);
+  assert.strictEqual(units[0].heard, undefined, 'the live units are not touched');
+});
+
+test('buildFeedCutText: nothing to do without a cut piece, or without the text to rebuild from; a piece cut at once keeps the rest', () => {
+  assert.strictEqual(hc.buildFeedCutText([{ raw: 'All of it.' }, { raw: 'Played.' }]), null);
+  assert.strictEqual(hc.buildFeedCutText([]), null);
+  assert.strictEqual(hc.buildFeedCutText(null), null);
+  assert.strictEqual(hc.buildFeedCutText([{ raw: 'Cut.', durMs: 900, cutMs: 300 }, { hasSpeech: true }]), null, 'a piece with no text: store the turn as written');
+  const r = hc.buildFeedCutText([{ raw: 'Never really started this one.', durMs: 2400, cutMs: 0 }, { raw: 'But this played.' }]);
+  assert.strictEqual(r.text, `${hc.CUT_GAP} But this played.`);
+  const only = hc.buildFeedCutText([{ raw: 'Never really started this one.', durMs: 2400, cutMs: 0 }]);
+  assert.strictEqual(only.text, hc.CUT_NONE, 'nothing heard at all');
+});
+
+test('placePhone and buildHeardText: a barge-in after a feed-cut piece keeps the gap, the later pieces heard, and the closing marker', () => {
+  // Piece 1 broke off after 1 s (no mark). Piece 2 played whole (mark). Piece 3 was interrupted 500 ms in.
+  const units = [
+    { raw: 'First sentence that broke off part of the way through it.', sendAt: 1000, durMs: 3400, cutMs: 1000 },
+    { raw: 'Second sentence, heard whole.', sendAt: 4500, durMs: 1500, markAt: 6000 },
+    { raw: 'Third sentence that the caller talked over.', sendAt: 6000, durMs: 2000 },
+    { raw: 'Fourth, never started.', sendAt: 0 },
+  ];
+  hc.placePhone(units, 6500);
+  assert.deepStrictEqual(units[0].heard, { ms: 1000 });
+  assert.strictEqual(units[1].heard, 'whole');
+  assert.deepStrictEqual(units[2].heard, { ms: 500 });
+  const r = hc.buildHeardText(units);
+  assert.ok(r.text.includes(hc.CUT_GAP) && r.text.includes('Second sentence, heard whole.'), r.text);
+  assert.ok(r.text.endsWith(hc.CUT_MARK), r.text);
+  assert.ok(!r.text.includes('talked over') && !r.text.includes('Fourth'), r.text);
+
+  // A barge-in DURING the feed-cut piece's audio is an ordinary cut: nothing after it.
+  const early = [
+    { raw: 'First sentence that broke off part of the way through it.', sendAt: 1000, durMs: 3400, cutMs: 1000 },
+    { raw: 'Second sentence.', sendAt: 0 },
+  ];
+  hc.placePhone(early, 1400);
+  assert.deepStrictEqual(early[0].heard, { ms: 400 });
+  const e = hc.buildHeardText(early);
+  assert.ok(e.text.endsWith(hc.CUT_MARK) && !e.text.includes(hc.CUT_GAP) && !e.text.includes('Second'), e.text);
+});

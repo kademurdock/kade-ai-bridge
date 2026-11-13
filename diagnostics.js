@@ -52,14 +52,19 @@ function normalizeEntry(b, at) {
 /* Nov 13 2026 (sweep 8.3): the free CI simulator runs post their crash-loop reports to this sink (the
  * app's sink address is fixed), and in 30 hours they were 205 of 215 reports and most of the daily cap
  * that real phones share. A report from a TEST BUILD is counted on its own small allowance and never
- * enters the ring, the seats or the crash alert. A test build is one the app marks itself
- * (`simulator: true`, or a device name with "Simulator" in it), or an iPhone build whose number is in
- * DIAG_TEST_BUILDS (default "100": project.yml gives every non-release build that number, and no
- * released build has it). DIAG_TEST_BUILDS= (empty) turns the build-number rule off. */
+ * enters the ring, the seats or the crash alert.
+ *
+ * A test build is one that carries the simulator MARK: `simulator: true` in the report, or a device
+ * name with "Simulator" in it. A build number alone is not proof (second pass, lead review): build 100
+ * is every non-release iPhone build, and one of those on a real phone must keep its crash reports. So
+ * the build-number rule is OFF unless DIAG_TEST_BUILDS names numbers (a comma list, iPhone only), for
+ * someone who knows no real phone carries them. DIAG_TEST_RULE=0 turns the whole rule off: every
+ * report is a real one, as before. The app does not send the mark yet. */
 function testBuildNumbers(env = process.env) {
-  return new Set(String(env.DIAG_TEST_BUILDS ?? '100').split(',').map((x) => x.trim()).filter(Boolean));
+  return new Set(String(env.DIAG_TEST_BUILDS ?? '').split(',').map((x) => x.trim()).filter(Boolean));
 }
 function isTestBuild(b, env = process.env) {
+  if (String(env.DIAG_TEST_RULE ?? '1').trim() === '0') return false;
   b = b || {};
   if (b.simulator === true || b.simulator === 'true' || b.simulator === 1) return true;
   if (/simulator/i.test(String(b.device || ''))) return true;

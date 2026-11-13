@@ -23,7 +23,7 @@ process.env.KADE_CALL_INGEST_SECRET = 'barge-synth-test-secret';
 
 const vs = require('./voice-stream.js');
 const { CallSession, WebCallSession, streamReply, streamPost, synthesizeStream, playMulawStream, fetchLlmOpener } = vs._test;
-const { CUT_NONE } = require('./heard-cut.js');
+const { CUT_NONE, CUT_GAP, CUT_MARK } = require('./heard-cut.js');
 
 const S1 = 'Okay, here is the first thing I wanted to tell you about today.';
 const S2 = 'Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey.';
@@ -65,9 +65,18 @@ const proxy = http.createServer((req, res) => {
     const rec = { at: Date.now(), closedAt: 0, streamHeader: req.headers['x-kade-tts-stream'] === '1', phone };
     ttsSeen.push(rec);
     res.on('close', () => { rec.closedAt = Date.now(); });
-    const how = ttsPlan.shift() || 'now';
+    // 'stall' and 'break' are for the streamed phone opener only: any other request leaves them in the plan.
+    const forOpener = ttsPlan[0] === 'stall' || ttsPlan[0] === 'break';
+    const how = forOpener && !rec.streamHeader ? 'now' : (ttsPlan.shift() || 'now');
     const body = phone ? Buffer.alloc(8 * CLIP_MS, 0xff) : wavMs(CLIP_MS);
     if (how === 'hold') { setTimeout(() => { try { res.end(body); } catch {} }, 3000); return; }
+    // Nov 13 2026 (sweep 1.3): one second of audio, then the stream goes quiet ('stall') or breaks off ('break').
+    if (how === 'stall' || how === 'break') {
+      res.writeHead(200, { 'Content-Type': 'audio/basic', 'x-kade-tts-streamed': '1' });
+      res.write(Buffer.alloc(8000, 0xff));
+      if (how === 'break') setTimeout(() => { try { res.destroy(); } catch {} }, 60);
+      return;
+    }
     res.end(body);
   });
 });
@@ -277,6 +286,26 @@ test('sweep 1.3: a feed that stalls mid-piece is cut after the stall limit: no m
   assert.strictEqual(feed.destroyed, true, 'the proxy is let go');
   assert.strictEqual(s.isSpeaking, false, 'the line is free for the next sentence');
   assert.ok(unit.durMs >= unit.raw.length * 60, 'the piece keeps its whole estimated length, so it is never taken as fully heard');
+  assert.strictEqual(unit.cutMs, 100, 'how much of it played, for the stored turn');
+});
+
+test('sweep 1.3: a feed that delivered faster than real time is not cut while the caller is still hearing it', async () => {
+  const s = fakePhone();
+  const feed = fakeFeed();
+  const unit = { raw: 'A long first sentence that arrived all at once and then the stream went quiet.' };
+  feed.push(Buffer.alloc(16000, 1)); // two seconds of audio in one burst, then nothing, and the feed never ends
+  const t0 = Date.now();
+  let heardAllAt = 0;
+  const watch = setInterval(() => { if (!heardAllAt && s.frames.length === 100) heardAllAt = Date.now() - t0; }, 20);
+  await Promise.race([playMulawStream(s, feed, { unit }), new Promise((_, rej) => setTimeout(() => rej(new Error('still waiting after 9 s')), 9000))]);
+  clearInterval(watch);
+  const took = Date.now() - t0;
+  assert.strictEqual(s.frames.length, 100, 'every frame that arrived was sent');
+  // Bytes last ARRIVED at 0 ms. The old clock would have cut at 2.5 s, with the last half second still unsent.
+  assert.ok(took >= 4300, `cut at ${took} ms: 2 s of audio, then 2.5 s of real silence`);
+  assert.ok(took < 6500, `cut at ${took} ms`);
+  assert.strictEqual(unit.cutMs, 2000);
+  assert.strictEqual(s.marks.length, 0);
 });
 
 test('sweep 1.3: a slow feed that keeps arriving is never cut, and audio still buffered is never cut', async () => {
@@ -304,6 +333,53 @@ test('sweep 1.3: a feed that ends on an error is recorded as cut short, not as h
   assert.strictEqual(s.frames.length, 5, 'what arrived still plays, padded');
   assert.strictEqual(s.marks.length, 0);
   assert.ok(unit.durMs >= unit.raw.length * 60);
+  assert.strictEqual(unit.cutMs, 100);
+});
+
+test('sweep 1.3: a barge-in is not a feed cut (no cutMs), and a whole piece carries none either', async () => {
+  const s = fakePhone();
+  const feed = fakeFeed();
+  const unit = { raw: 'x' };
+  feed.push(Buffer.alloc(16000, 1));
+  const play = playMulawStream(s, feed, { unit });
+  setTimeout(() => { s.llmAbort = true; }, 250);
+  await play;
+  assert.strictEqual(unit.cutMs, undefined);
+  const s2 = fakePhone(); const feed2 = fakeFeed(); const unit2 = { raw: 'x' };
+  feed2.push(Buffer.alloc(800, 1)); feed2.end();
+  await playMulawStream(s2, feed2, { unit: unit2 });
+  assert.strictEqual(unit2.cutMs, undefined);
+  assert.strictEqual(s2.marks.length, 1);
+});
+
+/* The whole turn, through streamReply on a phone session: what is STORED. */
+for (const how of ['stall', 'break']) {
+  test(`sweep 1.3: an opener whose audio ${how === 'stall' ? 'stalls' : 'breaks off'} is stored cut, with the later sentences kept`, async () => {
+    const s = new CallSession('CAc' + how, 'MZc' + how, '+15550100', { agentId: 'a-one', agentName: 'One' }, openWs(), global._vsConfig);
+    ttsPlan = [how];
+    await streamReply(s, 'Tell me three things.');
+    const a = [...s.history].reverse().find((m) => m.role === 'assistant');
+    assert.ok(a, 'the turn was stored');
+    assert.ok(a.content.length < REPLY.length, `the stored text is shorter than what the model wrote (${a.content.length} of ${REPLY.length})`);
+    assert.strictEqual(a.heardCut, true);
+    assert.strictEqual(a.generatedChars, REPLY.length, 'billing still counts the whole reply');
+    assert.ok(a.content.includes(CUT_GAP), a.content);
+    assert.ok(!a.content.includes('wanted to tell you about today.'), 'the end of the first sentence was never heard: ' + a.content);
+    assert.ok(a.content.startsWith('Okay,'), 'the start of it was: ' + a.content);
+    assert.ok(a.content.indexOf(CUT_GAP) < a.content.indexOf('Alpha bravo'), 'the gap is marked where it happened');
+    assert.ok(a.content.includes(S2) && a.content.endsWith(S3), 'the sentences after it played and are kept: ' + a.content);
+    assert.ok(!a.content.includes(CUT_MARK), 'the turn itself was not interrupted');
+    const marks = sent.filter((x) => typeof x === 'string').map((x) => JSON.parse(x)).filter((m) => m.event === 'mark');
+    assert.strictEqual(marks.length, ttsSeen.filter((r) => r.phone).length - 1, 'no heard mark for the cut piece, one for each later piece');
+  });
+}
+
+test('sweep 1.3: an opener that plays whole is stored whole, as before', async () => {
+  const s = new CallSession('CAw', 'MZw', '+15550100', { agentId: 'a-one', agentName: 'One' }, openWs(), global._vsConfig);
+  await streamReply(s, 'Tell me three things.');
+  const a = [...s.history].reverse().find((m) => m.role === 'assistant');
+  assert.strictEqual(a.content, REPLY);
+  assert.strictEqual(a.heardCut, undefined);
 });
 
 test('sweep 1.3: the switch is read at load and documented in the code', () => {

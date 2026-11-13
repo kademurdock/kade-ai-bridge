@@ -83,17 +83,22 @@ test('Android causes are spoken plainly; Apple ones are unchanged', () => {
 
 /* Nov 13 2026 (sweep 8.3): reports from CI simulators and other test builds are told apart, so they can
  * be kept off the cap real phones share. */
-test('a test build is one the app marks, a Simulator device, or an iPhone build number on the list', () => {
+test('a test build carries the simulator mark; a build number alone is not proof unless the list names it', () => {
   const { isTestBuild } = require('./diagnostics');
-  assert.equal(isTestBuild({ platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'abnormal' }, {}), true, 'build 100: every non-release iPhone build');
-  assert.equal(isTestBuild({ build: 100, device: 'iPhone iOS 26.5' }, {}), true, 'a number, and no platform field (iPhone by default)');
-  assert.equal(isTestBuild({ platform: 'ios', build: '348', device: 'iPhone iOS 27.2.1', kind: 'hang' }, {}), false, 'a released build');
-  assert.equal(isTestBuild({ platform: 'ios', build: '1000' }, {}), false);
-  assert.equal(isTestBuild({ platform: 'android', build: '100', device: 'Pixel 9' }, {}), false, 'Android build 100 was a real release number');
+  assert.equal(isTestBuild({ platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'abnormal' }, {}), false, 'build 100 on what may be a real phone: kept');
+  assert.equal(isTestBuild({ platform: 'ios', build: '100', device: 'iPhone iOS 26.5', simulator: true }, {}), true, 'the mark');
   assert.equal(isTestBuild({ platform: 'ios', build: '348', simulator: true }, {}), true);
-  assert.equal(isTestBuild({ platform: 'android', build: '126', device: 'Android Simulator x86' }, {}), true);
-  assert.equal(isTestBuild({ platform: 'ios', build: '100' }, { DIAG_TEST_BUILDS: '' }), false, 'the build-number rule can be switched off');
-  assert.equal(isTestBuild({ platform: 'ios', build: '777' }, { DIAG_TEST_BUILDS: '100, 777' }), true);
+  assert.equal(isTestBuild({ platform: 'ios', build: '348', simulator: 'true' }, {}), true);
+  assert.equal(isTestBuild({ platform: 'ios', build: '348', simulator: false }, {}), false);
+  assert.equal(isTestBuild({ platform: 'android', build: '126', device: 'Android Simulator x86' }, {}), true, 'a device that names itself');
+  assert.equal(isTestBuild({ platform: 'ios', build: '348', device: 'iPhone iOS 27.2.1', kind: 'hang' }, {}), false, 'a released build');
+  // The build-number rule is opt-in, iPhone only.
+  assert.equal(isTestBuild({ platform: 'ios', build: '100' }, { DIAG_TEST_BUILDS: '100, 777' }), true);
+  assert.equal(isTestBuild({ build: 777, device: 'iPhone iOS 26.5' }, { DIAG_TEST_BUILDS: '100, 777' }), true, 'a number, and no platform field (read from the device)');
+  assert.equal(isTestBuild({ platform: 'ios', build: '1000' }, { DIAG_TEST_BUILDS: '100' }), false);
+  assert.equal(isTestBuild({ platform: 'android', build: '100', device: 'Pixel 9' }, { DIAG_TEST_BUILDS: '100' }), false, 'Android build 100 was a real release number');
+  // The whole rule has an off switch.
+  assert.equal(isTestBuild({ platform: 'ios', build: '100', simulator: true, device: 'iPhone Simulator' }, { DIAG_TEST_RULE: '0', DIAG_TEST_BUILDS: '100' }), false);
   assert.equal(isTestBuild(null, {}), false);
   assert.equal(isTestBuild({}, {}), false);
 });
@@ -113,11 +118,11 @@ test('the /diagnostics route: test-build reports never touch the real cap, the r
   const logs = [];
   const ctx = { process: { env: { DIAG_MAX_PER_DAY: '3', DIAG_TEST_MAX_PER_DAY: '2' } }, express: { json: () => null },
     app: { post: (r, _mw, f) => handlers.set(r, f) }, diag, diagDayStamp: '', diagDayCount: 0, diagTestDayCount: 0, kept: [],
-    console: { log: (m) => logs.push(String(m)), warn: (m) => logs.push(String(m)) }, Date, Number };
+    console: { log: (m) => logs.push(String(m)), warn: (m) => logs.push(String(m)) }, Date, Number, String, Math };
   vm.createContext(ctx);
   vm.runInContext(head, ctx);
   const post = (body) => { let code = 200, out; handlers.get('/diagnostics')({ body }, { status(c) { code = c; return this; }, json(v) { out = v; return this; } }); return { code, out }; };
-  const sim = { platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'abnormal', breadcrumbs: 'private breadcrumb words' };
+  const sim = { platform: 'ios', build: '100', device: 'iPhone iOS 26.5', simulator: true, kind: 'abnormal', breadcrumbs: 'private breadcrumb words' };
   const real = { platform: 'ios', build: '348', device: 'iPhone iOS 27.2.1', kind: 'hang' };
   for (let i = 0; i < 50; i++) assert.equal(JSON.stringify(post(sim)), JSON.stringify({ code: 200, out: { ok: true, kept: false, reason: 'test build' } }));
   assert.equal(ctx.kept.length, 0, 'nothing from a test build is kept');
@@ -127,4 +132,18 @@ test('the /diagnostics route: test-build reports never touch the real cap, the r
   for (let i = 0; i < 3; i++) assert.equal(post(real).out.kept, true);
   assert.equal(post(real).code, 429);
   assert.equal(ctx.kept.length, 3);
+
+  // DIAG_TEST_MAX_PER_DAY=0 is a real answer (no log line at all), not "use the default".
+  const logs0 = [];
+  const ctx0 = { process: { env: { DIAG_TEST_MAX_PER_DAY: '0' } }, express: { json: () => null },
+    app: { post: (r, _mw, f) => handlers.set(r, f) }, diag, diagDayStamp: '', diagDayCount: 0, diagTestDayCount: 0, kept: [],
+    console: { log: (m) => logs0.push(String(m)), warn: (m) => logs0.push(String(m)) }, Date, Number, String, Math };
+  vm.createContext(ctx0);
+  vm.runInContext(head, ctx0);
+  for (let i = 0; i < 5; i++) assert.equal(post(sim).out.kept, false);
+  assert.equal(logs0.length, 0);
+  assert.equal(ctx0.kept.length, 0);
+  // A build-100 report with no simulator mark is a real report: kept, and counted on the real cap.
+  assert.equal(post({ platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'crash' }).out.kept, true);
+  assert.equal(ctx0.kept.length, 1);
 });

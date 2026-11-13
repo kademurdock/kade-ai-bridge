@@ -27,6 +27,11 @@
  */
 
 const CUT_MARK = '(cut off here; they did not hear the rest)';
+/* Nov 13 2026 (sweep 1.3, second pass). A piece whose AUDIO broke off on the way to the phone (the
+ * streamed first sentence stalled or its feed failed), in a turn that then went on: the caller heard the
+ * start of that sentence and every sentence after it. The stored turn says so in place, and carries on.
+ * It matches CUT_MARK_RE, so it is kept out of speech and captions like the other marker. */
+const CUT_GAP = '(cut off; not heard to the end)';
 const CUT_NONE = '(cut off before I said anything; they heard none of this reply)';
 // Any "(cut off ...)" the model writes back in its own reply is stripped before it is spoken.
 const CUT_MARK_RE = /\(\s*cut off\b[^()\n]{0,100}\)/gi;
@@ -134,21 +139,42 @@ function heardWordCount(unit, heardMs) {
 function buildHeardText(units, { lostText = false } = {}) {
   const pieces = [];
   let cut = !!lostText;
+  let stopped = !!lostText; // the turn itself ended early (the closing marker), as against a gap inside it
+  let heardWords = 0;
   for (const u of units || []) {
     const h = u && u.heard;
-    if (!h || h === 'none') { cut = true; break; }
-    if (h === 'whole') { if (u.raw && String(u.raw).trim()) pieces.push(String(u.raw).trim()); continue; }
+    if (!h || h === 'none') { cut = true; stopped = true; break; }
+    if (h === 'whole') {
+      if (u.raw && String(u.raw).trim()) { pieces.push(String(u.raw).trim()); heardWords += spokenWords(u.raw).length; }
+      continue;
+    }
     const total = spokenWords(u.raw).length;
-    const n = heardWordCount(u, h.ms);
+    /* A piece whose audio broke off after cutMs (sweep 1.3): it can never have been heard past that
+     * point, however long it was given, and the turn went on after it unless something else stopped it. */
+    const feedCut = Number.isFinite(u.cutMs);
+    const n = heardWordCount(u, feedCut ? Math.min(h.ms, u.cutMs) : h.ms);
     const kept = cutAtWords(u.raw, n);
-    if (kept) pieces.push(kept);
-    if (n < total) { cut = true; break; }
+    if (kept) { pieces.push(kept); heardWords += n; }
+    if (feedCut && h.ms >= u.cutMs) { cut = true; pieces.push(CUT_GAP); continue; }
+    if (n < total) { cut = true; stopped = true; break; }
   }
   const said = pieces.join(' ').replace(/\[END CALL\]/gi, '').replace(/[ \t]{2,}/g, ' ').trim();
   if (!cut) return { text: said, cut: false };
   // Nothing heard: the marker alone. A cut mid-word or between pieces: the heard words, then the marker.
-  if (!spokenWords(said).length) return { text: CUT_NONE, cut: true };
-  return { text: `${said} ${CUT_MARK}`, cut: true };
+  if (!heardWords) return { text: CUT_NONE, cut: true };
+  return { text: stopped ? `${said} ${CUT_MARK}` : said, cut: true };
+}
+
+/* A turn that ran to its end with nobody interrupting, in which the audio of one piece broke off
+ * (unit.cutMs): what the caller heard. Every other piece played whole. Returns null when no piece was
+ * cut, or when a piece has no text to rebuild the turn from (then the turn is stored as written). */
+function buildFeedCutText(units) {
+  const list = Array.isArray(units) ? units : [];
+  if (!list.some((u) => u && Number.isFinite(u.cutMs))) return null;
+  if (!list.every((u) => u && typeof u.raw === 'string')) return null;
+  const placed = list.map((u) => ({ ...u, heard: Number.isFinite(u.cutMs) ? { ms: u.cutMs } : 'whole' }));
+  const r = buildHeardText(placed, { lostText: false });
+  return r.cut ? r : null;
 }
 
 /* Where each piece got to, on the PHONE line.
@@ -164,6 +190,9 @@ function placePhone(units, stopAt) {
     if (!u.sendAt) { u.heard = u.cueAt && u.cueAt < stopAt && !u.hasSpeech ? 'whole' : 'none'; continue; }
     if (u.markAt && u.markAt <= stopAt) { u.heard = 'whole'; prevMark = u.markAt; continue; }
     const startAt = Math.max(u.sendAt, prevMark || 0);
+    /* Sweep 1.3: a piece whose audio broke off after cutMs has no mark, and the pieces after it still
+     * played. It ended at startAt + cutMs; if that was before the stop, the walk goes on from there. */
+    if (Number.isFinite(u.cutMs) && startAt + u.cutMs <= stopAt) { u.heard = { ms: u.cutMs }; prevMark = startAt + u.cutMs; continue; }
     u.heard = startAt >= stopAt ? 'none' : { ms: stopAt - startAt };
     prevMark = 0;
   }
@@ -215,7 +244,7 @@ function kdtmWords(buf) {
 }
 
 module.exports = {
-  CUT_MARK, CUT_NONE, heardOnlyOn, hasCutMark, stripCutMarks,
+  CUT_MARK, CUT_GAP, CUT_NONE, buildFeedCutText, heardOnlyOn, hasCutMark, stripCutMarks,
   spokenWords, cutAtWords, wordsByShare, heardWordCount, buildHeardText,
   placePhone, placeWeb, kdtmWords,
 };

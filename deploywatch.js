@@ -275,7 +275,13 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser, cancelDe
     }
     state.last = { at: new Date().toISOString(), trigger, rows };
     const allBlind = rows.length > 0 && rows.every((r) => r.error);
-    if (allBlind) {
+    /* Only the watcher's own scheduled passes count toward the streak (second pass, lead review): a
+     * /platform-status read or a manual run during an outage would otherwise reach the limit in
+     * minutes. Any pass that reads something, scheduled or not, still ends the streak. */
+    const scheduled = trigger === 'tick' || trigger === 'boot';
+    if (allBlind && !scheduled) {
+      // not counted, not alerted on
+    } else if (allBlind) {
       state.blind.passes += 1;
       if (BLIND_PASSES > 0 && state.blind.passes >= BLIND_PASSES && !state.blind.alerted) {
         state.blind.alerted = true;

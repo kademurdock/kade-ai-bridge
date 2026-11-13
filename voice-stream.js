@@ -3088,6 +3088,22 @@ async function streamReply(session, userText) {
         applyHeardCut(session, cut);
         session._lastCut = cut;
       } else {
+        /* Nov 13 2026 (sweep 1.3): nobody interrupted, but the audio of one piece broke off on the way
+         * to the phone (unit.cutMs, set by playMulawStream). The turn used to be stored whole, as if
+         * the caller had heard that sentence to its end. It is stored as heard: that sentence cut,
+         * with the marker, and every later sentence kept. */
+        try {
+          const r = heardCut.buildFeedCutText(turnUnits);
+          if (r) {
+            entry.content = r.text;
+            entry.heardCut = true;
+            entry.generatedChars = whole.length; // billing still counts what the model wrote
+            console.log(`[voice-stream] heard-cut ${session.streamSid}: a piece's audio broke off mid-turn, kept ${r.text.length}/${whole.length} chars`);
+          }
+        } catch (e) {
+          entry.content = whole; // never lose the turn over this
+          console.warn('[voice-stream] feed-cut store failed, whole reply kept:', e.message);
+        }
         // The turn is done but its audio may still be playing: a web turn returns WEB_LEAD_MS before
         // the last clip ends. A barge-in in that tail still cuts this entry (see bargeIn).
         session._lastCut = { entry, units: turnUnits, lostText: false, startedAt: turnStartedAt, whole, doneAt: Date.now() };
@@ -3159,10 +3175,13 @@ const PHONE_STREAM_FIRST = process.env.PHONE_STREAM_FIRST !== '0';
 /* Nov 13 2026 (sweep 1.3): a streamed opener that stops arriving mid-sentence. The player waited, with
  * the line held as "speaking", until the proxy's 20 s clock or this side's 25 s socket clock, and the
  * caller sat in silence; then the piece was recorded as fully heard. Now, once some of the piece has
- * played, everything that arrived has been sent, and nothing new has come for PHONE_STREAM_STALL_MS
- * (default 2500), the piece is given up as CUT (not fully heard) and the reply moves on to its next
- * sentence. A feed that ended on an error is recorded as cut as well. PHONE_STREAM_STALL_MS=0: wait
- * as before, and a failed feed counts as heard as before. */
+ * played and the caller has been hearing NOTHING for PHONE_STREAM_STALL_MS (default 2500), the piece
+ * is given up as CUT and the reply moves on to its next sentence. The clock runs from the moment the
+ * audio already sent finished playing, not from when bytes last arrived: a feed can deliver faster
+ * than real time, and the caller is still hearing what it delivered. A feed that ended on an error is
+ * cut as well. Either way the piece carries unit.cutMs (how much of it played), and the turn is stored
+ * with that sentence cut and the sentences after it kept (heard-cut.js). PHONE_STREAM_STALL_MS=0:
+ * wait as before, and a failed feed counts as heard as before. */
 const PHONE_STREAM_STALL_MS = (() => {
   const n = parseInt(process.env.PHONE_STREAM_STALL_MS ?? '', 10);
   return Number.isFinite(n) && n >= 0 ? n : 2500;
@@ -3254,13 +3273,13 @@ async function playMulawStream(session, feed, opts = {}) {
   let dry = false;
   let complete = false;       // every frame of the piece was sent
   let stalled = false;        // sweep 1.3: the feed stopped arriving mid-piece
-  let lastDataAt = start;     // when bytes last arrived from the proxy
+  let dryAt = 0;              // when the audio already sent finished playing (the caller hears nothing from then)
   for (;;) {
     if (session.llmAbort || !session.isSpeaking || session.ws.readyState !== WebSocket.OPEN) break;
-    if (feed.queue.length) { pending = Buffer.concat([pending, ...feed.queue.splice(0)]); lastDataAt = Date.now(); }
+    if (feed.queue.length) pending = Buffer.concat([pending, ...feed.queue.splice(0)]);
     const now = Date.now();
     if (playheadEnd < now) {  // Twilio ran dry: the next frame plays when it lands
-      if (frames && !dry) { dry = true; underruns++; }
+      if (frames && !dry) { dry = true; underruns++; dryAt = playheadEnd; }
       playheadEnd = now;
     }
     while (pending.length >= FRAME_BYTES && playheadEnd - now < LEAD_MS) {
@@ -3280,7 +3299,7 @@ async function playMulawStream(session, feed, opts = {}) {
       complete = !(PHONE_STREAM_STALL_MS > 0 && feed.failed); // a feed that broke off was not the whole sentence
       break;
     }
-    if (PHONE_STREAM_STALL_MS > 0 && frames > 0 && !feed.ended && pending.length < FRAME_BYTES && now - lastDataAt >= PHONE_STREAM_STALL_MS) {
+    if (PHONE_STREAM_STALL_MS > 0 && dry && !feed.ended && pending.length < FRAME_BYTES && now - dryAt >= PHONE_STREAM_STALL_MS) {
       stalled = true;
       break;
     }
@@ -3295,6 +3314,10 @@ async function playMulawStream(session, feed, opts = {}) {
       const queued = feed.queue.reduce((n, c) => n + c.length, 0);
       const got = Math.ceil((frames * FRAME_BYTES + pending.length + queued) / FRAME_BYTES) * 20;
       unit.durMs = feed.ended && !feed.failed ? got : Math.max(got, String(unit.raw || '').length * 60);
+      /* Sweep 1.3: the AUDIO ended short (a stall, or a feed that broke off) and nobody interrupted:
+       * this much of the piece played, and the turn goes on. The stored turn is cut here (streamReply). */
+      const feedCut = stalled || (PHONE_STREAM_STALL_MS > 0 && !!feed.failed && feed.ended);
+      if (feedCut && !session.llmAbort && session.isSpeaking && session.ws.readyState === WebSocket.OPEN) unit.cutMs = frames * 20;
     }
   }
   if (!complete) feed.destroy(); // barge-in, a closed line or a stalled feed: let the proxy go

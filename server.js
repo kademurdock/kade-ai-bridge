@@ -586,7 +586,11 @@ function crashWhoPhrase(entries) {
 const DIAG_MAX_PER_DAY = Number(process.env.DIAG_MAX_PER_DAY || 200);
 /* Sweep 8.3 (diagnostics.js isTestBuild): a test build's reports get this many log lines a day, never
  * touch the real cap, the ring or the crash alert, and past it are dropped without a word. */
-const DIAG_TEST_MAX_PER_DAY = Number(process.env.DIAG_TEST_MAX_PER_DAY || 20);
+const DIAG_TEST_MAX_PER_DAY = (() => { // 0 is a real answer: no log line at all for a test build
+  const raw = String(process.env.DIAG_TEST_MAX_PER_DAY ?? '').trim();
+  const n = raw === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 20;
+})();
 app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
