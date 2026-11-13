@@ -178,7 +178,15 @@ async function githubTip(repo, branch, pat) {
   const r = await fetch(`https://api.github.com/repos/${repo}/branches/${encodeURIComponent(branch)}`, {
     headers: { Authorization: `Bearer ${pat}`, 'User-Agent': UA, Accept: 'application/vnd.github+json' },
   });
-  if (!r.ok) throw new Error(`github ${repo}@${branch}: HTTP ${r.status}`);
+  if (!r.ok) {
+    /* Nov 13 2026: say WHY. A bare 403 hid whether it was the token, a rate limit or the
+     * repo; GitHub's own message and its rate-limit headers tell them apart. Never the token. */
+    let why = '';
+    try { why = String((await r.json())?.message || '').replace(/\s+/g, ' ').slice(0, 160); } catch { /* no body */ }
+    const left = r.headers.get('x-ratelimit-remaining');
+    const retry = r.headers.get('retry-after');
+    throw new Error(`github ${repo}@${branch}: HTTP ${r.status}${why ? ` (${why})` : ''}${left != null ? ` left=${left}` : ''}${retry ? ` retry-after=${retry}` : ''}`);
+  }
   const j = await r.json();
   return { sha: j?.commit?.sha || null, at: j?.commit?.commit?.committer?.date || null };
 }
