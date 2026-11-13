@@ -54,6 +54,7 @@
 'use strict';
 
 const fs = require('fs');
+const { textReceipt } = require('./log-text'); // Nov 13 2026 (sweep 8.6): what was said is logged as a length and a hash (KADE_LOG_TEXT=1 for the words)
 const os = require('os');
 const path = require('path');
 const axios = require('axios');
@@ -1044,7 +1045,7 @@ function attachErrands(app, deps = {}) {
     if (store.errands.length > ERRANDS_KEPT) store.errands.length = ERRANDS_KEPT;
     saveStore();
     setImmediate(() => pump(deps).catch((e) => console.error('[errand] pump:', e.message)));
-    console.log(`[errand] ${errand.id} started for ${userId}: "${cut(goal, 80)}"`);
+    console.log(`[errand] ${errand.id} started for ${userId}: ${textReceipt(goal)}`);
     res.json({
       ok: true, id: errand.id, status: errand.status,
       spokenSummary: `Alright, I'm on it. I'll ping your phone when it's done, and you can ask me how it's going any time. This one's number is ${errand.id}.`,

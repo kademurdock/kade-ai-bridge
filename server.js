@@ -12,6 +12,7 @@
 'use strict';
 
 const express  = require('express');
+const { textReceipt } = require('./log-text'); // Nov 13 2026 (sweep 8.6): what was said is logged as a length and a hash (KADE_LOG_TEXT=1 for the words)
 const http     = require('http');
 const http2    = require('http2');
 const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd, characterRateFor } = require('./voice-stream');
@@ -532,6 +533,7 @@ const DIAG_SEATS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tm
 const diagSeats = (() => { try { if (fs.existsSync(DIAG_SEATS_FILE)) return JSON.parse(fs.readFileSync(DIAG_SEATS_FILE, 'utf8')) || {}; } catch {} return {}; })();
 function saveDiagSeats() { try { fs.writeFileSync(DIAG_SEATS_FILE, JSON.stringify(diagSeats)); } catch (e) { console.warn('[diag] seats save failed:', e.message); } }
 let diagDayStamp = ''; let diagDayCount = 0; let crashPushDay = '';
+let diagTestDayCount = 0; // sweep 8.3: reports from test builds (CI simulators), counted apart from real phones
 /* Aug 13 2026 — STORM DETECTION. One push per Central day was the old rule,
  * and even had it been able to fire, Amber's FIVE crashes in 55 minutes would
  * have read exactly like one crash. Volume is the signal: a lone crash is
@@ -582,10 +584,21 @@ function crashWhoPhrase(entries) {
  * 64KB ceiling to anyone auditing this route, and real payloads are
  * 100–300KB. */
 const DIAG_MAX_PER_DAY = Number(process.env.DIAG_MAX_PER_DAY || 200);
+/* Sweep 8.3 (diagnostics.js isTestBuild): a test build's reports get this many log lines a day, never
+ * touch the real cap, the ring or the crash alert, and past it are dropped without a word. */
+const DIAG_TEST_MAX_PER_DAY = Number(process.env.DIAG_TEST_MAX_PER_DAY || 20);
 app.post('/diagnostics', express.json({ limit: '600kb' }), (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    if (diagDayStamp !== today) { diagDayStamp = today; diagDayCount = 0; }
+    if (diagDayStamp !== today) { diagDayStamp = today; diagDayCount = 0; diagTestDayCount = 0; }
+    if (diag.isTestBuild(req.body)) {
+      const n = ++diagTestDayCount;
+      if (n <= DIAG_TEST_MAX_PER_DAY) {
+        const t = diag.normalizeEntry(req.body || {}, new Date().toISOString());
+        console.log(`DIAGNOSTICS (test build, not kept) -- ${t.platform} build ${t.build} device ${t.device} kind ${t.kind} (${n} today${n === DIAG_TEST_MAX_PER_DAY ? '; further test-build reports today are dropped unlogged' : ''})`);
+      }
+      return res.json({ ok: true, kept: false, reason: 'test build' });
+    }
     if (++diagDayCount > DIAG_MAX_PER_DAY) {
       console.warn(`[diag] DROPPED a report — daily cap ${DIAG_MAX_PER_DAY} reached (raise DIAG_MAX_PER_DAY)`);
       return res.status(429).json({ ok: false, reason: 'daily cap' });
@@ -972,6 +985,23 @@ function sendApnsPush(deviceToken, title, body, opts = {}) {
 const fcm = require('./fcm');
 const pushAuth = require('./push-auth'); // IOS-19 (Nov 12 2026): a device links only to the user its token proves
 const PUSH_JWT_SECRET = process.env.LIBRECHAT_JWT_SECRET || process.env.JWT_SECRET || '';
+/* Sweep 8.7: every registration is counted by platform and outcome (push-auth.js), so "how many
+ * would fail on the enforce date" has an answer. One summary line every PUSH_AUTH_SUMMARY_HOURS
+ * (default 6; 0 = no line) when anything new was counted, and the same numbers under `pushAuth` in
+ * /platform-status. Numbers only. */
+const pushAuthTally = pushAuth.createPushAuthTally();
+{
+  const hours = Number(process.env.PUSH_AUTH_SUMMARY_HOURS ?? 6);
+  if (Number.isFinite(hours) && hours > 0) {
+    let lastTotal = 0;
+    const t = setInterval(() => {
+      if (pushAuthTally.total === lastTotal) return;
+      lastTotal = pushAuthTally.total;
+      console.log(`[push-auth] since boot (mode ${pushAuth.pushAuthMode()}): ${pushAuthTally.line()}`);
+    }, hours * 3600 * 1000);
+    if (typeof t.unref === 'function') t.unref();
+  }
+}
 {
   const from = pushAuth.enforceFromMs();
   console.log(`[push-auth] /push-register mode ${pushAuth.pushAuthMode()}${from !== null ? `, enforce from ${new Date(from).toISOString()}` : (process.env.PUSH_REGISTER_ENFORCE_FROM ? ' (PUSH_REGISTER_ENFORCE_FROM unreadable, ignored)' : '')}${PUSH_JWT_SECRET ? '' : ' -- NO LIBRECHAT_JWT_SECRET: nothing can be verified or refused'}`);
@@ -1017,6 +1047,7 @@ app.post('/push-register', (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'userId') && !claimedUserId) {
     pushTokens.delete(token);
     savePushTokens();
+    pushAuthTally.note('signout', isAndroid ? 'android' : platformIn);
     return res.json({ ok: true, count: pushTokens.size, linked: false, unregistered: true });
   }
   // IOS-19: the body's userId is only a claim. The link goes to the user the bearer proves.
@@ -1028,6 +1059,7 @@ app.post('/push-register', (req, res) => {
   if (link.how === 'would-refuse' || link.how === 'refused' || link.how === 'unverified' || link.mismatch) {
     console.warn(`[push-auth] ${link.how === 'jwt' ? 'body userId differs from the signed-in user; linked to the signed-in user' : link.how} (${link.reason || 'mismatch'}) platform=${platformIn}`);
   }
+  pushAuthTally.note(link.how, isAndroid ? 'android' : platformIn, { mismatch: !!link.mismatch });
   if (link.refuse) return res.status(401).json({ error: 'sign in again to link this device' });
   const userId = link.userId;
   const platform = isAndroid ? 'android' : platformIn;
@@ -1753,7 +1785,7 @@ app.post('/sms', async (req, res) => {
   const from  = req.body.From;
   const body  = (req.body.Body || '').trim();
   if (!body) { res.type('text/xml').send(twiml.toString()); return; }
-  console.log(`[sms] from=${from} body="${body}"`);
+  console.log(`[sms] from=${from} body=${textReceipt(body)}`);
   const user    = users.get(from) || { agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME, name: 'there' };
   const history = convHistory.get(from) || [];
   convHistory.set(from, history);
@@ -1990,7 +2022,7 @@ app.post('/voice/transcribed', async (req, res) => {
 
   res.status(200).end();
   if (!state || !text || !twilioClient) return;
-  console.log(`[voice] transcribed callSid=${callSid}: "${text}"`);
+  console.log(`[voice] transcribed callSid=${callSid}: ${textReceipt(text)}`);
 
   try {
     // Voice switch check first ("switch voice to Sarah")
@@ -2054,7 +2086,7 @@ app.post('/voice/continue/:callSid', async (req, res) => {
     return res.type('text/xml').send(twiml.toString());
   }
 
-  console.log(`[voice] continue callSid=${callSid}: "${speech}"`);
+  console.log(`[voice] continue callSid=${callSid}: ${textReceipt(speech)}`);
 
   try {
     // Voice switch check first
@@ -2138,7 +2170,7 @@ app.post('/voice/heard/:callSid', async (req, res) => {
   res.type('text/xml').send(twiml.toString());
 
   if (!state || !speech || !twilioClient) return;
-  console.log(`[voice] heard callSid=${callSid}: "${speech}"`);
+  console.log(`[voice] heard callSid=${callSid}: ${textReceipt(speech)}`);
 
   try {
     const voiceTarget = extractVoiceSwitch(speech);
@@ -3595,7 +3627,7 @@ app.post('/reminders', (req, res) => {
   };
   reminders.set(id, sub);
   saveReminders();
-  console.log(`[reminders] created ${id}: ${sub.agentName} -> user ${userId} at ${sub.fireAt} ("${text.slice(0, 60)}")`);
+  console.log(`[reminders] created ${id}: ${sub.agentName} -> user ${userId} at ${sub.fireAt} (${textReceipt(text)})`);
   res.json({ ok: true, reminder: { ...sub, fireAtCentral: formatCentralDisplay(fireAt) } });
 });
 
@@ -6194,6 +6226,7 @@ app.get('/platform-status', async (req, res) => {
       battery: batteryS.section,
       // Part 236: Jev's call counts since boot ({ok, failed}); null = not loaded.
       jev: JEV ? { enabled: JEV.enabled(), model: JEV.MODEL, ...JEV.counts } : null,
+      pushAuth: adminOk ? { mode: pushAuth.pushAuthMode(), ...pushAuthTally.snapshot() } : undefined, // sweep 8.7
       balances: balances.section,
       spend: spend.lines,
       spendNote: spend.note,

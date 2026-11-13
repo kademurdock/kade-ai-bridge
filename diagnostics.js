@@ -49,6 +49,23 @@ function normalizeEntry(b, at) {
   return entry;
 }
 
+/* Nov 13 2026 (sweep 8.3): the free CI simulator runs post their crash-loop reports to this sink (the
+ * app's sink address is fixed), and in 30 hours they were 205 of 215 reports and most of the daily cap
+ * that real phones share. A report from a TEST BUILD is counted on its own small allowance and never
+ * enters the ring, the seats or the crash alert. A test build is one the app marks itself
+ * (`simulator: true`, or a device name with "Simulator" in it), or an iPhone build whose number is in
+ * DIAG_TEST_BUILDS (default "100": project.yml gives every non-release build that number, and no
+ * released build has it). DIAG_TEST_BUILDS= (empty) turns the build-number rule off. */
+function testBuildNumbers(env = process.env) {
+  return new Set(String(env.DIAG_TEST_BUILDS ?? '100').split(',').map((x) => x.trim()).filter(Boolean));
+}
+function isTestBuild(b, env = process.env) {
+  b = b || {};
+  if (b.simulator === true || b.simulator === 'true' || b.simulator === 1) return true;
+  if (/simulator/i.test(String(b.device || ''))) return true;
+  return platformOf(b) === 'ios' && testBuildNumbers(env).has(String(b.build ?? '').trim());
+}
+
 /** Which entry to drop when the ring is over its cap: the oldest that is not a crash or a freeze. */
 function evictIndex(ring) {
   const i = ring.findIndex((e) => !ALERT_KINDS.has(e.kind));
@@ -133,6 +150,6 @@ function platformPhrase(entry) {
 }
 
 module.exports = {
-  ALERT_KINDS, RING_MAX, platformOf, normalizeEntry, evictIndex, trimRing, loadRing, updateSeats, seatKey,
+  ALERT_KINDS, RING_MAX, platformOf, normalizeEntry, isTestBuild, evictIndex, trimRing, loadRing, updateSeats, seatKey,
   crashCausePlain, platformPhrase,
 };

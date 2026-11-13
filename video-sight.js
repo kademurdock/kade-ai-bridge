@@ -19,6 +19,7 @@
  * Everything here is fail-soft: vision trouble degrades to a voice call.
  */
 const fs = require('fs');
+const { textReceipt } = require('./log-text'); // Nov 13 2026 (sweep 8.6): what was said is logged as a length and a hash (KADE_LOG_TEXT=1 for the words)
 const path = require('path');
 const os = require('os');
 const axios = require('axios');
@@ -222,7 +223,7 @@ function onAlert(fn) { _deliverAlert = fn; }
 function disarmWatch(session, reason) {
   if (session._videoWatchTimer) { clearInterval(session._videoWatchTimer); session._videoWatchTimer = null; }
   if (session.watch) {
-    console.log(`[video-sight] watch disarmed (${reason || 'off'}): "${session.watch.condition}" user=${session.userId}`);
+    console.log(`[video-sight] watch disarmed (${reason || 'off'}): ${textReceipt(session.watch.condition)} user=${session.userId}`);
     session.watch = null;
   }
 }
@@ -234,7 +235,7 @@ function armWatch(session, condition) {
   disarmWatch(session, 'replaced'); // one watch at a time -- new one wins
   session.watch = { condition: cond, armedAt: Date.now(), firing: false };
   session._videoWatchTimer = setInterval(() => { checkWatch(session).catch(() => {}); }, WATCH_INTERVAL_MS);
-  console.log(`[video-sight] watch ARMED: "${cond}" user=${session.userId} every ${WATCH_INTERVAL_MS}ms`);
+  console.log(`[video-sight] watch ARMED: ${textReceipt(cond)} user=${session.userId} every ${WATCH_INTERVAL_MS}ms`);
 }
 
 async function checkWatch(session) {
@@ -276,7 +277,7 @@ async function checkWatch(session) {
     // Condition is TRUE. Take one fresh, full look (best available detail for
     // the alert itself), then hand the character an automatic alert turn.
     w.firing = true;
-    console.log(`[video-sight] watch HIT: "${w.condition}" user=${session.userId}`);
+    console.log(`[video-sight] watch HIT: ${textReceipt(w.condition)} user=${session.userId}`);
     try { await describeFrame(session); } catch { /* alert still fires without a fresh look */ }
     const desc = session.sceneDesc && session.sceneDesc.text ? session.sceneDesc.text : 'no fresh description available';
     const cond = w.condition;

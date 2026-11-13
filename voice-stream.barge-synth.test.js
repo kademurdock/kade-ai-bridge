@@ -259,3 +259,55 @@ test('GW-5: a greeting the timeout gave up on closes its request (the proxy then
   await until(() => askSeen.length === 1 && askSeen[0].closedAt > 0, 2000);
   assert.ok(askSeen[0].closedAt - t0 < 1500, 'closed when the timeout fired, not left running');
 });
+
+/* Nov 13 2026 (sweep 1.3): a streamed opener that stops arriving mid-sentence is given up after
+ * PHONE_STREAM_STALL_MS (2500) instead of holding the line silent until a 20 s clock, and a piece that was
+ * cut short is no longer recorded as fully heard. */
+test('sweep 1.3: a feed that stalls mid-piece is cut after the stall limit: no mark, the stream released, not counted as whole', async () => {
+  const s = fakePhone();
+  const feed = fakeFeed();
+  const unit = { raw: 'So the thing about your fence is that it leans.' };
+  feed.push(Buffer.alloc(800, 1)); // 100 ms of audio, then nothing, and the feed never ends
+  const t0 = Date.now();
+  await Promise.race([playMulawStream(s, feed, { unit }), new Promise((_, rej) => setTimeout(() => rej(new Error('still waiting after 6 s')), 6000))]);
+  const took = Date.now() - t0;
+  assert.ok(took >= 2400 && took < 4500, `gave up after ${took} ms`);
+  assert.strictEqual(s.frames.length, 5, 'what arrived was played');
+  assert.strictEqual(s.marks.length, 0, 'no heard mark for a piece that was cut');
+  assert.strictEqual(feed.destroyed, true, 'the proxy is let go');
+  assert.strictEqual(s.isSpeaking, false, 'the line is free for the next sentence');
+  assert.ok(unit.durMs >= unit.raw.length * 60, 'the piece keeps its whole estimated length, so it is never taken as fully heard');
+});
+
+test('sweep 1.3: a slow feed that keeps arriving is never cut, and audio still buffered is never cut', async () => {
+  const s = fakePhone();
+  const feed = fakeFeed();
+  const unit = { raw: 'x' };
+  feed.push(Buffer.alloc(160, 1));
+  const play = playMulawStream(s, feed, { unit });
+  // A piece every 900 ms for 3.6 s: each gap is under the limit, the total is well over it.
+  for (let i = 1; i <= 4; i++) setTimeout(() => { feed.push(Buffer.alloc(160, 1)); if (i === 4) feed.end(); }, i * 900);
+  await play;
+  assert.strictEqual(s.frames.length, 5);
+  assert.strictEqual(s.marks.length, 1, 'played whole');
+  assert.strictEqual(feed.destroyed, false);
+});
+
+test('sweep 1.3: a feed that ends on an error is recorded as cut short, not as heard', async () => {
+  const s = fakePhone();
+  const feed = fakeFeed();
+  const unit = { raw: 'hello there, this was going to be a longer sentence' };
+  feed.push(Buffer.alloc(800, 1));
+  const play = playMulawStream(s, feed, { unit });
+  setTimeout(() => feed.end(new Error('cut off before its end')), 50);
+  await play;
+  assert.strictEqual(s.frames.length, 5, 'what arrived still plays, padded');
+  assert.strictEqual(s.marks.length, 0);
+  assert.ok(unit.durMs >= unit.raw.length * 60);
+});
+
+test('sweep 1.3: the switch is read at load and documented in the code', () => {
+  const src = require('fs').readFileSync(require.resolve('./voice-stream.js'), 'utf8');
+  assert.ok(src.includes("parseInt(process.env.PHONE_STREAM_STALL_MS ?? '', 10)"));
+  assert.ok(src.includes('complete = !(PHONE_STREAM_STALL_MS > 0 && feed.failed);'));
+});

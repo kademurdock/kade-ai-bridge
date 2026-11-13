@@ -137,3 +137,32 @@ test('the call socket\'s barge handler asks the Spotter lane to mute', () => {
   const block = src.slice(at, src.indexOf('return;', at));
   assert.ok(block.includes('if (session.liveOn) { try { videoLive.muteLiveTurn(session); } catch {} }'));
 });
+
+/* Nov 13 2026 (sweep 1.4): with LIVE_STOP_NOTE=1 Google is told, once per muted turn, that the rest
+ * was not heard. Off by default: nothing is sent. */
+test('Stop tells the Spotter nothing by default; with LIVE_STOP_NOTE=1 it is told once per muted turn', () => {
+  const texts = (gws) => gws.sent.map((d) => JSON.parse(d)).filter((m) => m.realtimeInput && typeof m.realtimeInput.text === 'string');
+  {
+    const { s, gws } = mk();
+    handleGoogleMessage(s, audio(), gws);
+    assert.strictEqual(vl.muteLiveTurn(s), true);
+    assert.strictEqual(texts(gws).length, 0, 'default: nothing is written to Google');
+  }
+  process.env.LIVE_STOP_NOTE = '1';
+  try {
+    const { s, gws } = mk();
+    handleGoogleMessage(s, audio(), gws);
+    assert.strictEqual(vl.muteLiveTurn(s), true);
+    assert.strictEqual(vl.muteLiveTurn(s), true, 'a second Stop in the same turn');
+    assert.strictEqual(texts(gws).length, 1, 'told once');
+    assert.strictEqual(texts(gws)[0].realtimeInput.text, vl.LIVE_STOP_NOTE);
+    handleGoogleMessage(s, end('turnComplete'), gws);
+    assert.strictEqual(vl.muteLiveTurn(s), false, 'no open turn: nothing muted, nothing told');
+    assert.strictEqual(texts(gws).length, 1);
+    handleGoogleMessage(s, audio(), gws);
+    assert.strictEqual(vl.muteLiveTurn(s), true);
+    assert.strictEqual(texts(gws).length, 2, 'the next muted turn is told again');
+  } finally {
+    delete process.env.LIVE_STOP_NOTE;
+  }
+});

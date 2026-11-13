@@ -80,3 +80,51 @@ test('Android causes are spoken plainly; Apple ones are unchanged', () => {
   assert.equal(d.platformPhrase({ platform: 'android', appVersion: '2.16' }), 'The Android app 2.16');
   assert.equal(d.platformPhrase({ platform: 'ios' }), '');
 });
+
+/* Nov 13 2026 (sweep 8.3): reports from CI simulators and other test builds are told apart, so they can
+ * be kept off the cap real phones share. */
+test('a test build is one the app marks, a Simulator device, or an iPhone build number on the list', () => {
+  const { isTestBuild } = require('./diagnostics');
+  assert.equal(isTestBuild({ platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'abnormal' }, {}), true, 'build 100: every non-release iPhone build');
+  assert.equal(isTestBuild({ build: 100, device: 'iPhone iOS 26.5' }, {}), true, 'a number, and no platform field (iPhone by default)');
+  assert.equal(isTestBuild({ platform: 'ios', build: '348', device: 'iPhone iOS 27.2.1', kind: 'hang' }, {}), false, 'a released build');
+  assert.equal(isTestBuild({ platform: 'ios', build: '1000' }, {}), false);
+  assert.equal(isTestBuild({ platform: 'android', build: '100', device: 'Pixel 9' }, {}), false, 'Android build 100 was a real release number');
+  assert.equal(isTestBuild({ platform: 'ios', build: '348', simulator: true }, {}), true);
+  assert.equal(isTestBuild({ platform: 'android', build: '126', device: 'Android Simulator x86' }, {}), true);
+  assert.equal(isTestBuild({ platform: 'ios', build: '100' }, { DIAG_TEST_BUILDS: '' }), false, 'the build-number rule can be switched off');
+  assert.equal(isTestBuild({ platform: 'ios', build: '777' }, { DIAG_TEST_BUILDS: '100, 777' }), true);
+  assert.equal(isTestBuild(null, {}), false);
+  assert.equal(isTestBuild({}, {}), false);
+});
+
+test('the /diagnostics route: test-build reports never touch the real cap, the ring, the seats or the alert', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const vm = require('vm');
+  const diag = require('./diagnostics');
+  const src = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+  const start = src.indexOf('const DIAG_MAX_PER_DAY =');
+  const end = src.indexOf('diagRing.push(entry);', start);
+  assert.ok(start > 0 && end > start);
+  // The head of the handler, up to the point where a real report is kept; closed off so it can run alone.
+  const head = src.slice(start, end) + 'kept.push(entry); res.json({ ok: true, kept: true }); } catch (e) { res.status(500).json({ error: e.message }); } });';
+  const handlers = new Map();
+  const logs = [];
+  const ctx = { process: { env: { DIAG_MAX_PER_DAY: '3', DIAG_TEST_MAX_PER_DAY: '2' } }, express: { json: () => null },
+    app: { post: (r, _mw, f) => handlers.set(r, f) }, diag, diagDayStamp: '', diagDayCount: 0, diagTestDayCount: 0, kept: [],
+    console: { log: (m) => logs.push(String(m)), warn: (m) => logs.push(String(m)) }, Date, Number };
+  vm.createContext(ctx);
+  vm.runInContext(head, ctx);
+  const post = (body) => { let code = 200, out; handlers.get('/diagnostics')({ body }, { status(c) { code = c; return this; }, json(v) { out = v; return this; } }); return { code, out }; };
+  const sim = { platform: 'ios', build: '100', device: 'iPhone iOS 26.5', kind: 'abnormal', breadcrumbs: 'private breadcrumb words' };
+  const real = { platform: 'ios', build: '348', device: 'iPhone iOS 27.2.1', kind: 'hang' };
+  for (let i = 0; i < 50; i++) assert.equal(JSON.stringify(post(sim)), JSON.stringify({ code: 200, out: { ok: true, kept: false, reason: 'test build' } }));
+  assert.equal(ctx.kept.length, 0, 'nothing from a test build is kept');
+  assert.equal(logs.filter((l) => l.includes('test build, not kept')).length, 2, 'two log lines a day, then silence');
+  assert.ok(logs.every((l) => !l.includes('private breadcrumb words')));
+  // Fifty simulator reports later, the real cap is untouched: three real reports are kept, the fourth is the cap.
+  for (let i = 0; i < 3; i++) assert.equal(post(real).out.kept, true);
+  assert.equal(post(real).code, 429);
+  assert.equal(ctx.kept.length, 3);
+});

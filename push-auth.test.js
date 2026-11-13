@@ -103,7 +103,8 @@ function rig(env) {
   const token = 'a'.repeat(64);
   const warnings = [];
   const ctx = { app: { post: (r, f) => handlers.set(r, f) }, pushTokens: new Map(), fcm: { looksLikeFcmToken: () => false },
-    savePushTokens() {}, CALL_RINGTONES: {}, console: { log() {}, warn(m) { warnings.push(m); } }, pushAuth, PUSH_JWT_SECRET: 's3' };
+    savePushTokens() {}, CALL_RINGTONES: {}, console: { log() {}, warn(m) { warnings.push(m); } }, pushAuth, PUSH_JWT_SECRET: 's3',
+    pushAuthTally: pushAuth.createPushAuthTally() }; // Nov 13 2026 (sweep 8.7): every registration is counted
   vm.createContext(ctx);
   const start = src.indexOf("app.post('/push-register'");
   vm.runInContext(src.slice(start, src.indexOf('// Admin: send a push', start)), ctx);
@@ -146,5 +147,47 @@ test('handler: a past enforce date refuses with no other setting', () => {
   const r = rig({ PUSH_REGISTER_ENFORCE_FROM: '2020-01-01' });
   try {
     assert.equal(r.call({ token: r.token, platform: 'ios', userId: X }, {}).code, 401);
+  } finally { r.done(); }
+});
+
+/* Nov 13 2026 (sweep 8.7): log mode counts successes too, per platform, so "how many would fail on the
+ * enforce date" can be answered. Numbers only. */
+test('tally: outcomes are counted per platform, a mismatch is counted inside proved, and unknown words are ignored', () => {
+  const t = pushAuth.createPushAuthTally(NOW);
+  assert.equal(t.line(), 'no registrations since boot');
+  t.note('jwt', 'ios'); t.note('jwt', 'ios', { mismatch: true }); t.note('would-refuse', 'ios');
+  t.note('would-refuse', 'android'); t.note('would-refuse', 'android'); t.note('signout', 'android');
+  t.note('unlinked', 'IOS'); t.note('nonsense', 'ios'); t.note('jwt', 'we b!');
+  const snap = t.snapshot();
+  assert.equal(snap.total, 8);
+  assert.equal(snap.since, new Date(NOW).toISOString());
+  assert.deepEqual(snap.platforms.ios, { proved: 2, mismatch: 1, unproven: 1, unlinked: 1 });
+  assert.deepEqual(snap.platforms.android, { unproven: 2, signedOut: 1 });
+  assert.deepEqual(snap.platforms.web, { proved: 1 });
+  assert.equal(t.line(), 'android signedOut 1, unproven 2; ios mismatch 1, proved 2, unlinked 1, unproven 1; web proved 1');
+});
+
+test('handler, log mode: proved, unproven, token-only and sign-out registrations are all counted, with no id or token', () => {
+  const r = rig({});
+  try {
+    r.call({ token: r.token, platform: 'ios', userId: X }, { authorization: 'Bearer ' + mintNow(X) }); // proved
+    r.call({ token: r.token, platform: 'ios', userId: X }, { authorization: 'Bearer ' + mintNow(Y) }); // proved, body names someone else
+    r.call({ token: r.token, platform: 'ios', userId: X }, {});                                        // would fail on the enforce date
+    r.call({ token: r.token, platform: 'ios' }, {});                                                   // links nobody
+    r.call({ token: r.token, platform: 'ios', userId: null }, {});                                     // sign-out
+    r.call({ token: 'not a token', platform: 'ios', userId: X }, {});                                  // refused as a bad token: not a registration
+    const snap = r.ctx.pushAuthTally.snapshot();
+    assert.equal(snap.total, 5);
+    assert.deepEqual(snap.platforms, { ios: { proved: 2, mismatch: 1, unproven: 1, unlinked: 1, signedOut: 1 } });
+    const text = JSON.stringify(snap) + r.ctx.pushAuthTally.line();
+    assert.ok(!text.includes(X) && !text.includes(Y) && !text.includes(r.token));
+  } finally { r.done(); }
+});
+
+test('handler, enforce: a refusal is counted as refused', () => {
+  const r = rig({ PUSH_REGISTER_AUTH: 'enforce' });
+  try {
+    assert.equal(r.call({ token: r.token, platform: 'ios', userId: X }, {}).code, 401);
+    assert.deepEqual(r.ctx.pushAuthTally.snapshot().platforms, { ios: { refused: 1 } });
   } finally { r.done(); }
 });

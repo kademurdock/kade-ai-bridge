@@ -712,6 +712,24 @@ function endLiveTurn(session) {
   session._liveMuted = false;
 }
 
+/* Nov 13 2026 (sweep 1.4). Stop drops the rest of the turn's audio here, but Google is told nothing, so
+ * the model still believes it said all of it (a direction, a hazard) and its next answer can build on
+ * words she never heard. With LIVE_STOP_NOTE=1 the model is told once per muted turn, as realtime
+ * text, the same door the camera note uses. OFF by default for the same reason as that note: it has
+ * not been tried against Google, and an unasked-for text can make the model start talking again.
+ * Turn it on only after the staging replay planned for LIVE_CAMERA_NOTE. */
+const LIVE_STOP_NOTE =
+  '(Automatic note from the app, not spoken by me: I pressed Stop while you were talking, so I did not hear the rest of ' +
+  'what you were just saying. Do not answer this note and do not repeat yourself now. If I ask about it, say it again.)';
+function noteStop(session) {
+  if (process.env.LIVE_STOP_NOTE !== '1') return false;
+  const gws = session._liveWs;
+  if (!gws || gws.readyState !== 1) return false;
+  try { gws.send(JSON.stringify({ realtimeInput: { text: LIVE_STOP_NOTE } })); } catch { return false; }
+  console.log(`[video-live] the Spotter was told the rest of its turn was not heard (user=${session.userId})`);
+  return true;
+}
+
 /** Returns true when an open Spotter turn was muted. */
 function muteLiveTurn(session) {
   if (process.env.LIVE_STOP_MUTE === '0') return false;
@@ -720,6 +738,7 @@ function muteLiveTurn(session) {
   if (!session._liveMuted) {
     session._liveMuted = true;
     console.log(`[video-live] Stop pressed: muting the rest of this turn (user=${session.userId})`);
+    noteStop(session); // once per muted turn, and only with LIVE_STOP_NOTE=1
   }
   try { session.sendClear && session.sendClear(); } catch {}
   return true;
@@ -1080,7 +1099,7 @@ function handleLiveMsg(session, msg, speak) {
 
 module.exports = {
   shouldWarnLiveSilence, noteCallerWords,
-  LIVE_SILENT_LINE, LIVE_CAMERA_LOST, enabled, handleLiveMsg, forwardAudio, forwardFrame, noteCamera, stopLive, minutesLeft, effectiveSpotter,
+  LIVE_SILENT_LINE, LIVE_CAMERA_LOST, LIVE_STOP_NOTE, enabled, handleLiveMsg, forwardAudio, forwardFrame, noteCamera, stopLive, minutesLeft, effectiveSpotter,
   muteLiveTurn };
 // Exported for the pre-push test harness only — not called across modules.
 module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive, liveSilenceDueAt, pcmRms, noteCallerAudio };

@@ -18,6 +18,7 @@
  */
 
 const WebSocket = require('ws');
+const { textReceipt } = require('./log-text'); // Nov 13 2026 (sweep 8.6): what was said is logged as a length and a hash (KADE_LOG_TEXT=1 for the words)
 const EventEmitter = require('events');
 const https = require('https');
 const http = require('http');
@@ -1513,7 +1514,7 @@ function openDeepgramFlux(session, key) {
       if (shouldBargeIn(session, text, msg.words)) {
         session.bargedIn = true;
         noteMoodBarge(session);
-        console.log(`[voice-stream] barge-in trigger (flux, ${session.surface}): "${text.slice(0, 50)}"`);
+        console.log(`[voice-stream] barge-in trigger (flux, ${session.surface}): ${textReceipt(text)}`);
         bargeIn(session);
       }
       return;
@@ -1564,7 +1565,7 @@ function openDeepgramFlux(session, key) {
         const echoWindow = session.isSpeaking || sinceSpoke < 1200;
         const isEcho = echoPossible && utteranceIsEcho(session, full, echoWindow);
         if (!isEcho) handleUtterance(session, full);
-        else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): "${full.slice(0, 60)}"`);
+        else console.log(`[voice-stream] echo-dropped (flux EndOfTurn): ${textReceipt(full)}`);
       };
       // Nov 12 2026 (audit phase 4, pick 1): an adaptive grace, SHADOW by default (turn-grace.js).
       // FLUX_ADAPTIVE_GRACE unset/shadow = today's grace plus one log line, 1 = use it, 0 = off.
@@ -1702,7 +1703,7 @@ function openDeepgram(session) {
       if (shouldBargeIn(session, text, alt && alt.words)) {
         session.bargedIn = true;
         noteMoodBarge(session);
-        console.log(`[voice-stream] barge-in trigger (${session.surface}): "${text.slice(0, 50)}" (final=${!!msg.is_final})`);
+        console.log(`[voice-stream] barge-in trigger (${session.surface}): ${textReceipt(text)} (final=${!!msg.is_final})`);
         bargeIn(session);
       }
       if (msg.is_final) {
@@ -1752,7 +1753,7 @@ function openDeepgram(session) {
           session._moodGapMs = null;
           handleUtterance(session, utterance);
         }
-        else console.log(`[voice-stream] echo-dropped (overlap, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
+        else console.log(`[voice-stream] echo-dropped (overlap, sinceSpoke=${sinceSpoke}ms): ${textReceipt(utterance)}`);
       }
       return;
     }
@@ -1774,7 +1775,7 @@ function openDeepgram(session) {
         session._moodGapMs = null;
         handleUtterance(session, utterance);
       }
-      else console.log(`[voice-stream] echo-dropped (UtteranceEnd, sinceSpoke=${sinceSpoke}ms): "${utterance.slice(0, 60)}"`);
+      else console.log(`[voice-stream] echo-dropped (UtteranceEnd, sinceSpoke=${sinceSpoke}ms): ${textReceipt(utterance)}`);
     }
   });
 
@@ -2038,7 +2039,7 @@ async function jevSaysNotAName(text, jev = JEV) {
 async function handleGateTurn(session, text) {
   const g = session.gate;
   const t = String(text || '').trim();
-  console.log(`[gate] ${session.from} step=${g.step} "${t.slice(0, 60)}"`);
+  console.log(`[gate] ${session.from} step=${g.step} ${textReceipt(t)}`);
   switch (g.step) {
     case 'purpose': {
       // Part 236: regex first, exactly as before. Jev only when all of them missed.
@@ -2226,7 +2227,7 @@ async function handleUtterance(session, text) {
     // "Hello?" on pickup). Hold the text — releaseGreetingLock() replays it
     // the moment the greeting ends — and if the greeting hasn't STARTED yet,
     // their finished hello is exactly the cue to start it now.
-    console.log(`[voice-stream] holding utterance during greeting: "${text.slice(0, 50)}"`);
+    console.log(`[voice-stream] holding utterance during greeting: ${textReceipt(text)}`);
     session._pending = session._pending ? `${session._pending} ${text}` : text;
     if (session._startGreeting) session._startGreeting();
     return;
@@ -2238,7 +2239,7 @@ async function handleUtterance(session, text) {
     session._confirmPhase = false;
     if (session._confirmTimer) { clearTimeout(session._confirmTimer); session._confirmTimer = null; }
     session.history.push({ role: 'user', content: text });
-    console.log(`[voice-stream] outbound confirm consumed: "${text.slice(0, 50)}"`);
+    console.log(`[voice-stream] outbound confirm consumed: ${textReceipt(text)}`);
     if (session._playGreetingPart2) session._playGreetingPart2();
     return;
   }
@@ -2246,14 +2247,14 @@ async function handleUtterance(session, text) {
     if (session.isSpeaking && !session.bargedIn) {
       // Actively speaking with no barge-in registered: a "completed utterance"
       // here is near-certainly room echo. Still the right call to drop.
-      console.log(`[voice-stream] busy+speaking, dropping: "${text.slice(0,50)}"`);
+      console.log(`[voice-stream] busy+speaking, dropping: ${textReceipt(text)}`);
     } else if (session.bargedIn) {
       // FIX (July 1 2026): the caller already barged in (their interim speech
       // stopped playback), and this is their COMPLETED utterance arriving while
       // the aborted turn is still unwinding. The old code dropped it -- so the
       // very answer that interrupted Kiana's question never reached the LLM.
       // Queue it (merging with any earlier fragment) so the finally-block runs it.
-      console.log(`[voice-stream] queueing post-barge-in utterance: "${text.slice(0,50)}"`);
+      console.log(`[voice-stream] queueing post-barge-in utterance: ${textReceipt(text)}`);
       session._pending = session._pending ? `${session._pending} ${text}` : text;
     } else {
       // KADE July 2 2026 (round 5, live pizza-call finding): a bare backchannel
@@ -2263,10 +2264,10 @@ async function handleUtterance(session, text) {
       // though every individual generation took only 2-3s (reframe logs).
       // A human doesn't restart their sentence because the listener nodded.
       if (BACKCHANNEL_RE.test(text.trim())) {
-        console.log(`[voice-stream] backchannel during generation, dropping: "${text.slice(0,50)}"`);
+        console.log(`[voice-stream] backchannel during generation, dropping: ${textReceipt(text)}`);
         return;
       }
-      console.log(`[voice-stream] aborting mid-gen for: "${text.slice(0,50)}"`);
+      console.log(`[voice-stream] aborting mid-gen for: ${textReceipt(text)}`);
       noteMoodBarge(session); // eager restart = interruption energy for the mood read
       session.sendClear(); // flush any in-flight thinking-filler audio
       session.llmAbort = true;
@@ -2275,7 +2276,7 @@ async function handleUtterance(session, text) {
     }
     return;
   }
-  console.log(`[voice-stream] utterance: "${text.slice(0, 80)}"`);
+  console.log(`[voice-stream] utterance: ${textReceipt(text)}`);
   // WEB VOICE: live caption of what was heard + a 'thinking' state so the
   // client UI mirrors the turn. Both are undefined on phone sessions.
   if (session.sendCaption) session.sendCaption('user', text);
@@ -2698,7 +2699,7 @@ async function streamReply(session, userText) {
     const unitRaw = sentence;
     if (INJECTION_ECHO_RE.test(sentence)) {
       echoDropped++;
-      console.warn(`[voice-stream] INJECTION-ECHO suppressed (#${echoDropped}) for ${session.streamSid}: "${String(sentence).slice(0, 80)}"`);
+      console.warn(`[voice-stream] INJECTION-ECHO suppressed (#${echoDropped}) for ${session.streamSid}: ${textReceipt(String(sentence))}`);
       return;
     }
     if (TURN_SPOKEN_CAP > 0 && spokenChars >= TURN_SPOKEN_CAP) {
@@ -3155,6 +3156,17 @@ async function synthesize(text, voice, rate, format = 'mulaw', dictionary, opts 
 // own GW-10 half is live (TTS_STREAM_TELEPHONY); until then it answers this request buffered, which
 // the feed below takes as one burst, so the bridge may ship first.
 const PHONE_STREAM_FIRST = process.env.PHONE_STREAM_FIRST !== '0';
+/* Nov 13 2026 (sweep 1.3): a streamed opener that stops arriving mid-sentence. The player waited, with
+ * the line held as "speaking", until the proxy's 20 s clock or this side's 25 s socket clock, and the
+ * caller sat in silence; then the piece was recorded as fully heard. Now, once some of the piece has
+ * played, everything that arrived has been sent, and nothing new has come for PHONE_STREAM_STALL_MS
+ * (default 2500), the piece is given up as CUT (not fully heard) and the reply moves on to its next
+ * sentence. A feed that ended on an error is recorded as cut as well. PHONE_STREAM_STALL_MS=0: wait
+ * as before, and a failed feed counts as heard as before. */
+const PHONE_STREAM_STALL_MS = (() => {
+  const n = parseInt(process.env.PHONE_STREAM_STALL_MS ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2500;
+})();
 
 // Resolves once the first audio bytes are in hand (so the typing filler keeps going until real speech
 // exists) with a FEED: { queue, ended, failed, wake, destroy() }. The feed owns the response's
@@ -3241,9 +3253,11 @@ async function playMulawStream(session, feed, opts = {}) {
   let underruns = 0;
   let dry = false;
   let complete = false;       // every frame of the piece was sent
+  let stalled = false;        // sweep 1.3: the feed stopped arriving mid-piece
+  let lastDataAt = start;     // when bytes last arrived from the proxy
   for (;;) {
     if (session.llmAbort || !session.isSpeaking || session.ws.readyState !== WebSocket.OPEN) break;
-    if (feed.queue.length) pending = Buffer.concat([pending, ...feed.queue.splice(0)]);
+    if (feed.queue.length) { pending = Buffer.concat([pending, ...feed.queue.splice(0)]); lastDataAt = Date.now(); }
     const now = Date.now();
     if (playheadEnd < now) {  // Twilio ran dry: the next frame plays when it lands
       if (frames && !dry) { dry = true; underruns++; }
@@ -3263,7 +3277,11 @@ async function playMulawStream(session, feed, opts = {}) {
         playheadEnd += 20;
         frames++;
       }
-      complete = true;
+      complete = !(PHONE_STREAM_STALL_MS > 0 && feed.failed); // a feed that broke off was not the whole sentence
+      break;
+    }
+    if (PHONE_STREAM_STALL_MS > 0 && frames > 0 && !feed.ended && pending.length < FRAME_BYTES && now - lastDataAt >= PHONE_STREAM_STALL_MS) {
+      stalled = true;
       break;
     }
     await new Promise((r) => { feed.wake = r; setTimeout(r, pending.length >= FRAME_BYTES ? 100 : 40); });
@@ -3279,7 +3297,9 @@ async function playMulawStream(session, feed, opts = {}) {
       unit.durMs = feed.ended && !feed.failed ? got : Math.max(got, String(unit.raw || '').length * 60);
     }
   }
-  if (!complete) feed.destroy(); // barge-in or a closed line: let the proxy go
+  if (!complete) feed.destroy(); // barge-in, a closed line or a stalled feed: let the proxy go
+  if (stalled) console.warn(`[voice-stream] streamed opener stalled for ${session.streamSid}: nothing new for ${PHONE_STREAM_STALL_MS}ms after ${frames} frames -- cut short, moving on`);
+  else if (feed.failed && !complete && feed.ended && frames) console.warn(`[voice-stream] streamed opener broke off for ${session.streamSid} after ${frames} frames -- recorded as cut short`);
   if (underruns) console.log(`[voice-stream] streamed opener ran dry ${underruns}x for ${session.streamSid} (${frames} frames)`);
   // heard-cut: a mark after the piece's last frame. Twilio echoes it when the piece has played.
   if (unit && complete && !session.llmAbort && heardCut.heardOnlyOn()) {
@@ -4269,7 +4289,7 @@ function attachMediaStreams(server, users, cfg) {
               step: 'purpose', strikes: 0,
               cb: global._vsConfig.findCallbackContext ? global._vsConfig.findCallbackContext(from) : null,
             };
-            if (gsess.gate.cb) console.log(`[gate] callback prematch ${from} -> user=${gsess.gate.cb.userName || gsess.gate.cb.userId} purpose="${String(gsess.gate.cb.purpose || '').slice(0, 60)}"`);
+            if (gsess.gate.cb) console.log(`[gate] callback prematch ${from} -> user=${gsess.gate.cb.userName || gsess.gate.cb.userId} purpose=${textReceipt(String(gsess.gate.cb.purpose || ''))}`);
             else console.log(`[gate] armed for ${from} (no callback match) — ${GATE_MAX_SEC}s leash`);
             gsess._gateWarnTimer = setTimeout(() => {
               if (gsess.gate && !gsess.gate.delivered && gsess.ws.readyState === WebSocket.OPEN) {
@@ -4521,7 +4541,7 @@ function attachMediaStreams(server, users, cfg) {
                   // Seed history (like outbound already does) so the agent
                   // knows what it said on pickup and won't repeat itself.
                   sess.history.push({ role: 'assistant', content: text });
-                  console.log(`[voice-stream] LLM opener: "${opener.slice(0, 80)}"`);
+                  console.log(`[voice-stream] LLM opener: ${textReceipt(opener)}`);
                 }
               }
               const buf = await synthesize(text, sess.voice, sess.rate, sess.media, sess.pronunciationDictionary);

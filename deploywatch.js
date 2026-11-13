@@ -193,6 +193,12 @@ async function railwayLatest(serviceId, environmentId, token) {
   if (!r.ok) throw new Error(`railway HTTP ${r.status}`);
   const j = await r.json();
   const n = j?.data?.deployments?.edges?.[0]?.node;
+  /* Nov 13 2026 (sweep 8.0): Railway answers a bad token with HTTP 200 and an `errors` list. That was
+   * read as "no deployments", which hid a stale token for three weeks. Its own words now ride in the
+   * error (they name the fault, never the token). */
+  if (!n && Array.isArray(j?.errors) && j.errors.length) {
+    throw new Error(`railway: ${String(j.errors[0]?.message || 'error with no message').replace(/\s+/g, ' ').slice(0, 160)}`);
+  }
   if (!n) throw new Error('railway: no deployments');
   return { status: n.status, sha: n.meta?.commitHash || null, at: n.createdAt };
 }
@@ -206,6 +212,16 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser, cancelDe
   const state = loadState();
   if (!state.deploy) state.deploy = {};
   if (!state.tts) state.tts = { fails: 0 };
+  /* Nov 13 2026 (sweep 8.0): a watcher that cannot read ANY service is blind, and it used to say so
+   * only in the log. After DEPLOYWATCH_BLIND_PASSES passes in a row (default 4, an hour at the usual
+   * 15 minutes) with every service unreadable, the admin gets ONE alert carrying the reason; the next
+   * one can come only after a pass that read something. The count is kept in the state file, so a
+   * restart neither repeats the alert nor forgets the streak. DEPLOYWATCH_BLIND_PASSES=0: no alert. */
+  const BLIND_PASSES = (() => {
+    const n = parseInt(process.env.DEPLOYWATCH_BLIND_PASSES ?? '', 10);
+    return Number.isFinite(n) && n >= 0 ? n : 4;
+  })();
+  if (!state.blind || typeof state.blind !== 'object') state.blind = { passes: 0, alerted: false };
 
   async function tick(trigger = 'tick') {
     if (!RAILWAY_TOKEN || !GITHUB_PAT) {
@@ -258,6 +274,23 @@ function attachDeployWatch(app, { bridgeSecretOk, runNotify, adminUser, cancelDe
       }
     }
     state.last = { at: new Date().toISOString(), trigger, rows };
+    const allBlind = rows.length > 0 && rows.every((r) => r.error);
+    if (allBlind) {
+      state.blind.passes += 1;
+      if (BLIND_PASSES > 0 && state.blind.passes >= BLIND_PASSES && !state.blind.alerted) {
+        state.blind.alerted = true;
+        const reasons = [...new Set(rows.map((r) => r.error))].slice(0, 2).join('; ');
+        console.warn(`[deploywatch] BLIND: no service could be read for ${state.blind.passes} passes in a row (${reasons})`);
+        runNotify({
+          agentId: 'kade-deploy-watch', agentName: 'Estate watch', title: 'Deploy watch is blind',
+          body: `I have not been able to read any service's deploys for ${state.blind.passes} checks in a row, so a failed or missing deploy would go unseen. The reason given: ${reasons}. This usually means the Railway or GitHub token on the bridge needs replacing. I will say this once, and again only if it breaks again after it has worked.`,
+          urgent: false, userId: adminUser, adminAlert: true,
+        }).catch(() => {});
+      }
+    } else {
+      if (state.blind.alerted) console.log(`[deploywatch] can see again after ${state.blind.passes} blind passes`);
+      state.blind = { passes: 0, alerted: false };
+    }
     saveState(state);
     if (problems.length) {
       console.warn(`[deploywatch] ALERT: ${problems.join('; ')}`);

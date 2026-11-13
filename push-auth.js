@@ -77,4 +77,42 @@ function decidePushLink({ bearer, bodyUserId, mode, secret, now = Date.now() } =
   return { userId: claimed, refuse: false, how: 'would-refuse', reason: v.reason };
 }
 
-module.exports = { pushAuthMode, enforceFromMs, verifyUserJwt, decidePushLink };
+/* Nov 13 2026 (sweep 8.7): log mode wrote a line only for a registration that WOULD be refused, so
+ * "how many would fail on the enforce date" had no answer: a clean registration left no trace, and
+ * zero would-refuse lines could mean everyone proved themselves or nobody registered at all. Every
+ * registration is now counted, by platform and by outcome, since boot:
+ *   proved     the bearer proved the user (how 'jwt')
+ *   mismatch   proved, but the body named somebody else (also counted in proved)
+ *   unproven   linked on the body's word alone; this is what enforce would refuse ('would-refuse')
+ *   noSecret   nothing could be checked, no secret on this service ('unverified')
+ *   refused    enforce refused it
+ *   unlinked   a token with no user at all (links nobody)
+ *   signedOut  an explicit sign-out
+ *   off        PUSH_REGISTER_AUTH=off
+ * Numbers only: no token, no user id. */
+const OUTCOME = { jwt: 'proved', 'would-refuse': 'unproven', unverified: 'noSecret', refused: 'refused', unlinked: 'unlinked', signout: 'signedOut', off: 'off' };
+function createPushAuthTally(now = Date.now()) {
+  const since = now;
+  const by = new Map(); // platform -> { outcome: n }
+  let total = 0;
+  function note(how, platform, { mismatch = false } = {}) {
+    const outcome = OUTCOME[how];
+    if (!outcome) return;
+    const p = String(platform || 'ios').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'ios';
+    const row = by.get(p) || {};
+    row[outcome] = (row[outcome] || 0) + 1;
+    if (mismatch) row.mismatch = (row.mismatch || 0) + 1;
+    by.set(p, row);
+    total++;
+  }
+  const snapshot = () => ({ since: new Date(since).toISOString(), total, platforms: Object.fromEntries([...by].map(([p, row]) => [p, { ...row }])) });
+  /** One log line, e.g. "ios proved 12, unproven 3; android unproven 5". */
+  function line() {
+    if (!total) return 'no registrations since boot';
+    return [...by].sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([p, row]) => `${p} ${Object.keys(row).sort().map((k) => `${k} ${row[k]}`).join(', ')}`).join('; ');
+  }
+  return { note, snapshot, line, get total() { return total; } };
+}
+
+module.exports = { pushAuthMode, enforceFromMs, verifyUserJwt, decidePushLink, createPushAuthTally };
