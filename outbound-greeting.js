@@ -16,10 +16,16 @@
  *   - A STRANGER greeting plays whenever the call is to a business or to anyone who does not know
  *     the user: disclose:true (errands), business:true (the chat's phone tool, set by the model),
  *     or a number that is not in the registry. Plain words, short, and in this order:
- *       who is talking (an A I assistant), who for (first name, "one of our users", so nobody has
- *       to know who that is), the recording notice the code always gave, then the question.
- *     "Hi, this is Kiana, an A I assistant calling for Kade, one of our users. This call may be
- *      recorded. I'm calling to ask if you're running any deals on hemp products right now."
+ *       who is talking (an A I assistant), on whose behalf ("a customer", then the person's FULL
+ *       name), the recording notice the code always gave, then the question.
+ *     "Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock. This
+ *      call may be recorded. I'm calling to ask if you're running any deals on hemp products."
+ *     That frame is Kade's own, Part 66 (Aug 15 2026), from the first real business call: "it did
+ *     say A I calling for Kade, but odds are someone at a business isn't gonna know who Kade is."
+ *     A first name means nothing to a store; "a customer" and the full name make the call make
+ *     sense (errands.js says the same where it sends the name). The first version of this file
+ *     said "calling for Kade, one of our users", which undid that; the review the same day put
+ *     her wording back. With no real name on record it is "calling on behalf of a customer."
  *   - The question in a stranger greeting is the FIRST thing asked, never "Kade wants to know":
  *     "<her name> wants to know if X" becomes "ask if X", and a long purpose is cut to its first
  *     question (the rest of the purpose is still the mission the character carries on the call).
@@ -66,10 +72,18 @@ function framePurpose(p) {
 /** A first name to say out loud, or null when the record holds a placeholder ("a Kade-AI user"). */
 function firstNameOf(userName) {
   const t = String(userName || '').trim();
-  if (!t || /kade[- ]?a\.?i\.? user/i.test(t)) return null;
+  if (!t || /kade[- ]?a\.?i\.? user/i.test(t) || /@/.test(t)) return null;
   const first = t.split(/\s+/)[0].replace(/[^A-Za-z'-]/g, '');
   if (!first || first.length < 2 || /^(?:a|an|the|someone|somebody|user|unknown|customer|client)$/i.test(first)) return null;
   return first;
+}
+
+/** The full name a business hears (Part 66), or null for a placeholder. Letters only: no digits,
+ *  no email address, at most 40 characters. */
+function fullNameOf(userName) {
+  if (!firstNameOf(userName)) return null;
+  const clean = String(userName || '').replace(/[^A-Za-z .'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40).trim();
+  return clean.length >= 2 ? clean : null;
 }
 
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -101,11 +115,12 @@ const ASK_FORM = /^(?:to\s+)?(?:ask|find out|check|see|confirm|verify|make sure)
  * repeated in front of the question; a long purpose keeps only its first question, cut before an
  * "especially ..." tail when it is still long. Everything else goes through framePurpose as before.
  */
-function strangerAsk(purpose, firstName) {
+function strangerAsk(purpose, firstName, fullName) {
   let t = String(purpose || '').slice(0, 300).trim().replace(/^["']+|["']+$/g, '').replace(/\s+/g, ' ');
   t = t.replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '');
   const who = ['my user', 'the user', 'my client', 'the client', 'my customer', 'the customer', 'she', 'he', 'they'];
   if (firstName) who.unshift(escapeRe(firstName));
+  if (fullName && fullName !== firstName) who.unshift(escapeRe(fullName));
   const alts = who.join('|');
   // "<name> wants to know if/whether X", "<name> would like to find out X", "<name> needs to ask about X"
   const wants = new RegExp(`^(?:${alts})\\s+(?:wants|would like|wanted|needs|is hoping|was hoping|is trying|asked me)\\s+to\\s+(?:know|find out|ask|check|see)\\s+(?:(if|whether)\\s+)?`, 'i');
@@ -133,14 +148,14 @@ function strangerAsk(purpose, firstName) {
   return framePurpose(t);
 }
 
-/** "Kade, one of our users" or "one of our users". */
-function forWhom(firstName) {
-  return firstName ? `${firstName}, one of our users` : 'one of our users';
+/** "a customer, Kade Murdock" or "a customer" (Part 66). */
+function forWhom(fullName) {
+  return fullName ? `a customer, ${fullName}` : 'a customer';
 }
 
 /** The disclosure sentence that opens every stranger greeting. */
-function disclosureLine(agentName, firstName) {
-  return `this is ${agentName}, an A I assistant calling for ${forWhom(firstName)}.`;
+function disclosureLine(agentName, fullName) {
+  return `this is ${agentName}, an A I assistant calling on behalf of ${forWhom(fullName)}.`;
 }
 
 const RECORDING_NOTICE = 'This call may be recorded.';
@@ -184,8 +199,9 @@ function composeOutboundGreeting(o) {
   }
 
   const first = firstNameOf(o.userName);
-  const ask = strangerAsk(purpose, first);
-  const disclose = disclosureLine(agentName, first);
+  const full = fullNameOf(o.userName);
+  const ask = strangerAsk(purpose, first, full);
+  const disclose = disclosureLine(agentName, full);
   if (calleeName) {
     // The first thing they hear still says who is calling and for whom; the recording notice and
     // the question follow their answer to "is this ...?".
@@ -203,15 +219,17 @@ function composeOutboundGreeting(o) {
 /** The voicemail a stranger's machine gets (voice-stream.js handleAmdResult). */
 function strangerVoicemail({ agentName, userName, purpose }) {
   const first = firstNameOf(userName);
-  const ask = strangerAsk(purpose, first)
+  const full = fullNameOf(userName);
+  const ask = strangerAsk(purpose, first, full)
     .replace(/^I'm calling /, 'I was calling ')
     .replace(/^I've got a quick question — /, 'I had a quick question: ');
-  return `Hi, ${disclosureLine(agentName || 'Kiana', first)} ${ask} Sorry I missed you. Bye!`;
+  return `Hi, ${disclosureLine(agentName || 'Kiana', full)} ${ask} Sorry I missed you. Bye!`;
 }
 
 module.exports = {
   framePurpose,
   firstNameOf,
+  fullNameOf,
   strangerAsk,
   firstSentenceEnd,
   forWhom,

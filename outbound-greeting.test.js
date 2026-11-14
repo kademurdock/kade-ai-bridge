@@ -10,17 +10,18 @@ const HEMP = "Kade wants to know if you're running any sales or clearance deals 
 const HER_ROW = { name: 'Kade', agentId: 'agent_kiana' };
 const base = { agentName: 'Kiana', userName: 'Kade Murdock', purpose: HEMP, calleeName: null, agentId: 'agent_kiana' };
 
-test("KADE'S TEST: her own number called as a business says it is an A I assistant, for whom, the recording notice, then one plain question", () => {
+test("KADE'S TEST: her own number called as a business says it is an A I assistant, on behalf of a customer by full name (Part 66), the recording notice, then one plain question", () => {
   const r = g.composeOutboundGreeting({ ...base, calleeRec: HER_ROW, business: true });
   assert.equal(r.tier, 'stranger');
   assert.equal(r.business, true);
   assert.equal(r.disclosed, true);
   assert.equal(r.greeting,
-    "Hi, this is Kiana, an A I assistant calling for Kade, one of our users. This call may be recorded. " +
+    "Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock. This call may be recorded. " +
     "I'm calling to ask if you're running any sales or clearance deals on hemp products right now.");
   assert.equal(r.greeting2, null);
   assert.equal(/wants to know/.test(r.greeting), false, 'never "Kade wants to know" to a stranger');
-  assert.ok(r.greeting.length < 200, `short: ${r.greeting.length} characters (the old stranger greeting for this purpose was about 378)`);
+  assert.ok(r.greeting.length < 215, `short: ${r.greeting.length} characters (the old stranger greeting for this purpose was about 378)`);
+  assert.equal(/one of our users/.test(r.greeting), false, 'review: "calling for Kade, one of our users" undid her Part 66 wording');
   // The question starts where askAt says (voice-stream.js times nods against it).
   assert.equal(r.greeting.slice(Math.round(r.askAt * r.greeting.length)).startsWith("I'm calling to ask"), true);
 });
@@ -33,7 +34,7 @@ test('the AI-assistant words come before the question in every stranger greeting
   ];
   for (const r of shapes) {
     const first = r.greeting;
-    assert.match(first, /^Hi, this is Kiana, an A I assistant calling for Kade, one of our users\./, 'the first thing a stranger hears');
+    assert.match(first, /^Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock\./, 'the first thing a stranger hears');
     const all = `${r.greeting} ${r.greeting2 || ''}`;
     assert.ok(all.indexOf('This call may be recorded.') > all.indexOf('A I assistant'));
     assert.ok(all.indexOf("I'm calling") > all.indexOf('This call may be recorded.'), 'the question comes last');
@@ -42,7 +43,7 @@ test('the AI-assistant words come before the question in every stranger greeting
 
 test('the two-part stranger greeting: who and for whom, "is this X?", then the notice and the question', () => {
   const r = g.composeOutboundGreeting({ ...base, purpose: 'ask whether you are open on Sunday', calleeName: "Tony's Pizza", calleeRec: null });
-  assert.equal(r.greeting, "Hi, this is Kiana, an A I assistant calling for Kade, one of our users. Is this Tony's Pizza?");
+  assert.equal(r.greeting, "Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock. Is this Tony's Pizza?");
   assert.equal(r.greeting2, "Thanks! This call may be recorded. I'm calling to ask whether you are open on Sunday.");
   assert.equal(r.greeting.slice(Math.round(r.askAt * r.greeting.length)), "Is this Tony's Pizza?");
   assert.equal(r.greeting2.slice(Math.round(r.ask2At * r.greeting2.length)), "I'm calling to ask whether you are open on Sunday.");
@@ -79,13 +80,27 @@ test('who gets the business rules: errands and business:true always; an unregist
   assert.deepEqual([pick({ calleeRec: HER_ROW }).tier, pick({ calleeRec: HER_ROW }).business], ['own', false]);
 });
 
-test('a placeholder name is never spoken: "calling for one of our users"', () => {
-  for (const userName of ['a Kade-AI user', '', null, 'a customer']) {
+test('a placeholder name is never spoken: "calling on behalf of a customer"', () => {
+  for (const userName of ['a Kade-AI user', '', null, 'a customer', 'someone@example.com']) {
     const r = g.composeOutboundGreeting({ ...base, userName, calleeRec: null, purpose: 'What time do you close tonight?' });
-    assert.equal(r.greeting, "Hi, this is Kiana, an A I assistant calling for one of our users. This call may be recorded. I've got a quick question — what time do you close tonight?", String(userName));
+    assert.equal(r.greeting, "Hi, this is Kiana, an A I assistant calling on behalf of a customer. This call may be recorded. I've got a quick question — what time do you close tonight?", String(userName));
   }
   assert.equal(g.firstNameOf('Kade Murdock'), 'Kade');
   assert.equal(g.firstNameOf('Amber'), 'Amber');
+  assert.equal(g.fullNameOf('Kade Murdock'), 'Kade Murdock');
+  assert.equal(g.fullNameOf('  Amber   Lynn  '), 'Amber Lynn');
+  assert.equal(g.fullNameOf('kade123'), 'kade', 'no digits read out');
+  assert.equal(g.fullNameOf('a Kade-AI user'), null);
+});
+
+test("PART 66 (Aug 15 2026, Kade's ear on the first business call) is what a business hears: \"a customer\" and the FULL name, never a first name alone", () => {
+  // errands.js sends the full name for exactly this (ERRAND_CALLER_NAME, "Kade Murdock").
+  const errand = g.composeOutboundGreeting({ ...base, purpose: 'ask whether you have the part in stock', calleeRec: null, disclose: true });
+  assert.match(errand.greeting, /^Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock\. This call may be recorded\./);
+  const amber = g.composeOutboundGreeting({ ...base, userName: 'Amber Lynn', purpose: 'ask what time you close', calleeRec: null, business: true });
+  assert.match(amber.greeting, /calling on behalf of a customer, Amber Lynn\./);
+  // "Kade Murdock wants to know if X" is cut to the question as well as "Kade wants to know if X".
+  assert.equal(g.strangerAsk('Kade Murdock wants to know if you deliver', 'Kade', 'Kade Murdock'), "I'm calling to ask if you deliver.");
 });
 
 test('strangerAsk: the question first, in plain words', () => {
@@ -116,7 +131,7 @@ test('framePurpose is unchanged (moved from server.js)', () => {
 
 test('a stranger\'s voicemail says the same who and for whom, and the question in the past', () => {
   assert.equal(g.strangerVoicemail({ agentName: 'Kiana', userName: 'Kade Murdock', purpose: HEMP }),
-    "Hi, this is Kiana, an A I assistant calling for Kade, one of our users. I was calling to ask if you're running any sales or clearance deals on hemp products right now. Sorry I missed you. Bye!");
+    "Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock. I was calling to ask if you're running any sales or clearance deals on hemp products right now. Sorry I missed you. Bye!");
   assert.equal(g.strangerVoicemail({ agentName: 'Kiana', userName: 'Kade', purpose: 'What time do you close?' }),
-    'Hi, this is Kiana, an A I assistant calling for Kade, one of our users. I had a quick question: what time do you close? Sorry I missed you. Bye!');
+    'Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade. I had a quick question: what time do you close? Sorry I missed you. Bye!');
 });
