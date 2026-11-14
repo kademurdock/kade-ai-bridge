@@ -2456,6 +2456,25 @@ function saveJsonFile(file, data) {
 
 const outboundLog  = loadJsonFile(OUTBOUND_LOG_FILE, []); // finalized call records (capped at 500)
 const outboundMeta = new Map();                           // callSid -> live call context
+
+// Nov 14 2026: who hears what first on an outbound call, and the character's own report when a
+// chat-placed call ends (Kade: "they message you when they're done with the call").
+const outboundGreeting = require('./outbound-greeting');
+const callReport = require('./call-report');
+const callReporter = callReport.createCallReporter({
+  // The same door research.js and errands.js post their write-ups through.
+  speak: async (body) => {
+    if (!BRIDGE_SECRET) return { ok: false, error: 'no BRIDGE_SECRET' };
+    const r = await axios.post(`${FORK_USAGE_URL}/api/kade/soul/speak`, body, {
+      headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
+      timeout: 280000,
+      validateStatus: () => true,
+    });
+    if (r.status === 200 && r.data && r.data.ok) return { ok: true, conversationId: r.data.conversationId || null };
+    return { ok: false, error: (r.data && r.data.error) || `HTTP ${r.status}` };
+  },
+  notify: (push) => runNotify(push),
+});
 const lastDialed   = new Map();                           // e164 -> ts of last outbound dial
 
 function todayUTC() { return new Date().toISOString().slice(0, 10); }
@@ -2480,7 +2499,11 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness, disclose } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness, disclose, business: rawBusiness } = req.body || {};
+  // Nov 14 2026: the chat's phone tool says whether the call is to a business or a stranger
+  // (true), a person who knows the user (false), or nothing (undefined: the registry decides).
+  const businessFlag = rawBusiness === true || rawBusiness === 'true' ? true
+    : rawBusiness === false || rawBusiness === 'false' ? false : undefined;
   // KADE July 2 2026: the model sometimes fills calleeName with junk like
   // "whoever it is" or "the person" — which produced the live gem
   // "Hi, is this whoever it is?". A name is only a name if it looks like one.
@@ -2578,55 +2601,20 @@ app.post('/outbound-call', async (req, res) => {
   const greetingRate = typeof calleeRate === 'number' ? calleeRate : (outRate ?? undefined);
   console.log(`[outbound] voice resolved: "${outVoice}"${greetingRate ? ` rate ${greetingRate}` : ''} for agent ${agentName || DEFAULT_AGENT_NAME}`);
   // TWO-PHASE greeting (July 2 2026): when we know the callee's name, part 1
-  // is JUST "Hi — is this X?" — the stream layer waits for their answer before
-  // part 2 (disclosure + purpose). Unknown callee: one combined line.
+  // asks "is this X?" and the stream layer waits for their answer before
+  // part 2. Unknown callee: one combined line.
   //
-  // Purpose framing (July 2 round 3, Kade's catch): the model fills `purpose`
-  // in whatever shape it likes — "is your refrigerator running?" produced
-  // "I'm calling because is your refrigerator running?". Frame by shape
-  // instead of blindly gluing onto "because".
-  const framePurpose = (p) => {
-    let t = String(p || '').slice(0, 300).trim().replace(/^["']+|["']+$/g, '');
-    t = t.replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '');
-    t = t.replace(/\s+/g, ' ').trim();
-    if (!t) return "I'm calling on their behalf";
-    const endPunct = /[.?!]$/.test(t) ? '' : '.';
-    if (/^(?:to\s+)?(?:ask|find out|check|catch up|catch|check in|see|confirm|verify|make sure|place|order|book|schedule|cancel|request|remind|tell|invite|wish|set up|pick up|drop off|let)\b/i.test(t)) {
-      t = t.replace(/^to\s+/i, '');
-      return `I'm calling to ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
-    }
-    if (/\?$/.test(t) || /^(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|what|when|where|who|why|how)\b/i.test(t)) {
-      return `I've got a quick question — ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
-    }
-    // KADE July 2 2026 (round 5): a NOUN-PHRASE purpose ("fun test call from her
-    // big sister...") glued onto "because" reads broken. If none of the first
-    // few words is a verb-ish token, the text has no clause — frame with
-    // "about" instead. Clauses ("she wants...", "Skylee asked...") still get
-    // "because".
-    const firstWords = t.split(/\s+/).slice(0, 3);
-    const VERBISH = /^(?:is|are|was|were|am|be|has|have|had|do|does|did|want|wants|wanted|need|needs|needed|ask|asks|asked|say|says|said|told|tell|tells|think|thinks|thought|hope|hopes|hoped|wonder|wonders|wondered|would|will|should|can|could|may|might|must|let|lets|got|get|gets|there's|it's|she's|he's|i'm|we're|they're|you're)$/i;
-    const hasEarlyVerb = firstWords.some((w) => VERBISH.test(w.replace(/[^a-z']/gi, '')));
-    if (!hasEarlyVerb) {
-      return `I'm calling about ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
-    }
-    return `I'm calling because ${t.charAt(0).toLowerCase()}${t.slice(1)}${endPunct}`;
-  };
-  // First name only when speaking (Kade's ask: "calling for Kade", not
-  // "calling for Kade Murdock"). Full name stays in records/transcripts.
-  const spokenUserName = String(userName || '').trim().split(/\s+/)[0] || 'a Kade-AI user';
-  /* PART 66 (Aug 15 2026), straight off Kade's ear on the first real business
-   * call: "it did say A I calling for Kade, but odds are someone at a business
-   * isn't gonna know who Kade is." A first name is right for family — it is
-   * meaningless to a stranger at a store. A business hears the FULL name and
-   * the word customer, which is the frame that makes the call make sense. */
-  const businessUserName = String(userName || '').trim() || 'a customer';
   // GREETING TIERS (July 12 2026, Kade: "none of this weird fourth-wall
-  // stuff"). Registered family who KNOW the agent get greeted like a friend;
-  // the full formal AI-disclosure + recording notice stays for strangers and
-  // businesses (that's the anti-prank armor — unchanged where it matters).
-  //   own agent  -> "Hey! It's Lilly. <mission>"          (their OWN companion)
-  //   family     -> "Hey — it's Kiana, Kade's A I. <mission>"
-  //   stranger   -> full disclosure, exactly as before
+  // stuff"), and the stranger greeting rewritten Nov 14 2026 after her test
+  // call ("the people aren't going to know who Kade is ... identify that it's
+  // an ai assistant calling on someone's behalf"). The words, the tier rules
+  // and the purpose framing all live in outbound-greeting.js now:
+  //   own agent  -> "Hi! It's Lilly! <mission>"          (their OWN companion)
+  //   family     -> "Hi! It's Kiana — Kade's A I. <mission>"
+  //   stranger   -> "Hi, this is Kiana, an A I assistant calling for Kade, one
+  //                 of our users. This call may be recorded. <the question>"
+  // A stranger is anyone the call is not a family call to: disclose:true
+  // (errands), business:true (the chat's phone tool), or an unregistered number.
   const calleeRec = users.get(e164);
   // July 17 2026 (Kade caught this live: a real call went out to a registered
   // family number while the greeting/purpose were built around a DIFFERENT
@@ -2659,18 +2647,24 @@ app.post('/outbound-call', async (req, res) => {
    * if the number happens to sit in the family registry the friendly "It's
    * Kiana!" branch would quietly drop both the disclosure and the recording
    * notice. Found by reading the transcript of the rung-2 smoke, which dialled
-   * Kade's OWN registered number and therefore took the friendly branch — a
-   * correct behaviour that would have been the wrong one on a real errand. */
-  const ownAgent = disclose !== true && !!(calleeRec && calleeRec.agentId === (agentId || DEFAULT_AGENT));
-  const introText = ownAgent
-    ? `It's ${agentName || DEFAULT_AGENT_NAME}! ${framePurpose(purpose)}`
-    : (calleeRec && disclose !== true)
-      ? `It's ${agentName || DEFAULT_AGENT_NAME} — ${spokenUserName}'s A I. ${framePurpose(purpose)}`
-      : `This is ${agentName || DEFAULT_AGENT_NAME}, an A I assistant calling on behalf of a customer, ` +
-        `${businessUserName}. This call may be recorded, and if I go quiet for a second I'm just thinking. ` +
-        framePurpose(purpose);
-  const greetingText  = calleeName ? `Hi — is this ${calleeName}?` : `Hi! ${introText}`;
-  const greeting2Text = calleeName ? introText : null;
+   * Kade's OWN registered number and therefore took the friendly branch.
+   * Nov 14 2026: the same trap caught Kade's own test from chat (her number,
+   * "call this gas station"), because the chat's phone tool had no way to say
+   * "business". It has now (business:true), and it forces the same greeting. */
+  const composed = outboundGreeting.composeOutboundGreeting({
+    agentName: agentName || DEFAULT_AGENT_NAME,
+    userName,
+    purpose,
+    calleeName,
+    calleeRec,
+    agentId: agentId || DEFAULT_AGENT,
+    disclose: disclose === true,
+    business: businessFlag,
+  });
+  const greetingText  = composed.greeting;
+  const greeting2Text = composed.greeting2;
+  // Nov 14 2026: a call placed from a chat reports back into that chat by itself (call-report.js).
+  const report = callReport.reportFields(req.body, { defaultAgentId: DEFAULT_AGENT });
   let greetingBuf = null;
   let greeting2Buf = null;
   try {
@@ -2723,8 +2717,20 @@ app.post('/outbound-call', async (req, res) => {
        * rails in buildOutboundSuffix and turns the character's emotional
        * steering off — her word on the first live one: the voice direction
        * made it sound like "a nightmare therapist coming to eat you." Family
-       * and platform calls keep the character; a store gets a professional. */
-      business: disclose === true,
+       * and platform calls keep the character; a store gets a professional.
+       * Nov 14 2026: also on for the chat's business:true, and for any number
+       * that is not in the registry unless the chat said business:false. */
+      business: composed.business,
+      // Nov 14 2026: which greeting was spoken ('own' | 'family' | 'stranger'), so the
+      // character is told the truth about what it already said (voice-stream.js).
+      tier: composed.tier,
+      disclosed: composed.disclosed,
+      // How far into each greeting part the question starts (0..1): voice-stream.js uses it to
+      // tell a "yeah" said to the question from one said to "this is Kiana".
+      greetingAskAt: composed.askAt,
+      greeting2AskAt: composed.ask2At,
+      ask: composed.ask,
+      ...(report || { reportBack: false }),
       to: e164,
       agentId: agentId || DEFAULT_AGENT,
       agentName: agentName || DEFAULT_AGENT_NAME,
@@ -2753,11 +2759,16 @@ app.post('/outbound-call', async (req, res) => {
     daily.byUser[userId] = (daily.byUser[userId] || 0) + 1;
     daily.total += 1;
     saveJsonFile(OUTBOUND_DAILY_FILE, daily);
-    console.log(`[outbound] call ${call.sid} -> ${e164} for user ${userId} (${daily.byUser[userId]}/${OUTBOUND_DAILY_LIMIT} today)`);
+    console.log(`[outbound] call ${call.sid} -> ${e164} for user ${userId} (${daily.byUser[userId]}/${OUTBOUND_DAILY_LIMIT} today, greeting ${composed.tier}${composed.business ? ', business' : ''}${report ? ', reports back' : ''})`);
     res.json({
       ok: true, callSid: call.sid, to: e164,
       timeLimitMin: Math.round(OUTBOUND_TIME_LIMIT_SEC / 60),
       callsLeftToday: OUTBOUND_DAILY_LIMIT - daily.byUser[userId],
+      // Nov 14 2026: true = the character will message the person when the call ends (call-report.js),
+      // so the website tells the character to say so instead of "check back later".
+      reportBack: !!report,
+      business: composed.business,
+      greeting: composed.tier,
     });
   } catch (err) {
     console.error('[outbound] call create failed:', err.message);
@@ -2811,6 +2822,8 @@ app.post('/voice-status', (req, res) => {
     meta.finalized = true;
     meta.finalStatus = CallStatus;
     meta.durationSec = parseInt(CallDuration || '0', 10);
+    // Nov 14 2026: the character tells the person how it went, now, not after pricing (call-report.js).
+    callReporter.onFinal(meta);
     // Give Twilio ~45s to compute price and land recording callbacks first.
     setTimeout(() => finalizeOutboundCall(CallSid).catch((e) =>
       console.error('[outbound] finalize error:', e.message)), 45000);
@@ -2876,6 +2889,9 @@ async function finalizeOutboundCall(callSid) {
     recordingUrl: meta.recordingUrl,
     voicemail: meta.voicemail || false,
     transcript: meta.transcript || null,
+    // Nov 14 2026: whether the character already told the person (call-report.js).
+    reportBack: meta.reportBack === true,
+    reportState: (meta.report && meta.report.state) || null,
   };
   outboundLog.push(record);
   while (outboundLog.length > 500) outboundLog.shift();
@@ -2959,6 +2975,9 @@ app.post('/outbound/result', async (req, res) => {
     // Call ended but finalize is still pricing it: the transcript is already
     // on the meta — return it now, that's what report-back needs.
     if (live.finalized || (live.transcript && live.transcript.length)) {
+      // Nov 14 2026 (call-report.js): the person is getting the result right here, so the
+      // character's own report is not sent too; or it already went, and the character is told.
+      const told = callReporter.claim(live);
       return res.json({
         found: true,
         status: live.finalStatus || 'completed',
@@ -2968,6 +2987,8 @@ app.post('/outbound/result', async (req, res) => {
         purpose: live.purpose,
         durationSec: Math.round((Date.now() - live.startedAt) / 1000),
         transcript: (live.transcript || []).slice(-40),
+        reportBack: live.reportBack === true,
+        reportedToChat: told === 'posting' || told === 'posted',
       });
     }
     return res.json({
@@ -2979,6 +3000,7 @@ app.post('/outbound/result', async (req, res) => {
       purpose: live.purpose,
       startedSecondsAgo: Math.round((Date.now() - live.startedAt) / 1000),
       note: 'Call is still going.',
+      reportBack: live.reportBack === true,
     });
   }
   if (!done) return res.json({ found: false, note: 'No outbound calls found for this user.' });
@@ -2992,6 +3014,8 @@ app.post('/outbound/result', async (req, res) => {
     purpose: done.purpose,
     durationSec: done.durationSec,
     transcript: (done.transcript || []).slice(-40),
+    reportBack: done.reportBack === true,
+    reportedToChat: done.reportState === 'posting' || done.reportState === 'posted',
   });
 });
 
