@@ -484,11 +484,12 @@ function greetedClaim(ctx) {
 }
 
 /* Nov 14 2026 verification round: is this a call that opens with the A I greeting (a business, or
- * someone who does not know the user)? Only those calls run the new first exchange, the quiet watch
- * and the new prompt lines. Family calls, a character calling its own person, and wellness check-ins
- * (to anyone, registered or not) run exactly as they did before this branch (Kade: family calls must
- * sound exactly as before; check-ins unchanged). A context with no tier on record (from before
- * Nov 14) counts only when it says business. */
+ * someone who does not know the user)? Only those calls run the quiet watch and are told the new
+ * "what you already said" line (greetedClaim). Family calls, a character calling its own person, and
+ * wellness check-ins (to anyone, registered or not) keep the old claim and never get the quiet watch.
+ * Since the evening of Nov 14 every outbound call runs the new first exchange (firstRoundOn); this
+ * no longer decides that. A context with no tier on record (from before Nov 14) counts only when it
+ * says business. */
 function strangerGreetingCall(ctx) {
   if (!ctx || ctx.wellness) return false;
   return ctx.tier ? ctx.tier === 'stranger' : ctx.business === true;
@@ -511,9 +512,10 @@ function buildOutboundSuffix(ctx, { firstRound = false } = {}) {
      * never reaches you now; a hello AFTER it means they did not hear it. */
     /* Review, same day: a hold or a transfer means they did not hear it either (the business rules
      * below already say a transferred caller hears the mission again). */
-    /* Verification round, same day: only where the new first exchange runs. Elsewhere (family,
-     * check-ins, KADE_OUTBOUND_FIRST_ROUND=0) the pickup hello is still replayed after the greeting,
-     * so the old line stays with it. */
+    /* Verification round, same day: only where the new first exchange runs. With
+     * KADE_OUTBOUND_FIRST_ROUND=0 the pickup hello is still replayed after the greeting, so the old
+     * line stays with it. Since the evening of Nov 14 that is every outbound call, family calls and
+     * check-ins too (the old line invited the repeated question on Kade's own-number call). */
     (firstRound
       ? `Your greeting already asked your question. Ask it again, in one short sentence, only if they did not hear it: their first words after it are only "hello", they ask what you said, they come back from putting you on hold, or a new person comes on the line. Otherwise never ask it again; answer what they said. `
       : OLD_HELLO_LINE) +
@@ -1949,10 +1951,9 @@ function openDeepgram(session) {
  *     and start no new turn.
  *
  * Verification round, Nov 14 2026 (an independent review with its own simulated calls):
- *   - Only calls that open with the A I greeting (a business, or someone who does not know the user:
- *     strangerGreetingCall) run any of this, the quiet watch included. Family calls, a character
- *     calling its own person and wellness check-ins run exactly as before this branch: the old start,
- *     the pickup hello held and replayed, the old prompt lines, no quiet watch.
+ *   - (Undone the same evening, see "Family calls" below.) Only calls that open with the A I greeting
+ *     ran any of this; family calls, a character calling its own person and wellness check-ins kept
+ *     the old start, the pickup hello held and replayed, the old prompt lines, no quiet watch.
  *   - Once voicemail is found, no greeting part starts (handleAmdResult). The start could wait up to
  *     5 s while a machine talked, and part 2 of "... Is this Tony's Pizza?" followed 6 s later.
  *   - Their pickup is never a reply, unless they talked through the whole greeting: words begun at
@@ -1966,10 +1967,38 @@ function openDeepgram(session) {
  *   - Only a turn with words holds the start past the 2.5 s wait; line noise does not.
  *   - A lone stray word over the greeting ("You.", "The.") is noise, never a turn.
  *   - One Flux thought is handed over once (dispatch could run twice: the cap timer and the hold).
+ *
+ * Family calls, Nov 14 2026 (evening, Kade: the first exchange must work on EVERY outbound call):
+ *   - Every outbound call runs the new first exchange: family calls, a character calling its own
+ *     person, and wellness check-ins (the two-part "Hi — is this Holly?" too). The old path is the
+ *     one Kade hit on her test call (her own number, Kiana as its own character): her "Hello?" lost
+ *     the race with the 2.5 s start, was held, and was replayed as her answer when the greeting ended.
+ *     The greeting WORDS are unchanged (outbound-greeting.js is not touched).
+ *   - The quiet watch ("Hello? Can you hear me?", then a goodbye and the hang-up) stays on calls that
+ *     open with the A I greeting only (strangerGreetingCall). A silent pickup on a check-in may mean
+ *     something is wrong; nothing hangs up on it, as before.
+ *   - The greeting waits while the person who answered is still talking, up to 10 s after pickup
+ *     (KADE_OUTBOUND_GREETING_MAX_WAIT_MS, was 5 s): a clerk's long pickup line no longer gets the
+ *     uninterruptible greeting over it, where "an A I assistant" could be missed. Still talking at
+ *     10 s: it starts anyway.
+ *   - A pickup that sounds like a voicemail machine ("leave a message", "after the tone", "is not
+ *     available") does not start the greeting; it waits for Twilio's machine verdict (it comes at the
+ *     beep), up to 4 s after the machine's last words (KADE_OUTBOUND_VOICEMAIL_HOLD_MS). Waiting for a
+ *     talker made the greeting start just as a machine stopped talking: at the beep, into the
+ *     recording. No verdict by then: the greeting starts, as it would have.
+ *   - A reply begun after a greeting part ended is a reply, even within 1.6 s of their pickup line:
+ *     "Hi — is this Holly?" is short enough for "Speaking." to come that soon.
  * Switches: KADE_OUTBOUND_FIRST_ROUND=0 (all of the above but the quiet watch, the voicemail guard
- * and the single hand-over), KADE_OUTBOUND_QUIET_WATCH=0 (the silence watch). */
+ * and the single hand-over; every outbound call back on the old path), KADE_OUTBOUND_FIRST_ROUND=business
+ * (only calls that open with the A I greeting run it, as on main 422e758: family calls, a character's
+ * own person and check-ins back on the old path, business calls keep it), KADE_OUTBOUND_QUIET_WATCH=0
+ * (the silence watch). */
 function firstRoundOn(session) {
-  return !!(session && session.outbound === true && session._strangerGreeting === true && process.env.KADE_OUTBOUND_FIRST_ROUND !== '0');
+  if (!session || session.outbound !== true) return false;
+  const sw = process.env.KADE_OUTBOUND_FIRST_ROUND;
+  if (sw === '0') return false;
+  if (sw === 'business') return session._strangerGreeting === true;
+  return true;
 }
 const envMs = (name, dflt) => {
   const n = parseInt(process.env[name] || '', 10);
@@ -2002,6 +2031,63 @@ function calleeSaysWords(session) {
 /** Are they audibly talking right now (words in the last moment)? */
 function calleeTalkingNow(session) {
   return !!(session._fluxTurnOpen && session._fluxWordsAt && Date.now() - session._fluxWordsAt < 1200);
+}
+
+/* ── A voicemail machine at pickup (family calls, Nov 14 2026, evening) ──
+ * Twilio's machine check (asyncAmd, DetectMessageEnd) gives its verdict at the END of a machine's
+ * message: at the beep, or after a moment of quiet. The greeting waits while the person who answered
+ * is talking (now up to 10 s), so on a machine it waited the message out and started the moment the
+ * machine stopped: at the beep, into the recording, until the verdict came and cut it off. On the old
+ * path a family call's greeting began at 2.5 s, over the machine's message, so this is new with the
+ * first exchange on family calls. Now, when what they said before the greeting sounds like a machine's
+ * message, the greeting waits for the verdict: while the machine talks, then up to
+ * KADE_OUTBOUND_VOICEMAIL_HOLD_MS (4000) after its last words, and never past
+ * KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS (15000) after pickup (the greeting lock's 35 s safety valve,
+ * counted from pickup, must not fire while a late greeting still plays). The verdict leaves the one voicemail
+ * message (handleAmdResult). No verdict by then: the greeting starts, as it would have. A person who
+ * says one of these things at pickup only waits a few seconds more for the greeting.
+ * Only phrases a machine says, never a person answering: "leave a message", "after the tone",
+ * "record your message", "voicemail", "mailbox", "the person you are trying to reach is not
+ * available", "I'm not available", "can't come to the phone", "sorry I missed your call". */
+const VOICEMAIL_CUE_RE = new RegExp([
+  String.raw`\bleave (?:me |us |him |her )?(?:a |your )?(?:(?:brief|short|quick|detailed) )?(?:message|name and (?:phone )?number|voice ?mail)\b`,
+  String.raw`\b(?:after|at) the (?:tone|beep)\b`,
+  String.raw`\brecord (?:your|a) message\b`,
+  String.raw`\bvoice ?mail\b`,
+  String.raw`\bmailbox\b`,
+  String.raw`\b(?:person|party|number|subscriber|customer)\b.{0,40}\b(?:is|are) (?:not available|unavailable)\b`,
+  String.raw`\b(?:i|we) (?:am|are|m|re) (?:not available|unavailable)\b`,
+  String.raw`\b(?:cannot|can not|can t|cant) (?:come|get) to the phone\b`,
+  String.raw`\bsorry (?:i|we) (?:have |ve )?missed (?:you|your call)\b`,
+  String.raw`\bautomated voice\b`,
+].join('|'));
+function voicemailCue(text) {
+  const t = String(text || '').toLowerCase().replace(/[’']/g, ' ').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  return !!t && VOICEMAIL_CUE_RE.test(t);
+}
+function noteVoicemailCue(session, where) {
+  if (session._vmCueAt) return;
+  session._vmCueAt = Date.now();
+  console.log(`[voice-stream] the pickup sounds like a voicemail machine (${where}): the greeting waits for Twilio's machine verdict ${session.streamSid}`);
+}
+
+/**
+ * Why the outbound greeting may not start yet: 'voicemail' (a machine's message, waiting for the
+ * verdict), 'talking' (they are still saying their pickup line), or null (start now).
+ * pickupAt: when the call's stream started (the callee answered).
+ */
+function greetingStartWait(session, pickupAt) {
+  const now = Date.now();
+  if (!session._vmCueAt && voicemailCue(`${session._fluxTurnText || ''} ${session.finalBuf || ''}`)) noteVoicemailCue(session, 'still talking');
+  if (session._vmCueAt && now - pickupAt < envMs('KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS', 15000)) {
+    if (calleeSaysWords(session)) return 'voicemail';
+    const lastWords = Math.max(session._vmCueAt, session._fluxWordsAt || 0, session._pickupEndedAt || 0, session._lastFinalAt || 0);
+    if (now - lastWords < envMs('KADE_OUTBOUND_VOICEMAIL_HOLD_MS', 4000)) return 'voicemail';
+  }
+  // Family calls, Nov 14 2026 (evening): 10 s, was 5 s. A clerk's long pickup line got the greeting,
+  // which cannot be interrupted, over it, and could miss "an A I assistant".
+  if (calleeSaysWords(session) && now - pickupAt < envMs('KADE_OUTBOUND_GREETING_MAX_WAIT_MS', 10000)) return 'talking';
+  return null;
 }
 
 /* Nov 14 2026 review: "good" is a hello only in "good morning" and the like (see greetingWordKind);
@@ -2092,6 +2178,12 @@ function greetingWordsVerdict(session, text, began) {
   if (!session._greetingStarted || !part) return 'pickup';
   // Begun before this part's sound could have reached them (the line, then Flux): their pickup.
   if (began < part.audioAt + envMs('KADE_OUTBOUND_PICKUP_GRACE_MS', 700)) return 'pickup';
+  /* Said after this part ended: a reply to it. Family calls, Nov 14 2026 (evening): this comes before
+   * the pickup chain below. "Hi — is this Holly?" lasts about a second and a half, so a quick
+   * "Speaking." can begin within 1.6 s of the "Hello?" that started it, and the chain dropped it as more
+   * of her pickup: no confirmation, and part 2 waited 6 s for an answer she had given. A business
+   * greeting part is far longer than the chain, so nothing changes there. */
+  if (part.done && began >= part.endAt) return 'hold';
   /* Verification round, Nov 14 2026: a sentence that opens just after a pickup line ended is more of
    * the same pickup. Flux splits "Thank you for calling Shell on Main. [pause] This is Mike, how can I
    * help you?" in two; the greeting starts on the first part, so the second used to be held and answered
@@ -2100,7 +2192,6 @@ function greetingWordsVerdict(session, text, began) {
    * pharmacy, press 2") is the exception: the model needs it to press a key. */
   if (session._pickupEndedAt && began - session._pickupEndedAt <= envMs('KADE_OUTBOUND_PICKUP_CHAIN_MS', 1600)
       && !PHONE_MENU_RE.test(text)) return 'pickup';
-  if (part.done && began >= part.endAt) return 'hold'; // said after this part ended: a reply to it
   const kind = greetingWordKind(text);
   if (kind === 'noise') return 'drop'; // verification round: "You.", "The." (line noise) is never a reply
   /* Verification round: a hello or "who's this?" begun in the last moments of the greeting means they
@@ -2199,7 +2290,8 @@ function hangingUp(session) {
  * greeting by someone who then hung up). Outbound calls only; inbound is unchanged.
  */
 function flushHeldWords(session) {
-  // Verification round: part of the new first exchange, so behind its switch (and never on family calls).
+  // Verification round: part of the new first exchange, so behind its switch. Since the evening of
+  // Nov 14 that is every outbound call: a check-in's last words reach its report too.
   if (!firstRoundOn(session) || session._heldFlushed) return;
   session._heldFlushed = true;
   const parts = [];
@@ -2258,7 +2350,9 @@ async function quietSay(session, watch, line, since) {
   return true;
 }
 function armQuietWatch(session) {
-  // Verification round: calls that open with the A I greeting only (never family or a check-in).
+  // Verification round: calls that open with the A I greeting only. Never a family call, a character's
+  // own person, or a check-in, even now that they run the new first exchange (Nov 14, evening): a silent
+  // pickup on a check-in may mean something is wrong, and nothing may hang up on it.
   if (!session || !session.outbound || !session._strangerGreeting || !quietWatchOn() || session.voicemailMode) return;
   disarmQuietWatch(session);
   const watch = { armedAt: Date.now(), asked: false, saying: false };
@@ -2808,7 +2902,7 @@ async function handleUtterance(session, text) {
         const kept = notePickupWords(session, text);
         session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended); // verification round: the pickup chain
         console.log(`[voice-stream] pickup words, not an answer (${kept ? 'kept as what they said first' : 'a hello'}): ${textReceipt(text)}`);
-        if (session._startGreeting) session._startGreeting();
+        if (session._startGreeting) session._startGreeting(text); // family calls round: a machine's message waits for the verdict
         return;
       }
       if (verdict === 'drop') {
@@ -3800,7 +3894,8 @@ async function streamReply(session, userText) {
     } else {
       console.log(`[voice-stream] agent requested hang-up for ${session.callSid}`);
       const sid = session.callSid;
-      // Nov 14 2026 review: words said over the goodbye start no new turn (calls with the A I greeting only).
+      // Nov 14 2026 review: words said over the goodbye start no new turn (every outbound call since the
+      // evening of Nov 14; KADE_OUTBOUND_FIRST_ROUND=0 turns it off).
       if (firstRoundOn(session)) session._hangingUpAt = Date.now();
       setTimeout(() => session.cfg.endCall(sid), 1500); // let the goodbye audio drain
     }
@@ -4961,8 +5056,9 @@ function attachMediaStreams(server, users, cfg) {
               rate: typeof outboundCtx.rate === 'number' ? outboundCtx.rate : null,
             };
             settleRate(session);
-            // Nov 14 2026 verification round: the new first exchange and the quiet watch are for calls
-            // that open with the A I greeting only; family calls and check-ins run as before.
+            // Nov 14 2026: the quiet watch (and the new "what you already said" line) is for calls that
+            // open with the A I greeting only. Since the evening of Nov 14 the new first exchange runs on
+            // every outbound call, family calls and check-ins too (firstRoundOn).
             session._strangerGreeting = strangerGreetingCall(outboundCtx);
             session.outboundSuffix = buildOutboundSuffix(outboundCtx, { firstRound: firstRoundOn(session) });
             /* Nov 14 2026: a business or stranger call is not a talk with whoever the dialed
@@ -5277,24 +5373,42 @@ function attachMediaStreams(server, users, cfg) {
                 : synthesize(greeting, sess.voice, sess.rate, sess.media, sess.pronunciationDictionary).then(playGreeting);
               p.catch(greetingFailed);
             };
-            sess._startGreeting = startGreeting;
             /* Nov 14 2026 (Kade's test call): the 2.5 s start was set July 2, before Flux and its
              * end-of-turn hold (July 12) made a finished "Hello?" arrive about a second later. Her
              * hello was still being heard at 2.5 s, so the greeting began over it. Now, when the
              * person is mid-sentence at 2.5 s, the greeting waits for them to finish (their
-             * finished words start it), up to 5 s from pickup. Silence still starts it at 2.5 s. */
+             * finished words start it), up to 10 s from pickup (5 s until the evening of Nov 14).
+             * Silence still starts it at 2.5 s. A pickup that sounds like a voicemail machine waits
+             * for Twilio's verdict instead (greetingStartWait). */
             const pickupAt = Date.now();
+            let waitTimer = null;
             const startWhenQuiet = () => {
+              waitTimer = null;
               if (sess._greetingStarted || sess.voicemailMode) return;
               // Verification round: words hold the start (calleeSaysWords); line noise does not.
-              if (firstRoundOn(sess) && sess.ws.readyState === WebSocket.OPEN && calleeSaysWords(sess)
-                  && Date.now() - pickupAt < envMs('KADE_OUTBOUND_GREETING_MAX_WAIT_MS', 5000)) {
-                setTimeout(startWhenQuiet, 150);
+              if (firstRoundOn(sess) && sess.ws.readyState === WebSocket.OPEN) {
+                if (greetingStartWait(sess, pickupAt)) {
+                  waitTimer = setTimeout(startWhenQuiet, 150);
+                  return;
+                }
+                if (sess._vmCueAt) console.log(`[voice-stream] no voicemail verdict came, so the greeting starts ${sess.streamSid}`);
+              }
+              startGreeting();
+            };
+            /* pickupText: a finished pickup line handed over before the greeting began (first round
+             * only). It starts the greeting at once, unless it, or an earlier one, sounds like a
+             * voicemail machine: then the greeting waits for the verdict. */
+            sess._startGreeting = (pickupText) => {
+              if (sess._greetingStarted) return;
+              if (firstRoundOn(sess) && typeof pickupText === 'string' && (sess._vmCueAt || voicemailCue(pickupText))) {
+                noteVoicemailCue(sess, 'pickup line');
+                if (waitTimer) clearTimeout(waitTimer);
+                startWhenQuiet();
                 return;
               }
               startGreeting();
             };
-            setTimeout(startWhenQuiet, envMs('KADE_OUTBOUND_GREETING_WAIT_MS', 2500));
+            waitTimer = setTimeout(startWhenQuiet, envMs('KADE_OUTBOUND_GREETING_WAIT_MS', 2500));
           } else {
             session._ringbackActive = true;
             playRingback(session).catch(console.error);
@@ -6119,4 +6233,6 @@ module.exports._test = {
   releaseGreetingLock, shouldBargeIn, armQuietWatch, disarmQuietWatch, QUIET_ASK_LINE, QUIET_BYE_LINE,
   // Nov 14 2026 review fixes.
   markGreetingPart, parkHeld, flushHeldWords, hangingUp, HOLD_RE,
+  // Nov 14 2026 (evening): every outbound call, and a voicemail machine at pickup.
+  firstRoundOn, strangerGreetingCall, voicemailCue, greetingStartWait,
 };
