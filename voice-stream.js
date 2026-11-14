@@ -1872,7 +1872,9 @@ function openDeepgram(session) {
  *     question) is held and answered once the greeting ends. If they are still talking then, it
  *     waits for the rest of what they say and is answered together with it.
  *   - The same rule applies to words that began during the greeting but were handed over after it
- *     ended, until the first real turn has run.
+ *     ended (Flux closes a turn a beat after the words stop).
+ *   - On any outbound call, a sentence the callee finishes while the character is talking waits
+ *     for the reply instead of being dropped as echo, and the typing sound pauses while they talk.
  *   - Silence: nothing at all heard for 8 s after the greeting -> "Hello? Can you hear me?" once,
  *     no model turn and no typing sound; 12 s more of nothing -> a short goodbye and hang up.
  * Switches: KADE_OUTBOUND_FIRST_ROUND=0 (all of the above but the quiet watch),
