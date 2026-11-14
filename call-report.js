@@ -28,14 +28,36 @@
  * Errands (they post their own write-up), wellness check-ins (their own report) and briefings never
  * ask for this, so they are unchanged.
  *
- * Cost: each report is one character-written message on the person's seat, the speak-first lane,
- * which since Nov 14 2026 is written by Claude for verified adults (about 20 cents measured).
- * Off switch: KADE_CALL_REPORT_BACK=0 (the call still works; the old "ask me" flow comes back on
- * the website side because the bridge then answers reportBack:false). */
+ * Review fixes, Nov 14 2026 (same day):
+ *   - A check_result that is already waiting on the call wins. /outbound/result marks the report
+ *     awaited while it waits (report.awaitedAt), and run() gives it up to 4 s to claim the result
+ *     before writing (yieldMs). Before, the report usually started writing first, so the person
+ *     got the answer twice: once in the reply, once as the message.
+ *   - The backup tap (when the website cannot write the message) is in the character's own words
+ *     and says what happened ("I called Shell. They said: ..."), never "Ask me what they said".
+ *     A 429 ("busy, try again in a minute") is tried again twice, a 5xx once, 60 s apart, before
+ *     it falls back. A request that got no answer at all is NOT tried again: the website may still
+ *     be writing it, and a second try could post it twice.
+ *   - The push is urgent: the person asked for this call minutes ago and is waiting, so quiet
+ *     hours do not hold it until 8 a.m. (the reminders' rule).
+ *   - The note says what really happened: someone who answered and then went quiet, a call cut off
+ *     by the 15 minute limit, a call cut off by a phone system restart.
+ *   - A restart no longer loses the report. Each call that will report back is written to a small
+ *     file on the volume when it is dialed (store), with its transcript once the call ends, and
+ *     taken off once the report is settled. After a restart, a call still on that list is reported
+ *     honestly from what was saved (recover, finishUnknown).
+ *   - When a report settles after the call record was saved, the record is told (onSettled).
+ *
+ * Cost: each report is one character-written message on the person's seat. The website keeps
+ * these on MiMo (about 1 to 2 cents) unless KADE_CLAUDE_CALL_REPORTS=1 there; see
+ * services/kadeCharacterTurn.js. Off switch: KADE_CALL_REPORT_BACK=0 (the call still works; the
+ * old "ask me" flow comes back on the website side because the bridge then answers
+ * reportBack:false). */
 
 const AGENT_ID = /^agent_[A-Za-z0-9_-]{6,64}$/;
 const CONVO_ID = /^[0-9a-f-]{36}$/i;
 const USER_ID = /^[a-f0-9]{24}$/i;
+const FINAL_STATUSES = ['completed', 'busy', 'no-answer', 'failed', 'canceled'];
 
 function enabled(env = process.env) {
   return String((env && env.KADE_CALL_REPORT_BACK) ?? '') !== '0';
@@ -67,17 +89,39 @@ const plain = (s) => String(s || '')
   .replace(/\s+/g, ' ')
   .trim();
 
-/** What happened, in one plain sentence the character can build from. */
+const turnsOf = (meta) => (Array.isArray(meta.transcript) ? meta.transcript : []);
+const theySpokeIn = (meta) => turnsOf(meta).some((t) => t && t.role === 'user' && plain(t.content));
+const answeredCall = (meta) => String(meta.finalStatus || 'completed') === 'completed' && (meta.durationSec || 0) > 0;
+/** Twilio's time limit ended it (the duration reached the limit the call was placed with). */
+const hitTimeLimit = (meta) => {
+  const limit = Number(meta.timeLimitSec) || 0;
+  return limit > 0 && String(meta.finalStatus || 'completed') === 'completed' && (meta.durationSec || 0) >= limit - 5;
+};
+const minutesWord = (sec) => {
+  const m = Math.round((Number(sec) || 0) / 60);
+  return m > 0 ? `${m}-minute` : 'time';
+};
+
+/** What happened, in one plain sentence (or two) the character can build from. */
 function outcomeLine(meta) {
   const status = String(meta.finalStatus || 'completed');
-  const turns = Array.isArray(meta.transcript) ? meta.transcript : [];
-  const theySpoke = turns.some((t) => t && t.role === 'user' && plain(t.content));
+  const theySpoke = theySpokeIn(meta);
   if (status === 'busy') return 'The line was busy, so nobody answered.';
   if (status === 'no-answer') return 'Nobody picked up.';
   if (status === 'failed') return 'The call did not go through (the phone company could not connect it).';
   if (status === 'canceled') return 'The call was cancelled before anyone answered.';
+  if (meta.restarted && answeredCall(meta)) {
+    return theySpoke || turnsOf(meta).length
+      ? 'The phone system restarted on our side around the time this call ended, so the end of the call may be missing from what is below.'
+      : 'The phone system restarted on our side during this call, so it was cut off and what they said was lost.';
+  }
   if (meta.voicemail) return 'It went to voicemail, and you left a short message.';
-  if (meta.quietHangUp) return 'Someone picked up, but you never heard anyone say anything, so you hung up after asking if they could hear you.';
+  if (meta.quietHangUp) {
+    if (theySpoke) return 'Someone answered (their words are below), then the line went quiet. You asked if they could hear you, waited, and hung up.';
+    if (meta.quietAfterWords) return 'Someone picked up and said hello, then the line went quiet. You asked if they could hear you, waited a few minutes, and hung up.';
+    return 'Someone picked up, but you never heard anyone say anything, so you hung up after asking if they could hear you.';
+  }
+  if (hitTimeLimit(meta)) return `The call reached its ${minutesWord(meta.timeLimitSec)} limit and was cut off before it finished.`;
   if (!theySpoke) return 'The call connected, but you never heard the other side say anything.';
   return 'They picked up and you talked with them.';
 }
@@ -85,7 +129,7 @@ function outcomeLine(meta) {
 /** The transcript as lines the character can read, newest last, capped. */
 function transcriptText(meta, { agentName, maxChars = 3500 } = {}) {
   const me = agentName || 'You';
-  const lines = (Array.isArray(meta.transcript) ? meta.transcript : [])
+  const lines = turnsOf(meta)
     .map((t) => {
       const text = plain(t && t.content).replace(/^\[VOICEMAIL LEFT\]\s*/i, '(voicemail message) ');
       if (!text) return null;
@@ -117,14 +161,97 @@ function buildNote(meta) {
   ].join('\n');
 }
 
+/** Cut to at most n characters at a word, with an ellipsis when cut. */
+function clip(s, n) {
+  const t = String(s || '').trim();
+  if (t.length <= n) return t;
+  return `${t.slice(0, n).replace(/\s+\S*$/, '')}...`;
+}
+
+/**
+ * The backup tap, in the character's own first person, when the website could not write the
+ * message (review, Nov 14 2026: it used to say "Ask me what they said", the very check-back Kade
+ * did not want, and lines meant for the character, "you left a short message", which VoiceOver
+ * reads to her as if she had). Built from the call itself; at most about 300 characters.
+ */
+function tapText(meta) {
+  const who = meta.calleeName || 'the number you gave me';
+  const status = String(meta.finalStatus || 'completed');
+  const said = turnsOf(meta).filter((t) => t && t.role === 'user').map((t) => plain(t.content)).filter(Boolean);
+  if (status === 'busy') return `I called ${who}, but the line was busy.`;
+  if (status === 'no-answer') return `I called ${who}, but nobody picked up.`;
+  if (status === 'failed') return `I tried to call ${who}, but the call did not go through.`;
+  if (status === 'canceled') return `The call to ${who} was cancelled before anyone answered.`;
+  if (meta.restarted && answeredCall(meta) && !said.length) return `I called ${who}, but our phone system restarted during the call and cut it off, so I don't know what they said.`;
+  if (meta.voicemail) return `I called ${who} and got voicemail, so I left a short message.`;
+  if (!said.length) {
+    if (meta.quietHangUp) return `I called ${who}. Someone picked up but never said anything, so I hung up.`;
+    return `I called ${who}. The call connected, but I never heard anyone say anything.`;
+  }
+  const lead = hitTimeLimit(meta) ? `I called ${who}; the call hit its time limit. They said: ` : `I called ${who}. They said: `;
+  return `${lead}"${clip(said.slice(-2).join(' '), 290 - lead.length)}"`;
+}
+
+/** What is kept on disk for a call that will report back (enough to report it after a restart). */
+function pendingEntry(meta) {
+  return {
+    callSid: meta.callSid,
+    userId: meta.userId,
+    agentId: meta.agentId || null,
+    agentName: meta.agentName || null,
+    reportAgentId: meta.reportAgentId,
+    reportAgentName: meta.reportAgentName || null,
+    conversationId: meta.conversationId || null,
+    calleeName: meta.calleeName || null,
+    purpose: String(meta.purpose || '').slice(0, 500),
+    startedAt: meta.startedAt || Date.now(),
+    timeLimitSec: meta.timeLimitSec || null,
+    state: 'waiting',
+  };
+}
+
+/** A call record rebuilt from what was kept on disk, after a restart. */
+function metaFromEntry(e, finalStatus, durationSec) {
+  return {
+    callSid: e.callSid,
+    userId: e.userId,
+    agentId: e.agentId,
+    agentName: e.agentName,
+    reportAgentId: e.reportAgentId,
+    reportAgentName: e.reportAgentName,
+    conversationId: e.conversationId,
+    calleeName: e.calleeName,
+    purpose: e.purpose,
+    startedAt: e.startedAt,
+    timeLimitSec: e.timeLimitSec,
+    transcript: Array.isArray(e.transcript) ? e.transcript : null,
+    voicemail: e.voicemail === true,
+    quietHangUp: e.quietHangUp === true,
+    quietAfterWords: e.quietAfterWords === true,
+    finalStatus: String(finalStatus || e.finalStatus || 'completed'),
+    durationSec: Number.isFinite(Number(durationSec)) ? Number(durationSec) : (e.durationSec || 0),
+    reportBack: true,
+    report: { state: 'waiting', at: Date.now() },
+    // The old process never saw the call end (no final status on the list), so the restart is what
+    // ended it, or happened as it ended. A call whose end WAS seen only lost its report: no notice.
+    restarted: !e.finalStatus,
+  };
+}
+
 /**
  * The reporter. All outside effects come in as functions, so tests run it with fakes.
  * @param {object} deps
- * @param {(body: object) => Promise<{ok:boolean, conversationId?:string}>} deps.speak  POST /api/kade/soul/speak
+ * @param {(body: object) => Promise<{ok:boolean, conversationId?:string, status?:number, error?:string}>} deps.speak
+ *        POST /api/kade/soul/speak. `status` is the HTTP status when the website answered; none means
+ *        no answer came (a timeout or a dropped connection).
  * @param {(push: object) => Promise<any>} [deps.notify]  the plain push used when the speak door fails
  * @param {(msg: string) => void} [deps.log]
  * @param {number} [deps.transcriptWaitMs]  how long an answered call waits for its transcript
  * @param {number} [deps.pollMs]
+ * @param {number} [deps.yieldMs]   how long a waiting check_result is given to claim the result
+ * @param {number} [deps.retryMs]   the wait before trying the website again after a 429 or 5xx
+ * @param {{ load: () => object, save: (all: object) => void }} [deps.store]  the on-disk list
+ * @param {(meta: object) => void} [deps.onSettled]  the report is done (posted, failed or claimed)
  */
 function createCallReporter(deps) {
   const speak = deps.speak;
@@ -132,7 +259,54 @@ function createCallReporter(deps) {
   const log = deps.log || ((m) => console.log(m));
   const transcriptWaitMs = deps.transcriptWaitMs ?? 10000;
   const pollMs = deps.pollMs ?? 250;
+  const yieldMs = deps.yieldMs ?? 4000;
+  const retryMs = deps.retryMs ?? 60000;
+  const store = deps.store || null;
+  const onSettled = deps.onSettled || (() => {});
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* ── the on-disk list of calls that will report back ── */
+  let pending = null;
+  function pend() {
+    if (pending) return pending;
+    try { pending = (store && store.load()) || {}; } catch (_) { pending = {}; }
+    if (!pending || typeof pending !== 'object' || Array.isArray(pending)) pending = {};
+    return pending;
+  }
+  function persist() {
+    if (!store) return;
+    try { store.save(pend()); } catch (e) { log(`[call-report] could not save the pending list: ${e && e.message}`); }
+  }
+  /** A call that will report back was just dialed. */
+  function track(meta) {
+    if (!meta || meta.reportBack !== true || !meta.callSid) return;
+    pend()[meta.callSid] = pendingEntry(meta);
+    persist();
+  }
+  /** Keep what a restart would need: the transcript at hang-up, the final status, the state. */
+  function note(meta, fields) {
+    const e = meta && pend()[meta.callSid];
+    if (!e) return;
+    Object.assign(e, fields);
+    persist();
+  }
+  function untrack(callSid) {
+    if (callSid && pend()[callSid]) { delete pend()[callSid]; persist(); }
+  }
+  /** The stream handed over the transcript (server.js onCallEnd). */
+  function noteTranscript(meta) {
+    if (!meta || meta.reportBack !== true) return;
+    note(meta, {
+      transcript: turnsOf(meta).slice(-40),
+      voicemail: meta.voicemail === true,
+      quietHangUp: meta.quietHangUp === true,
+      quietAfterWords: meta.quietAfterWords === true,
+    });
+  }
+  function settle(meta) {
+    untrack(meta.callSid);
+    try { onSettled(meta); } catch (_) { /* the record is a convenience */ }
+  }
 
   /** check_result read a finished call: the person is hearing it in the chat right now. */
   function claim(meta) {
@@ -142,29 +316,49 @@ function createCallReporter(deps) {
     if (s === 'failed') return 'failed';
     meta.report.state = 'claimed';
     meta.report.at = Date.now();
+    settle(meta);
     return 'claimed';
   }
 
+  /** check_result is waiting on this call right now (it should get the result, not a second report). */
+  function awaited(meta) {
+    if (meta && meta.reportBack === true && meta.report) meta.report.awaitedAt = Date.now();
+  }
+
   /** Twilio said the call is over. Fire and forget; never throws. */
+  const active = new Map(); // callSid -> the call this process is reporting right now (never two runs for one call)
   function onFinal(meta) {
-    if (!meta || meta.reportBack !== true || !meta.report || meta.report.state !== 'waiting') return Promise.resolve(false);
-    return run(meta).catch((e) => { log(`[call-report] ${meta.callSid} failed: ${e && e.message}`); return false; });
+    if (!meta || meta.reportBack !== true || !meta.report) return Promise.resolve(false);
+    if (meta.callSid && active.has(meta.callSid)) return Promise.resolve(false);
+    note(meta, { finalStatus: meta.finalStatus || null, durationSec: meta.durationSec || 0 });
+    if (meta.report.state !== 'waiting') {
+      if (meta.report.state === 'claimed') settle(meta);
+      return Promise.resolve(false);
+    }
+    if (meta.callSid) active.set(meta.callSid, meta);
+    return run(meta)
+      .catch((e) => { log(`[call-report] ${meta.callSid} failed: ${e && e.message}`); return false; })
+      .finally(() => { if (meta.callSid) active.delete(meta.callSid); });
   }
 
   async function run(meta) {
     // An answered call: the stream hands over its transcript at hang-up; wait for it a little.
-    const answered = String(meta.finalStatus || '') === 'completed' && (meta.durationSec || 0) > 0;
+    const answered = answeredCall(meta);
     const until = Date.now() + transcriptWaitMs;
-    while (answered && !(Array.isArray(meta.transcript) && meta.transcript.length) && Date.now() < until) {
-      if (meta.report.state !== 'waiting') return false;
+    while (answered && !turnsOf(meta).length && Date.now() < until) {
+      if (meta.report.state !== 'waiting') break;
+      await sleep(pollMs);
+    }
+    // A check_result waiting on this call gets the result first (it claims it), and no report is sent.
+    const yieldUntil = Date.now() + yieldMs;
+    while (meta.report.state === 'waiting' && meta.report.awaitedAt && Date.now() - meta.report.awaitedAt < pollMs * 4 + 1000 && Date.now() < yieldUntil) {
       await sleep(pollMs);
     }
     if (meta.report.state !== 'waiting') {
       log(`[call-report] ${meta.callSid}: not sent, the person already heard it (${meta.report.state})`);
+      if (meta.report.state === 'claimed') settle(meta);
       return false;
     }
-    meta.report.state = 'posting';
-    meta.report.at = Date.now();
     const body = {
       userId: meta.userId,
       agentId: meta.reportAgentId,
@@ -173,41 +367,147 @@ function createCallReporter(deps) {
       kind: 'call',
       requested: true,
       push: true,
+      // The person asked for this call minutes ago and is waiting for it: quiet hours do not hold it.
+      urgent: true,
+      // What the other person said is in the note: the website treats it like text from outside.
+      outsideText: true,
     };
-    try {
-      const r = await speak(body);
+    // 429 = the site is writing other messages right now; 5xx = it failed or was restarting.
+    let tries429 = 0;
+    let tries5xx = 0;
+    let lastError = '';
+    for (;;) {
+      if (meta.report.state !== 'waiting') {
+        log(`[call-report] ${meta.callSid}: not sent, the person already heard it (${meta.report.state})`);
+        if (meta.report.state === 'claimed') settle(meta);
+        return false;
+      }
+      meta.report.state = 'posting';
+      meta.report.at = Date.now();
+      note(meta, { state: 'posting', postingAt: Date.now() });
+      let r;
+      try {
+        r = await speak(body);
+      } catch (e) {
+        r = { ok: false, error: String((e && e.message) || e) };
+      }
       if (r && r.ok) {
         meta.report.state = 'posted';
         meta.report.at = Date.now();
         meta.report.conversationId = r.conversationId || null;
         log(`[call-report] ${meta.callSid}: told them in their conversation (${String(meta.finalStatus || 'completed')})`);
+        settle(meta);
         return true;
       }
-      throw new Error((r && r.error) || 'the site did not post it');
-    } catch (e) {
-      meta.report.state = 'failed';
-      meta.report.at = Date.now();
-      meta.report.error = String((e && e.message) || e).slice(0, 200);
-      log(`[call-report] ${meta.callSid}: the message could not be written (${meta.report.error}); sending a plain tap instead`);
-      try {
-        const talked = /you talked with them/.test(outcomeLine(meta));
-        const callTo = meta.calleeName ? `The call to ${meta.calleeName} is done.` : 'Your call is done.';
-        await notify({
-          userId: meta.userId,
-          agentId: meta.reportAgentId,
-          agentName: meta.reportAgentName || meta.agentName,
-          title: String(meta.reportAgentName || meta.agentName || 'Your call').slice(0, 40),
-          body: talked ? `${callTo} Ask me what they said.` : `${callTo} ${outcomeLine(meta)}`,
-          requested: true,
-          route: meta.conversationId ? 'conversation' : undefined,
-          conversationId: meta.conversationId || undefined,
-        });
-      } catch (_) { /* the transcript is still there for check_result */ }
-      return false;
+      lastError = String((r && r.error) || 'the site did not post it').slice(0, 200);
+      const status = Number(r && r.status) || 0;
+      const again = (status === 429 && tries429 < 2) || (status >= 500 && tries5xx < 1);
+      if (!again) break;
+      if (status === 429) tries429 += 1; else tries5xx += 1;
+      // While it waits, a check_result can still take it (claim sees 'waiting').
+      meta.report.state = 'waiting';
+      note(meta, { state: 'waiting' });
+      log(`[call-report] ${meta.callSid}: the site said ${status} (${lastError}); trying again in ${Math.round(retryMs / 1000)} s`);
+      await sleep(retryMs);
     }
+    meta.report.state = 'failed';
+    meta.report.at = Date.now();
+    meta.report.error = lastError;
+    log(`[call-report] ${meta.callSid}: the message could not be written (${lastError}); sending a plain tap instead`);
+    try {
+      await notify({
+        userId: meta.userId,
+        agentId: meta.reportAgentId,
+        agentName: meta.reportAgentName || meta.agentName,
+        title: String(meta.reportAgentName || meta.agentName || 'Your call').slice(0, 40),
+        body: tapText(meta),
+        requested: true,
+        urgent: true,
+        route: meta.conversationId ? 'conversation' : undefined,
+        conversationId: meta.conversationId || undefined,
+      });
+    } catch (_) { /* the transcript is still there for check_result */ }
+    settle(meta);
+    return false;
   }
 
-  return { onFinal, claim };
+  /* ── after a restart ── */
+  function entryFor(callSid) {
+    return (callSid && pend()[callSid]) || null;
+  }
+  /** The newest call of this person's that is still on the list (an older website sends no call id). */
+  function newestPendingFor(userId) {
+    return Object.values(pend())
+      .filter((e) => e && e.userId === userId)
+      .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0] || null;
+  }
+  /** check_result found the call only on the list: the person hears about it now, so no report too.
+   *  If this process is already reporting it (after a restart), that report is claimed the same way
+   *  claim() does it; `told` says what the person has already been sent. */
+  function claimEntry(callSid) {
+    const e = entryFor(callSid);
+    if (!e) return null;
+    const running = active.get(callSid);
+    if (running) return { ...e, told: claim(running) };
+    untrack(callSid);
+    return { ...e, told: 'claimed' };
+  }
+  /** Report a call this process did not place (it was placed before a restart), from the list. */
+  function reportRecovered(e, finalStatus, durationSec) {
+    if (active.has(e.callSid)) return Promise.resolve(false); // already being reported here
+    if (e.state === 'posting') {
+      // The website had it in hand when the bridge stopped; it finishes on its own. Never twice.
+      log(`[call-report] ${e.callSid}: was being written when the bridge restarted; left to the website`);
+      untrack(e.callSid);
+      return Promise.resolve(false);
+    }
+    log(`[call-report] ${e.callSid}: reporting a call from before a restart (${finalStatus})`);
+    return onFinal(metaFromEntry(e, finalStatus, durationSec));
+  }
+  /** /voice-status for a call this process does not know. Resolves false when it is not ours. */
+  function finishUnknown(callSid, finalStatus, durationSec) {
+    const e = entryFor(callSid);
+    if (!e || !FINAL_STATUSES.includes(String(finalStatus))) return Promise.resolve(false);
+    return reportRecovered(e, finalStatus, durationSec);
+  }
+  /**
+   * At boot: every call still on the list. Its final status from Twilio when the list does not
+   * have one; a call still going is left for its status callback; one older than maxAgeMs with no
+   * status at all is dropped.
+   * @param {{ fetchStatus?: (sid: string) => Promise<{status: string, duration?: string|number}>, isLive?: (sid: string) => boolean, maxAgeMs?: number }} o
+   */
+  async function recover(o = {}) {
+    const isLive = o.isLive || (() => false);
+    const maxAgeMs = o.maxAgeMs ?? 2 * 3600 * 1000;
+    let done = 0;
+    for (const e of Object.values(pend())) {
+      if (!e || !e.callSid || isLive(e.callSid) || active.has(e.callSid)) continue;
+      if (e.state === 'posting') { await reportRecovered(e); continue; } // the website has it: off the list
+      let status = e.finalStatus || null;
+      let duration = e.durationSec || 0;
+      if (!status && o.fetchStatus) {
+        try {
+          const c = await o.fetchStatus(e.callSid);
+          status = c && c.status ? String(c.status) : null;
+          duration = parseInt(c && c.duration, 10) || 0;
+        } catch (err) {
+          log(`[call-report] ${e.callSid}: could not read its status after a restart: ${err && err.message}`);
+        }
+      }
+      if (!status || !FINAL_STATUSES.includes(status)) {
+        if (Date.now() - (e.startedAt || 0) > maxAgeMs) { log(`[call-report] ${e.callSid}: dropped, too old and no status`); untrack(e.callSid); }
+        continue;
+      }
+      await reportRecovered(e, status, duration);
+      done += 1;
+    }
+    return done;
+  }
+
+  return { onFinal, claim, awaited, track, noteTranscript, entryFor, newestPendingFor, claimEntry, finishUnknown, recover, pendingList: () => ({ ...pend() }) };
 }
 
-module.exports = { enabled, reportFields, outcomeLine, transcriptText, buildNote, createCallReporter };
+module.exports = {
+  enabled, reportFields, outcomeLine, transcriptText, buildNote, tapText, pendingEntry, metaFromEntry,
+  createCallReporter, FINAL_STATUSES,
+};

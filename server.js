@@ -2462,19 +2462,39 @@ const outboundMeta = new Map();                           // callSid -> live cal
 // chat-placed call ends (Kade: "they message you when they're done with the call").
 const outboundGreeting = require('./outbound-greeting');
 const callReport = require('./call-report');
+// Nov 14 2026 review: the calls that will report back, kept on the volume so a restart cannot lose
+// one (call-report.js recover / finishUnknown). Removed as each report settles.
+const OUTBOUND_REPORTS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(), 'outbound-report-pending.json');
 const callReporter = callReport.createCallReporter({
   // The same door research.js and errands.js post their write-ups through.
   speak: async (body) => {
     if (!BRIDGE_SECRET) return { ok: false, error: 'no BRIDGE_SECRET' };
     const r = await axios.post(`${FORK_USAGE_URL}/api/kade/soul/speak`, body, {
       headers: { 'x-kade-secret': BRIDGE_SECRET, 'User-Agent': BROWSER_UA },
-      timeout: 280000,
+      /* Nov 14 2026 review: longer than the website's own worst case (four tries to start the
+       * turn with 15, 30 and 45 s between, a 240 s read, up to 20 s waiting for a quiet chat, a
+       * 25 s push), so the bridge does not give up and send its backup tap while the website is
+       * still writing the message, which then lands too. */
+      timeout: parseInt(process.env.KADE_CALL_REPORT_TIMEOUT_MS || '480000', 10),
       validateStatus: () => true,
     });
     if (r.status === 200 && r.data && r.data.ok) return { ok: true, conversationId: r.data.conversationId || null };
-    return { ok: false, error: (r.data && r.data.error) || `HTTP ${r.status}` };
+    return { ok: false, status: r.status, error: (r.data && r.data.error) || `HTTP ${r.status}` };
   },
   notify: (push) => runNotify(push),
+  store: {
+    load: () => loadJsonFile(OUTBOUND_REPORTS_FILE, {}),
+    save: (all) => saveJsonFile(OUTBOUND_REPORTS_FILE, all),
+  },
+  // A report that settles after the call record was saved (finalizeOutboundCall runs 45 s or more
+  // after the call): the record is told, so a later check_result reads the real state.
+  onSettled: (meta) => {
+    const rec = outboundLog.find((r) => r.callSid === meta.callSid);
+    if (rec && meta.report && rec.reportState !== meta.report.state) {
+      rec.reportState = meta.report.state;
+      saveJsonFile(OUTBOUND_LOG_FILE, outboundLog);
+    }
+  },
 });
 const lastDialed   = new Map();                           // e164 -> ts of last outbound dial
 
@@ -2735,6 +2755,9 @@ app.post('/outbound-call', async (req, res) => {
       greeting2AskAt: composed.ask2At,
       ask: composed.ask,
       ...(report || { reportBack: false }),
+      // Nov 14 2026 review: the limit this call was placed with, so a call Twilio cut off at the limit
+      // is reported as that, not as a normal talk (call-report.js outcomeLine).
+      timeLimitSec: OUTBOUND_TIME_LIMIT_SEC,
       to: e164,
       agentId: agentId || DEFAULT_AGENT,
       agentName: agentName || DEFAULT_AGENT_NAME,
@@ -2759,6 +2782,8 @@ app.post('/outbound-call', async (req, res) => {
         topics: String(rawWellness.topics || '').slice(0, 600) || null,
       } : null,
     });
+    // Nov 14 2026 review: on the volume until its report settles, so a restart cannot lose it.
+    if (report) callReporter.track(outboundMeta.get(call.sid));
     lastDialed.set(e164, Date.now());
     daily.byUser[userId] = (daily.byUser[userId] || 0) + 1;
     daily.total += 1;
@@ -2824,6 +2849,7 @@ app.post('/voice-status', (req, res) => {
   const meta = outboundMeta.get(CallSid);
   if (meta && !meta.finalized && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(CallStatus)) {
     meta.finalized = true;
+    meta.finalizedAt = Date.now();
     meta.finalStatus = CallStatus;
     meta.durationSec = parseInt(CallDuration || '0', 10);
     // Nov 14 2026: the character tells the person how it went, now, not after pricing (call-report.js).
@@ -2831,6 +2857,10 @@ app.post('/voice-status', (req, res) => {
     // Give Twilio ~45s to compute price and land recording callbacks first.
     setTimeout(() => finalizeOutboundCall(CallSid).catch((e) =>
       console.error('[outbound] finalize error:', e.message)), 45000);
+  } else if (!meta && CallSid) {
+    // Nov 14 2026 review: a call placed before a restart. If it was going to report back, it still
+    // does, honestly, from what was kept on the volume (call-report.js finishUnknown).
+    callReporter.finishUnknown(CallSid, CallStatus, parseInt(CallDuration || '0', 10)).catch(() => {});
   }
   res.status(200).end();
 });
@@ -2965,20 +2995,29 @@ app.post('/outbound/result', async (req, res) => {
   // from the moment the stream stops — finalization (Twilio pricing, 30-90s)
   // doesn't have to block the report-back.
   const deadline = Date.now() + Math.min(55, Math.max(0, parseInt(waitSec, 10) || 0)) * 1000;
+  /* Nov 14 2026 review:
+   *  - A call is over for this answer when its transcript is here, or it was never answered, or
+   *    Twilio said it ended more than 10 s ago. Twilio's status can come before the stream hands
+   *    the transcript over; answering then claimed the result with no words in it, so Kiana said
+   *    "(no speech captured)" and no report came either.
+   *  - It looks every 250 ms (an in-memory read), not every 2.5 s, and while it waits on a call that
+   *    reports back, the report knows (awaited) and lets this answer go first. Before, the report
+   *    nearly always started first and the person got the answer twice. */
+  const hasTranscript = (m) => !!(m.transcript && m.transcript.length);
+  const wasAnswered = (m) => m.finalStatus === 'completed' && (m.durationSec || 0) > 0;
+  const over = (m) => hasTranscript(m) || (m.finalized && (!wasAnswered(m) || Date.now() - (m.finalizedAt || 0) >= 10000));
+  const newer = (l, d) => !!l && (!d || l.startedAt > Date.parse(d.at));
   let { live, done } = findState();
-  while (
-    live && (!done || live.startedAt > Date.parse(done.at)) &&
-    !live.finalized && !(live.transcript && live.transcript.length) &&
-    Date.now() < deadline
-  ) {
-    await new Promise((r) => setTimeout(r, 2500));
+  while (newer(live, done) && !over(live) && Date.now() < deadline) {
+    callReporter.awaited(live);
+    await new Promise((r) => setTimeout(r, 250));
     ({ live, done } = findState());
   }
 
-  if (live && (!done || live.startedAt > Date.parse(done.at))) {
+  if (newer(live, done)) {
     // Call ended but finalize is still pricing it: the transcript is already
     // on the meta — return it now, that's what report-back needs.
-    if (live.finalized || (live.transcript && live.transcript.length)) {
+    if (over(live)) {
       // Nov 14 2026 (call-report.js): the person is getting the result right here, so the
       // character's own report is not sent too; or it already went, and the character is told.
       const told = callReporter.claim(live);
@@ -3003,11 +3042,38 @@ app.post('/outbound/result', async (req, res) => {
       calleeName: live.calleeName,
       purpose: live.purpose,
       startedSecondsAgo: Math.round((Date.now() - live.startedAt) / 1000),
-      note: 'Call is still going.',
+      // Ended a moment ago, transcript not handed over yet: still "going" for this answer.
+      note: live.finalized ? 'The call just ended; what was said is still coming in.' : 'Call is still going.',
       reportBack: live.reportBack === true,
     });
   }
-  if (!done) return res.json({ found: false, note: 'No outbound calls found for this user.' });
+  /* Nov 14 2026 review: a call placed before a bridge restart is not live here and was never
+   * finalized, so the newest saved record is an OLDER call, and that used to be reported as this
+   * one. If the call is still on the report list, it is answered from there (what was saved, and
+   * that the restart cut it off), and the person hearing it now means no report later. */
+  const cut = callSid ? callReporter.entryFor(callSid) : callReporter.newestPendingFor(userId);
+  if (cut && cut.userId === userId && (!done || (cut.startedAt || 0) > Date.parse(done.at))) {
+    const toldCut = (callReporter.claimEntry(cut.callSid) || {}).told;
+    return res.json({
+      found: true,
+      status: 'interrupted',
+      callSid: cut.callSid,
+      calleeName: cut.calleeName,
+      purpose: cut.purpose,
+      transcript: (cut.transcript || []).slice(-40),
+      note: 'The phone system restarted on our side during or right after this call, so it was cut off. The transcript holds only what was saved before that.',
+      reportBack: true,
+      reportedToChat: toldCut === 'posting' || toldCut === 'posted',
+    });
+  }
+  if (!done) {
+    return res.json({
+      found: false,
+      note: callSid
+        ? 'No call with that id is on record. It may have been cut off when the phone system restarted.'
+        : 'No outbound calls found for this user.',
+    });
+  }
   res.json({
     found: true,
     status: done.status,
@@ -4212,6 +4278,9 @@ function onCallEnd(callSid, history) {
       role: m.role,
       content: String(m.content || '').slice(0, 2000),
     }));
+    // Nov 14 2026 review: a call that reports back keeps its transcript on the volume until the
+    // report settles, so a restart (the stream closes on the way down) cannot lose what was said.
+    try { callReporter.noteTranscript(meta); } catch {}
   }
 }
 async function endCall(callSid) {
@@ -6379,4 +6448,14 @@ server.listen(port, () => {
   console.log(`[bridge] Port ${port} | Public: ${PUBLIC_URL}`);
   console.log(`[bridge] Default agent: ${DEFAULT_AGENT} (${DEFAULT_AGENT_NAME})`);
   if (!twilioClient) console.warn('[bridge] Twilio not configured -- set env vars');
+  /* Nov 14 2026 review: calls that were still going to report back when the bridge last stopped
+   * (a redeploy during a call). A call Twilio says is over is reported now, honestly, from what was
+   * kept; one still going is left for its status callback (finishUnknown in /voice-status). */
+  setTimeout(() => {
+    callReporter.recover({
+      fetchStatus: twilioClient ? (sid) => twilioClient.calls(sid).fetch() : undefined,
+      isLive: (sid) => outboundMeta.has(sid),
+    }).then((n) => { if (n) console.log(`[call-report] reported ${n} call(s) placed before the restart`); })
+      .catch((e) => console.warn('[call-report] restart recovery failed:', e.message));
+  }, 20000);
 });
