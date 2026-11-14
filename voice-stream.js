@@ -493,7 +493,9 @@ function buildOutboundSuffix(ctx) {
      * reached the right place", and on Kade's test call a pickup "Hello?" (replayed after the
      * greeting) became a turn and she was asked the question twice. A hello said over the greeting
      * never reaches you now; a hello AFTER it means they did not hear it. */
-    `Your greeting already asked your question. If their first words after it are only "hello", they did not hear it: say it again in one short sentence. Otherwise never ask it again; answer what they said. ` +
+    /* Review, same day: a hold or a transfer means they did not hear it either (the business rules
+     * below already say a transferred caller hears the mission again). */
+    `Your greeting already asked your question. Ask it again, in one short sentence, only if they did not hear it: their first words after it are only "hello", they ask what you said, they come back from putting you on hold, or a new person comes on the line. Otherwise never ask it again; answer what they said. ` +
     `Match the register of the call: businesses and strangers get professional, clean language — no profanity, no slang tics — unless the moment genuinely invites humor. ` +
     `Deliver each mission point ONCE. Before you speak, check the conversation above: anything you already said, do NOT say again — react to their actual last words instead. If they tell you something is handled, or let you off the hook, ACCEPT it and move on; re-delivering a prepared point they just waved off is worse than skipping it. ` +
     `Stay on the mission, be polite and brief, never invent facts you were not given, and never agree to ` +
@@ -1545,6 +1547,9 @@ function openDeepgramFlux(session, key) {
         // The person's own words, heard while nothing of ours is playing or just played (a
         // speakerphone feeding our voice back is not them). The outbound quiet watch reads this.
         if (!session.isSpeaking && Date.now() - (session.lastSpokAt || 0) > 1500) session._lastCalleeWordsAt = Date.now();
+        // Nov 14 2026 review: an answer to a quiet-watch line ("I can hear you" to "Hello? Can you hear
+        // me?") counts at once, unless it is a long stretch of the line itself (limitLineEcho).
+        else if (limitLineActive(session) && !limitLineEcho(text, session._limitLine)) session._lastCalleeWordsAt = Date.now();
       }
       // Real words while a grace timer runs = they kept going; wait for the
       // new EndOfTurn instead of firing the held one.
@@ -1762,6 +1767,7 @@ function openDeepgram(session) {
       noteCallerHeard(session, 'words', text); // Nov 10 2026: the quiet-line watch (call-limits.js)
       // Nov 14 2026: the outbound quiet watch's sign of life (not while our own voice could be what it heard).
       if (!session.isSpeaking && Date.now() - (session.lastSpokAt || 0) > 1500) session._lastCalleeWordsAt = Date.now();
+      else if (limitLineActive(session) && !limitLineEcho(text, session._limitLine)) session._lastCalleeWordsAt = Date.now();
       // Same single door as the flux path — grace window, echo gate, single-word
       // allow-list, and on app/web the room gate (confidence + screen-reader
       // chrome). nova hands back its word list on the alternative, not the
@@ -1877,6 +1883,33 @@ function openDeepgram(session) {
  *     for the reply instead of being dropped as echo, and the typing sound pauses while they talk.
  *   - Silence: nothing at all heard for 8 s after the greeting -> "Hello? Can you hear me?" once,
  *     no model turn and no typing sound; 12 s more of nothing -> a short goodbye and hang up.
+ *
+ * Review fixes, Nov 14 2026 (same day):
+ *   - The cutoffs allow for the line. We send audio up to 0.6 s ahead of Twilio's playout, the
+ *     person hears it a beat later still, and their words reach us late too (the line, then Flux
+ *     opening a turn). A nod to "This call may be recorded." showed up after the question had
+ *     started on our clock and was answered as if it were their answer. Now a nod or "who's this?"
+ *     counts as said to the question only from 1 s after the question started
+ *     (KADE_OUTBOUND_ASK_LATENCY_MS), and words begun within 0.7 s of a greeting part starting are
+ *     their pickup (KADE_OUTBOUND_PICKUP_GRACE_MS): nobody hears a greeting that fast.
+ *   - A held nod alone ("Okay.", "Uh-huh.") never starts a turn by itself at the end of the
+ *     greeting: it waits up to 2.5 s for the real answer and goes with it
+ *     (KADE_OUTBOUND_NOD_WAIT_MS), alone only if nothing more comes.
+ *   - Held words wait only while the person is really still talking: a noise that opens a turn and
+ *     closes with no words no longer holds the answer back for the whole 4 s.
+ *   - "Good!" is an answer (only "good morning" and the like is a hello), and "Speaking." is a yes.
+ *   - The quiet watch never hangs up on a person. If anyone said anything (their pickup "Hello?"
+ *     too) it asks once and then waits 3 minutes (KADE_OUTBOUND_QUIET_SPOKE_END_MS) before the
+ *     goodbye; if they asked us to hold ("hold on", "one moment", "please hold") it never asks and
+ *     never hangs up (the call's own 15 minute limit still ends it). Only a line where nothing at
+ *     all was ever heard gets the 12 s goodbye. Its lines wait until they are ready to play and
+ *     only play if nobody has spoken meanwhile, an answer to them that repeats their words ("I can
+ *     hear you") is the person, not the line's echo (the inbound call-limit rule, limitLineEcho),
+ *     and anything heard during the goodbye keeps the call up.
+ *   - What they said that was still waiting when the call ended (an answer held over the greeting)
+ *     goes into the transcript, so the report has it.
+ *   - Words said over the character's goodbye after it asked to end the call go into the transcript
+ *     and start no new turn.
  * Switches: KADE_OUTBOUND_FIRST_ROUND=0 (all of the above but the quiet watch),
  * KADE_OUTBOUND_QUIET_WATCH=0 (the silence watch). */
 function firstRoundOn(session) {
@@ -1886,7 +1919,11 @@ const envMs = (name, dflt) => {
   const n = parseInt(process.env[name] || '', 10);
   return Number.isFinite(n) && n >= 0 ? n : dflt;
 };
-const GREETING_ASK_LEAD_MS = 400; // people answer a question a little before it ends
+/* A question this far into a greeting part has words before it that draw nods ("this is Kiana, an
+ * A I assistant ... This call may be recorded."). A part that opens with its question ("Hi — is
+ * this Holly?") has nothing before it to nod at, so no latency is added there. */
+const ASK_PREAMBLE_MS = 1500;
+const HELD_TICK_MS = 200;
 
 /** Is the person who answered in the middle of saying something? */
 function calleeMidTurn(session) {
@@ -1902,10 +1939,15 @@ function calleeTalkingNow(session) {
   return !!(session._fluxTurnOpen && session._fluxWordsAt && Date.now() - session._fluxWordsAt < 1200);
 }
 
-const HELLO_WORDS = new Set(['hello', 'hi', 'hey', 'hiya', 'howdy', 'yo', 'hullo', 'hallo', 'good', 'morning', 'afternoon', 'evening', 'speaking']);
-const NOD_WORDS = new Set(['okay', 'ok', 'kay', 'yeah', 'yea', 'yah', 'yes', 'yep', 'yup', 'mhm', 'mmhmm', 'mmhm', 'uhhuh', 'huh', 'right', 'sure', 'alright', 'gotcha', 'cool']);
+/* Nov 14 2026 review: "good" is a hello only in "good morning" and the like (see greetingWordKind);
+ * a lone "Good!" is an answer to "how are you doing?". "Speaking." answers "is this Holly?". */
+const HELLO_WORDS = new Set(['hello', 'hi', 'hey', 'hiya', 'howdy', 'yo', 'hullo', 'hallo', 'morning', 'afternoon', 'evening']);
+const NOD_WORDS = new Set(['okay', 'ok', 'kay', 'yeah', 'yea', 'yah', 'yes', 'yep', 'yup', 'mhm', 'mmhmm', 'mmhm', 'uhhuh', 'huh', 'right', 'sure', 'alright', 'gotcha', 'cool', 'speaking']);
 const FILLER_WORDS = new Set(['uh', 'um', 'er', 'erm', 'ah', 'oh', 'hmm', 'hm', 'mm', 'well', 'so', 'and']);
 const WHO_PHRASE_RE = /^(?:who(?: is| s)?(?: this| it| that| calling| speaking)?(?: please)?|who are you|who is calling|what is this(?: about| regarding)?|what s this(?: about)?|how can i help(?: you)?|how may i help(?: you)?|can i help you|may i help you)$/;
+/* "Is anybody there?", "You there?", "Can you hear me?": checking that someone is on the line. Said
+ * over the greeting, the greeting itself answers it. */
+const PRESENCE_RE = /^(?:(?:hello|hi|hey|yes|yeah|uh|um|oh)\s+)*(?:(?:is|are)\s+)?(?:any ?body|any ?one|some ?body|some ?one|you)\s+(?:still\s+)?(?:there|on the line|on the phone)$|^(?:(?:hello|hi|hey|uh|um)\s+)*can (?:you|anybody|anyone) hear me$/;
 /**
  * What a short thing said over a greeting is.
  *   'hello' a hello, or a pickup phrase like "how can I help you" (never an answer)
@@ -1916,8 +1958,10 @@ const WHO_PHRASE_RE = /^(?:who(?: is| s)?(?: this| it| that| calling| speaking)?
 function greetingWordKind(text) {
   let t = String(text || '').toLowerCase()
     .replace(/\b(?:uh-huh|uh huh)\b/g, 'uhhuh').replace(/\bmm-?hmm\b/g, 'mmhmm').replace(/\ball right\b/g, 'alright')
-    .replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    .replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/\bgood (?:morning|afternoon|evening|day|night)\b/g, 'hello');
   if (!t) return 'hello';
+  if (PRESENCE_RE.test(t)) return 'hello';
   const lead = /^(?:(?:hello|hi|hey|yes|yeah|uh|um|oh|sorry|okay)\s+)+/;
   if (WHO_PHRASE_RE.test(t) || WHO_PHRASE_RE.test(t.replace(lead, ''))) {
     return /^(?:how|can|may)\b/.test(t.replace(lead, '')) ? 'hello' : 'who';
@@ -1936,14 +1980,18 @@ function greetingWordKind(text) {
   return 'hello'; // only "uh", "oh", "well": nothing to answer
 }
 
-/** Mark the greeting part that starts playing now (askFrac: where its question starts, 0..1). */
+/** Mark the greeting part that starts playing now (askFrac: where its question starts, 0..1).
+ *  askAt is on OUR clock, so it allows for the line (see the review notes above): a nod reaches us
+ *  about a second after the words it answers were sent. */
 function markGreetingPart(session, buf, askFrac, text) {
   const now = Date.now();
   const durMs = Math.round(((buf && buf.length) || 0) / 8); // mu-law 8 kHz: 8 bytes a millisecond
   const frac = typeof askFrac === 'number' && askFrac >= 0 && askFrac <= 1 ? askFrac : 0.5;
+  const questionMs = Math.round(durMs * frac);
+  const lagMs = questionMs >= ASK_PREAMBLE_MS ? envMs('KADE_OUTBOUND_ASK_LATENCY_MS', 1000) : 0;
   session._greetingPart = {
     audioAt: now,
-    askAt: now + Math.max(0, Math.round(durMs * frac) - GREETING_ASK_LEAD_MS),
+    askAt: now + Math.min(durMs, questionMs + lagMs),
     endAt: now + durMs,
     done: false,
     text: String(text || ''),
@@ -1962,7 +2010,9 @@ function endGreetingPart(session) {
  */
 function greetingWordsVerdict(session, text, began) {
   const part = session._greetingPart;
-  if (!session._greetingStarted || !part || began < part.audioAt) return 'pickup';
+  if (!session._greetingStarted || !part) return 'pickup';
+  // Begun before this part's sound could have reached them (the line, then Flux): their pickup.
+  if (began < part.audioAt + envMs('KADE_OUTBOUND_PICKUP_GRACE_MS', 700)) return 'pickup';
   if (part.done && began >= part.endAt) return 'hold'; // said after this part ended: a reply to it
   const kind = greetingWordKind(text);
   if (kind === 'hello') return 'drop';
@@ -1981,50 +2031,202 @@ function notePickupWords(session, text) {
   return true;
 }
 
-/* ── The quiet watch: nobody says anything after the greeting ── */
+/* ── Words held over the greeting wait for the rest of what they say (Nov 14 2026) ──
+ * releaseGreetingLock parks what was said over the greeting here when the person is still talking
+ * as it ends, or when all they said was a nod. Every HELD_TICK_MS it looks again:
+ *   - still talking (a turn with words, or one opened a moment ago): keep waiting, up to
+ *     KADE_OUTBOUND_HELD_WAIT_MS (4000) from when it was parked; their next words join it
+ *     (handleUtterance);
+ *   - a nod alone ("Okay.", "Uh-huh."): wait up to KADE_OUTBOUND_NOD_WAIT_MS (2500) for the real
+ *     answer, which joins it; alone only if nothing more comes;
+ *   - otherwise it goes now. A noise that opened a turn and closed with no words, or a turn with
+ *     no words for 1.5 s, is not someone talking (calleeMidTurn), so it no longer holds an answer
+ *     back for the whole 4 s. */
+function parkHeld(session, text, why) {
+  session._heldForNext = session._heldForNext ? `${session._heldForNext} ${text}` : text;
+  if (!session._heldSince) session._heldSince = Date.now();
+  session._heldNodOnly = greetingWordKind(session._heldForNext) === 'nod';
+  console.log(`[voice-stream] ${why}: their held words wait for the rest ${textReceipt(session._heldForNext)}`);
+  if (session._heldForNextTimer) clearTimeout(session._heldForNextTimer);
+  session._heldForNextTimer = setTimeout(() => releaseHeldTick(session), HELD_TICK_MS);
+}
+function clearHeld(session) {
+  session._heldForNext = null;
+  session._heldSince = null;
+  session._heldNodOnly = false;
+  if (session._heldForNextTimer) { clearTimeout(session._heldForNextTimer); session._heldForNextTimer = null; }
+}
+function releaseHeldTick(session) {
+  session._heldForNextTimer = null;
+  const held = session._heldForNext;
+  if (!held) return;
+  const waited = Date.now() - (session._heldSince || 0);
+  const stillWaiting = waited < envMs('KADE_OUTBOUND_HELD_WAIT_MS', 4000)
+    && (calleeMidTurn(session) || (session._heldNodOnly && waited < envMs('KADE_OUTBOUND_NOD_WAIT_MS', 2500)));
+  if (stillWaiting) {
+    session._heldForNextTimer = setTimeout(() => releaseHeldTick(session), HELD_TICK_MS);
+    return;
+  }
+  clearHeld(session);
+  if (session.busy) { session._pending = session._pending ? `${held} ${session._pending}` : held; return; }
+  session._heldRelease = true; // it has waited: run it as it is (handleUtterance reads and clears this)
+  handleUtterance(session, held);
+}
+
+/* ── The quiet watch: nobody says anything after the greeting ──
+ * Nov 14 2026 review: it must never hang up on a person. call-limits.js (the inbound watch) is kept
+ * off outbound calls for the same reason: a business putting the character on hold is quiet on
+ * purpose. So:
+ *   - they asked us to hold ("hold on", "one moment", "please hold"), at pickup or later: no
+ *     question, no goodbye; the call's own time limit (OUTBOUND_TIME_LIMIT_SEC) ends a hold that
+ *     never ends;
+ *   - anyone said anything at all, their pickup "Hello?" included: "Hello? Can you hear me?" once,
+ *     then the goodbye only after KADE_OUTBOUND_QUIET_SPOKE_END_MS (180000) more of nothing;
+ *   - nothing was ever heard on the line: the question after 8 s, the goodbye 12 s later.
+ * Its lines are made first and played only if nothing changed meanwhile (they spoke, a turn
+ * started). While one plays and for 3 s after, an answer that repeats its words ("I can hear you")
+ * is the person, not the line's echo: the same rule as the inbound call-limit lines (limitLineEcho).
+ * Anything heard during the goodbye, or in the moment after it, keeps the call up. */
 const QUIET_ASK_LINE = 'Hello? Can you hear me?';
 const QUIET_BYE_LINE = "I'm not hearing anyone, so I'll hang up now. Bye!";
+const HOLD_RE = /\b(?:hold on|hold please|please hold|hold for|hold the line|can you hold|could you hold|would you hold|hang on|one (?:sec|second|moment|minute)|just a (?:sec|second|moment|minute)|give me (?:a|one) (?:sec|second|moment|minute)|bear with me|be right (?:back|with you)|please wait|wait a (?:sec|second|moment|minute)|let me (?:check|see|get|grab|find|look|transfer))\b/i;
 function quietWatchOn() { return process.env.KADE_OUTBOUND_QUIET_WATCH !== '0'; }
+/** The character's goodbye has been said and the hang-up asked for (10 s at most, so a hang-up that
+ *  failed never leaves the call deaf). */
+function hangingUp(session) {
+  return !!(session && session._hangingUpAt && Date.now() - session._hangingUpAt < 10000);
+}
+/**
+ * Nov 14 2026 review: the call ended (they hung up, or the line dropped) while some of what they
+ * said was still waiting: an answer held over the greeting, held words waiting for the rest, or a
+ * finished thought in the stitch hold. It goes into the history as their last turn, so the call's
+ * transcript and the character's report have it ("No thanks, we closed down last week" said over the
+ * greeting by someone who then hung up). Outbound calls only; inbound is unchanged.
+ */
+function flushHeldWords(session) {
+  if (!session || session.outbound !== true || session._heldFlushed) return;
+  session._heldFlushed = true;
+  const parts = [];
+  for (const t of [session._heldForNext, session._pending]) if (t && String(t).trim()) parts.push(String(t).trim());
+  // A thought still in the stitch hold has not been through the echo test yet.
+  const carry = String(session._fluxCarry || '').trim();
+  if (carry && !utteranceIsEcho(session, carry, true)) parts.push(carry);
+  clearHeld(session);
+  session._pending = null;
+  session._fluxCarry = null;
+  // The stitch hold's timers would hand the same words over again into a call that has ended.
+  if (session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
+  if (session._fluxCapTimer) { clearTimeout(session._fluxCapTimer); session._fluxCapTimer = null; }
+  session._fluxDispatch = null;
+  if (!parts.length) return;
+  const text = parts.join(' ');
+  session.history.push({ role: 'user', content: text });
+  console.log(`[voice-stream] the call ended with their words still waiting; kept for the transcript: ${textReceipt(text)}`);
+}
 function disarmQuietWatch(session) {
   if (session && session._quietTimer) { clearTimeout(session._quietTimer); session._quietTimer = null; }
   if (session) session._quietWatch = null;
 }
+/** Has the person said anything (words or a finished sentence) after this moment? */
+function heardSince(session, at) {
+  return (session._lastCalleeWordsAt || 0) > at || (session._lastUtteranceAt || 0) > at;
+}
+/** Is anything happening that a quiet-watch line must not talk over? */
+function quietLineBlocked(session, watch, since) {
+  return session._quietWatch !== watch || !session.ws || session.ws.readyState !== WebSocket.OPEN
+    || session.voicemailMode || session.busy || session.isSpeaking || session._firstTurnRun
+    || session._greetingLock || session._confirmPhase || !!session._heldForNext || !!session._pending
+    || calleeMidTurn(session) || heardSince(session, since);
+}
+/** Make the line, then play it only if nothing changed while it was being made. */
+async function quietSay(session, watch, line, since) {
+  let buf;
+  try {
+    buf = await synthesize(line, session.voice, session.rate, session.media, session.pronunciationDictionary, { timing: session.faceTimings });
+  } catch (e) {
+    console.warn(`[voice-stream] outbound quiet watch: could not make its line: ${e.message}`);
+    return false;
+  }
+  if (!buf || !buf.length) return false;
+  if (quietLineBlocked(session, watch, since)) return false;
+  if (!session.busy && session.llmAbort) session.llmAbort = false; // a stale flag would mute the line
+  session.history.push({ role: 'assistant', content: line });
+  noteSpoken(session, line);
+  session._limitLine = line; // utteranceIsEcho: only a long stretch of this line is its echo
+  session._limitLineUntil = Infinity;
+  try {
+    await playBuffer(session, buf);
+  } finally {
+    session._limitLineUntil = Date.now() + 3000; // an answer usually comes just after the line ends
+  }
+  return true;
+}
 function armQuietWatch(session) {
   if (!session || !session.outbound || !quietWatchOn() || session.voicemailMode) return;
   disarmQuietWatch(session);
-  const watch = { armedAt: Date.now(), asked: false };
+  const watch = { armedAt: Date.now(), asked: false, saying: false };
   session._quietWatch = watch;
+  const again = (ms) => { if (session._quietWatch === watch) session._quietTimer = setTimeout(check, ms); };
   const check = async () => {
     session._quietTimer = null;
-    if (session._quietWatch !== watch) return;
+    if (session._quietWatch !== watch || watch.saying) return;
     const open = session.ws && session.ws.readyState === WebSocket.OPEN;
     if (!open || session.voicemailMode || session._firstTurnRun) { disarmQuietWatch(session); return; }
     // Something is happening: a turn, our own voice, a held answer, or they are talking.
-    if (session.busy || session.isSpeaking || session._greetingLock || session._confirmPhase || session._heldForNext || calleeMidTurn(session)) {
-      session._quietTimer = setTimeout(check, 1000);
+    if (session.busy || session.isSpeaking || session._greetingLock || session._confirmPhase || session._heldForNext || session._pending || calleeMidTurn(session)) {
+      again(1000);
       return;
     }
-    if ((session._lastCalleeWordsAt || 0) > watch.armedAt || (session._lastUtteranceAt || 0) > watch.armedAt) { disarmQuietWatch(session); return; }
+    if (heardSince(session, watch.armedAt)) { disarmQuietWatch(session); return; }
+    if (session._holdAskedAt) {
+      console.log(`[voice-stream] outbound quiet watch: they asked us to hold, so we wait quietly (the call's own time limit still applies) ${session.streamSid}`);
+      disarmQuietWatch(session);
+      return;
+    }
+    const heardAny = !!(session._lastUtteranceAt || session._lastCalleeWordsAt);
     if (!watch.asked) {
-      watch.asked = true;
       console.log(`[voice-stream] outbound quiet watch: nothing heard since the greeting, asking if they can hear ${session.streamSid}`);
-      session.history.push({ role: 'assistant', content: QUIET_ASK_LINE });
-      await speak(session, QUIET_ASK_LINE, session.voice);
-      if (session._quietWatch !== watch) return;
+      watch.saying = true;
+      const said = await quietSay(session, watch, QUIET_ASK_LINE, watch.armedAt);
+      watch.saying = false;
+      if (session._quietWatch !== watch) return; // they spoke: the watch is done
+      if (!said) { again(1000); return; }        // something changed while the line was made: look again
+      watch.asked = true;
       watch.armedAt = Date.now();
-      session._quietTimer = setTimeout(check, envMs('KADE_OUTBOUND_QUIET_END_MS', 12000));
+      // Someone was there at some point: give them minutes, not seconds.
+      again(heardAny ? envMs('KADE_OUTBOUND_QUIET_SPOKE_END_MS', 180000) : envMs('KADE_OUTBOUND_QUIET_END_MS', 12000));
       return;
     }
-    console.log(`[voice-stream] outbound quiet watch: still nothing heard, saying goodbye and hanging up ${session.streamSid}`);
+    console.log(`[voice-stream] outbound quiet watch: still nothing heard${heardAny ? ' (someone spoke earlier)' : ''}, saying goodbye ${session.streamSid}`);
+    const byeAt = Date.now();
+    watch.saying = true;
+    const said = await quietSay(session, watch, QUIET_BYE_LINE, watch.armedAt);
+    watch.saying = false;
+    if (session._quietWatch !== watch) { console.log(`[voice-stream] outbound quiet watch: they spoke during the goodbye, staying on the line ${session.streamSid}`); return; }
+    if (!said) { again(1000); return; }
+    const spokeDuringBye = () => heardSince(session, byeAt) || session.busy || session._firstTurnRun || !!session._pending || calleeMidTurn(session);
+    if (spokeDuringBye()) {
+      console.log(`[voice-stream] outbound quiet watch: they spoke during the goodbye, staying on the line ${session.streamSid}`);
+      disarmQuietWatch(session);
+      return;
+    }
     disarmQuietWatch(session);
-    session.history.push({ role: 'assistant', content: QUIET_BYE_LINE });
-    try {
-      const ctx = session.cfg && session.cfg.getOutboundCtx ? session.cfg.getOutboundCtx(session.callSid) : null;
-      if (ctx) ctx.quietHangUp = true; // the report says "nobody said anything", not "they talked"
-    } catch {}
-    await speak(session, QUIET_BYE_LINE, session.voice);
+    session._hangingUpAt = Date.now();
     const sid = session.callSid;
-    setTimeout(() => { try { if (session.cfg && session.cfg.endCall && sid) session.cfg.endCall(sid); } catch {} }, 1200);
+    setTimeout(() => {
+      if (spokeDuringBye()) {
+        session._hangingUpAt = null;
+        console.log(`[voice-stream] outbound quiet watch: they spoke just after the goodbye, staying on the line ${session.streamSid}`);
+        return;
+      }
+      try {
+        const ctx = session.cfg && session.cfg.getOutboundCtx ? session.cfg.getOutboundCtx(sid) : null;
+        // The report says what really happened: nothing at all was heard, or someone was there
+        // once and then the line stayed quiet (call-report.js outcomeLine).
+        if (ctx) { ctx.quietHangUp = true; ctx.quietAfterWords = heardAny; }
+      } catch {}
+      try { if (session.cfg && session.cfg.endCall && sid) session.cfg.endCall(sid); } catch {}
+    }, 1200);
   };
   session._quietTimer = setTimeout(check, envMs('KADE_OUTBOUND_QUIET_ASK_MS', 8000));
 }
@@ -2041,21 +2243,15 @@ function releaseGreetingLock(session) {
   if (session._pending) {
     const next = session._pending;
     session._pending = null;
-    if (outboundEnd && calleeMidTurn(session)) {
-      // Nov 14 2026: they answered over the end of the greeting and are still talking. Their held
-      // words wait for the rest, and the two are answered as one turn (or alone, if no more comes).
-      console.log(`[voice-stream] greeting over, callee still talking: their held words wait for the rest ${textReceipt(next)}`);
-      session._heldForNext = next;
-      if (session._heldForNextTimer) clearTimeout(session._heldForNextTimer);
-      session._heldForNextTimer = setTimeout(() => {
-        session._heldForNextTimer = null;
-        const held = session._heldForNext;
-        if (!held) return;
-        session._heldForNext = null;
-        if (session.busy) { session._pending = session._pending ? `${held} ${session._pending}` : held; return; }
-        handleUtterance(session, held);
-      }, envMs('KADE_OUTBOUND_HELD_WAIT_MS', 4000));
-      return;
+    if (outboundEnd) {
+      /* Nov 14 2026: they answered over the end of the greeting and are still talking, or all they
+       * said over it was a nod. Their held words wait for the rest and are answered as one turn
+       * (alone only if no more comes): parkHeld. */
+      const talking = calleeMidTurn(session);
+      if (talking || greetingWordKind(next) === 'nod') {
+        parkHeld(session, next, talking ? 'greeting over, callee still talking' : 'greeting over, only a nod was said over it');
+        return;
+      }
     }
     handleUtterance(session, next);
     return;
@@ -2433,6 +2629,9 @@ async function handleUtterance(session, text) {
   // replayed or queued text has none and counts as said now).
   const began = session._utteranceStartedAt || Date.now();
   session._utteranceStartedAt = null;
+  // Nov 14 2026 review: held words that already waited for the rest (releaseHeldTick) run as they are.
+  const heldRelease = session._heldRelease === true;
+  session._heldRelease = false;
   text = text.trim();
   if (!text || text.length < 2) return;
   // LIVE MODE GATE: while the Gemini Live session is on, IT owns the
@@ -2495,6 +2694,8 @@ async function handleUtterance(session, text) {
   if (!(session.busy && session.isSpeaking && !session.bargedIn)) noteCallerHeard(session, 'utterance');
   if (session._bargeRecoveryTimer) { clearTimeout(session._bargeRecoveryTimer); session._bargeRecoveryTimer = null; }
   if (session._quietWatch) disarmQuietWatch(session); // Nov 14 2026: someone is there
+  // Nov 14 2026 review: "hold on", "one moment", "please hold": the quiet watch must wait, not hang up.
+  if (session.outbound === true && HOLD_RE.test(text)) session._holdAskedAt = Date.now();
   const firstRound = firstRoundOn(session);
   if (session._greetingLock) {
     // Nov 14 2026 (outbound): pickup words and greeting-time hellos are never an answer.
@@ -2558,6 +2759,12 @@ async function handleUtterance(session, text) {
       console.log(`[voice-stream] said over the greeting (handed over after it), nothing to answer: ${textReceipt(text)}`);
       return;
     }
+    // Nov 14 2026 review: a nod alone said over the question waits for the real answer, the same as
+    // one held under the greeting lock (releaseGreetingLock).
+    if (!heldRelease && !session._firstTurnRun && !session.busy && greetingWordKind(text) === 'nod') {
+      parkHeld(session, text, 'a nod said over the greeting');
+      return;
+    }
   }
   if (session.busy) {
     if (session.isSpeaking && !session.bargedIn) {
@@ -2603,9 +2810,14 @@ async function handleUtterance(session, text) {
   }
   // Nov 14 2026 (outbound): an answer held over the end of the greeting joins what they said next.
   if (session._heldForNext) {
+    // Review: one more nod after a held nod ("Okay." ... "Uh-huh.") is still not the answer: it joins
+    // the held words and they keep waiting, within the same limit (releaseHeldTick).
+    if (firstRound && !heldRelease && !session._firstTurnRun && session._heldNodOnly && greetingWordKind(text) === 'nod') {
+      parkHeld(session, text, 'another nod');
+      return;
+    }
     text = `${session._heldForNext} ${text}`;
-    session._heldForNext = null;
-    if (session._heldForNextTimer) { clearTimeout(session._heldForNextTimer); session._heldForNextTimer = null; }
+    clearHeld(session);
   }
   if (session.outbound) session._firstTurnRun = true;
   console.log(`[voice-stream] utterance: ${textReceipt(text)}`);
@@ -2879,7 +3091,16 @@ async function handleUtterance(session, text) {
     if (session._pending) {
       const next = session._pending;
       session._pending = null;
-      handleUtterance(session, next);
+      if (hangingUp(session)) {
+        /* Nov 14 2026 review: "Okay, thanks, bye" said over the character's goodbye. The call is
+         * being ended (streamReply scheduled the hang-up), so another turn would only start the
+         * typing sound and be cut off. Their words go into the transcript instead. Only an outbound
+         * call ever sets _hangingUpAt. */
+        session.history.push({ role: 'user', content: next });
+        console.log(`[voice-stream] the call is ending, no new turn for words said over the goodbye: ${textReceipt(next)}`);
+      } else {
+        handleUtterance(session, next);
+      }
     }
   }
 }
@@ -3461,6 +3682,7 @@ async function streamReply(session, userText) {
     } else {
       console.log(`[voice-stream] agent requested hang-up for ${session.callSid}`);
       const sid = session.callSid;
+      session._hangingUpAt = Date.now(); // Nov 14 2026 review: words said over the goodbye start no new turn
       setTimeout(() => session.cfg.endCall(sid), 1500); // let the goodbye audio drain
     }
   }
@@ -5003,6 +5225,7 @@ function attachMediaStreams(server, users, cfg) {
           console.log(`[voice-stream] STOP ${session?.streamSid}`);
           streamOver = true;
           if (session) {
+            try { flushHeldWords(session); } catch (e) {} // Nov 14 2026 review: before the transcript is read
             try { logCallTranscript(session); } catch (e) {}
             try { postVoiceChatUsage(session); } catch (e) {}
             if (session.outbound && global._vsConfig.onCallEnd) {
@@ -5028,6 +5251,7 @@ function attachMediaStreams(server, users, cfg) {
     ws.on('close', () => {
       streamOver = true;
       if (session) {
+        try { flushHeldWords(session); } catch (e) {} // Nov 14 2026 review: before the transcript is read
         try { logCallTranscript(session); } catch (e) {}
         try { postVoiceChatUsage(session); } catch (e) {}
         if (session.outbound && global._vsConfig.onCallEnd) {
@@ -5752,4 +5976,6 @@ module.exports._test = {
   // Nov 14 2026: the outbound first exchange, the mission note, the quiet watch.
   greetingWordKind, greetingWordsVerdict, calleeMidTurn, calleeTalkingNow, buildOutboundSuffix, buildOutboundGreetingParts,
   releaseGreetingLock, shouldBargeIn, armQuietWatch, disarmQuietWatch, QUIET_ASK_LINE, QUIET_BYE_LINE,
+  // Nov 14 2026 review fixes.
+  markGreetingPart, parkHeld, flushHeldWords, hangingUp, HOLD_RE,
 };
