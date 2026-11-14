@@ -73,6 +73,13 @@ async function until(fn, ms, what) {
 const SID = (n) => 'CA' + String(n).padStart(32, '0');
 const HER = '+14175550142'; // a made-up registered number standing in for "her number"
 const SEC = 8000; // mu-law 8 kHz: one byte per sample
+// A greeting rendered from this byte tells its frames apart from the voice proxy's lines (0xff).
+const GREET_BYTE = 0x7e;
+function frameKind(buf) {
+  let greet = false;
+  for (const b of buf) { if (b === GREET_BYTE) greet = true; else if (b !== 0xff) return 'typing'; }
+  return greet ? 'greet' : 'voice';
+}
 const world = { said: [], asks: [], ended: [], callEnds: [], memoryFetches: 0, llmDelay: 400, reply: 'Thanks, that helps.', ttsSec: 1, ttsDelayFor: null };
 const ctxBySid = new Map();
 
@@ -154,9 +161,16 @@ async function outboundCall(n, over = {}) {
   ctxBySid.set(sid, ctx);
   const dgBefore = dg.conns.length;
   const ws = new RealWebSocket(`ws://127.0.0.1:${port}/ws/media`);
-  const call = { sid, ws, ctx, media: [], clears: 0 };
+  const call = { sid, ws, ctx, media: [], frames: [], clears: 0 };
   ws.on('message', (m) => {
-    try { const j = JSON.parse(m); if (j.event === 'media') call.media.push(Date.now()); if (j.event === 'clear') call.clears += 1; } catch {}
+    try {
+      const j = JSON.parse(m);
+      if (j.event === 'media') {
+        call.media.push(Date.now());
+        call.frames.push({ at: Date.now(), kind: frameKind(Buffer.from(j.media.payload, 'base64')) });
+      }
+      if (j.event === 'clear') call.clears += 1;
+    } catch {}
   });
   ws.on('error', () => {});
   await new Promise((r, rej) => { ws.on('open', r); ws.on('error', rej); });
@@ -169,8 +183,19 @@ async function outboundCall(n, over = {}) {
   call.turn = (event, transcript = '') => sock.send(JSON.stringify({ type: 'TurnInfo', event, transcript, words: [] }));
   /** They say something: the turn opens, words come, and Flux closes it endMs later. */
   call.say = async (text, endMs = 300) => { call.turn('StartOfTurn'); call.turn('Update', text); await sleep(endMs); call.turn('EndOfTurn', text); };
+  /** Words arriving one by one (an Update every gapMs), then Flux closes the turn eotMs after the last. */
+  call.words = async (text, { gapMs = 200, eotMs = 300, close = true } = {}) => {
+    const w = text.split(' ');
+    call.turn('StartOfTurn');
+    for (let i = 1; i <= w.length; i += 1) { await sleep(gapMs); call.turn('Update', w.slice(0, i).join(' ')); }
+    if (close) { await sleep(eotMs); call.turn('EndOfTurn', text); }
+  };
   call.at = (ms) => sleep(Math.max(0, ms - (Date.now() - call.t0)));
   call.hangUp = async () => { try { ws.send(JSON.stringify({ event: 'stop' })); } catch {} try { ws.close(); } catch {} await sleep(150); };
+  /** Frames of one kind sent after a moment (ms after pickup). */
+  call.framesAfter = (kind, fromMs) => call.frames.filter((f) => f.kind === kind && f.at - call.t0 > fromMs).length;
+  /** Turns THIS call ran (its own timing lines), so a late request from another call cannot be counted here. */
+  call.turnsRun = () => logs.filter((l) => l.includes(`[timing ${call.session.streamSid}] turn-start`)).length;
   return call;
 }
 
@@ -525,7 +550,8 @@ test('A FAMILY CALL to the same number keeps the caller line and memories (uncha
   const content = String([...messagesOf(asks0)].reverse().find((m) => m.role === 'user').content);
   assert.match(content, /\[The person on this call is Kade/);
   assert.equal(/STRANGER AT A BUSINESS/.test(content), false);
-  assert.match(content, /you have ALREADY greeted this person out loud —/, 'it is not told it gave an A I notice it never gave');
+  // Verification round: a family call is told exactly what it was told before this branch.
+  assert.ok(content.includes('you have ALREADY greeted this person out loud, confirmed who they are, introduced yourself as an AI, and given the recording notice —'), 'the old words, unchanged');
   await sleep(600);
   await c.hangUp();
 });
@@ -592,9 +618,14 @@ test('REVIEW D: a nod to "This call may be recorded." reaches us after the quest
   await c.hangUp();
 });
 
+/* Verification round: D2, D3 and J failed when the PC was busy with other test runs (808 pass, 3 fail).
+ * D2 now gives the nod a wait no busy PC outlasts, D3 measures from the bridge's own end-of-greeting
+ * stamp instead of when this test noticed it, and all three count only the turns their own call ran
+ * (a late request from an earlier call can no longer land in their count). */
+const userTurns = (c) => c.session.history.filter((m) => m.role === 'user').map((m) => m.content);
+
 test('REVIEW D2: a nod held over the question does not start a turn by itself; it waits and goes with the real answer', async () => {
-  setEnv();
-  const asks0 = world.asks.length;
+  setEnv({ KADE_OUTBOUND_NOD_WAIT_MS: '6000', KADE_OUTBOUND_HELD_WAIT_MS: '8000' });
   const c = await outboundCall(31, { greetingSec: 6 });
   await until(() => c.session._greetingStarted, 2000, 'greeting started');
   const part = c.session._greetingPart;
@@ -602,33 +633,34 @@ test('REVIEW D2: a nod held over the question does not start a turn by itself; i
   await c.say('Uh-huh.', 200); // a listening noise during the question: held
   await until(() => greetingDone(c), 6000, 'greeting over');
   await sleep(700);
-  assert.equal(world.asks.length, asks0, 'no turn on "Uh-huh." alone (no typing sound as she stops)');
+  assert.equal(c.turnsRun(), 0, 'no turn on "Uh-huh." alone (no typing sound as she stops)');
   await c.say('We have two for one on vapes.');
-  await until(() => world.asks.length > asks0, 5000, 'the answer');
+  await until(() => c.turnsRun() > 0, 5000, 'the answer');
   await sleep(800);
-  assert.deepEqual(asksSince(asks0), ['Uh-huh. We have two for one on vapes.'], 'one turn, the nod and the answer together');
+  assert.equal(c.turnsRun(), 1, 'one turn');
+  assert.deepEqual(userTurns(c), ['Uh-huh. We have two for one on vapes.'], 'the nod and the answer together');
   await c.hangUp();
 });
 
 test('REVIEW D3: a held nod with nothing after it is answered alone, once the short wait is over', async () => {
   setEnv({ KADE_OUTBOUND_NOD_WAIT_MS: '900' });
-  const asks0 = world.asks.length;
   const c = await outboundCall(32, { greetingSec: 6 });
   await until(() => c.session._greetingStarted, 2000, 'greeting started');
   await sleep(Math.max(0, c.session._greetingPart.askAt + 300 - Date.now()));
   await c.say('Yeah.', 200);
   await until(() => greetingDone(c), 6000, 'greeting over');
-  const over = Date.now();
-  await until(() => world.asks.length > asks0, 4000, 'the nod, alone');
-  assert.ok(world.asks[asks0].at - over >= 700, `it waited for more first (${world.asks[asks0].at - over} ms)`);
+  const over = c.session._greetingOverAt; // the bridge's own stamp, not when this test noticed
+  await until(() => c.turnsRun() > 0, 4000, 'the nod, alone');
+  const turnAt = c.session._turnT0;
+  assert.ok(turnAt - over >= 700, `it waited for more first (${turnAt - over} ms)`);
   await sleep(600);
-  assert.deepEqual(asksSince(asks0), ['Yeah.']);
+  assert.equal(c.turnsRun(), 1);
+  assert.deepEqual(userTurns(c), ['Yeah.']);
   await c.hangUp();
 });
 
 test('REVIEW J: "Is anybody there?" begun before our audio could reach them, or said over the greeting, is never a turn', async () => {
   setEnv();
-  const asks0 = world.asks.length;
   const logs0 = logs.length;
   const c = await outboundCall(33, { greetingSec: 4 });
   await c.at(250);
@@ -641,12 +673,13 @@ test('REVIEW J: "Is anybody there?" begun before our audio could reach them, or 
   await c.say('Hello? Anyone there?', 300); // over the greeting: the greeting itself answers it
   await until(() => greetingDone(c), 6000, 'greeting over');
   await sleep(400);
-  assert.equal(world.asks.length, asks0, 'neither became a turn');
+  assert.equal(c.turnsRun(), 0, 'neither became a turn');
   assert.ok(logs.slice(logs0).some((l) => /pickup words, not an answer/.test(l)));
   await c.say('Oh, sorry. No, no deals right now.');
-  await until(() => world.asks.length > asks0, 5000, 'answer');
+  await until(() => c.turnsRun() > 0, 5000, 'answer');
   await sleep(800);
-  assert.deepEqual(asksSince(asks0), ['Oh, sorry. No, no deals right now.']);
+  assert.equal(c.turnsRun(), 1);
+  assert.deepEqual(userTurns(c), ['Oh, sorry. No, no deals right now.']);
   await c.hangUp();
 });
 
@@ -800,6 +833,7 @@ test('REVIEW G: an answer said over the greeting by someone who then hangs up is
   assert.deepEqual(h2.filter((m) => m.role === 'user').map((m) => m.content), ['Not interested.']);
 });
 
+// Verification round: family calls run the old first exchange again (VERIFY 5), which answers both too.
 test('REVIEW H: "Good!" over a check-in greeting is an answer, and "Speaking." over "is this Holly?" is a yes', async () => {
   setEnv();
   const asks0 = world.asks.length;
@@ -859,7 +893,7 @@ test('REVIEW I: an answer held over the greeting does not wait 4 s behind a nois
 
 test('flushHeldWords: what was still waiting at hang-up becomes their last turn; inbound calls are untouched', async () => {
   let lateDispatch = 0;
-  const s = { outbound: true, history: [{ role: 'assistant', content: 'Hi.' }], _heldForNext: 'No thanks,', _pending: 'we closed.', _fluxCarry: 'Bye.', _spokenWindow: [] };
+  const s = { outbound: true, _strangerGreeting: true, history: [{ role: 'assistant', content: 'Hi.' }], _heldForNext: 'No thanks,', _pending: 'we closed.', _fluxCarry: 'Bye.', _spokenWindow: [] };
   s._fluxGraceTimer = setTimeout(() => { lateDispatch += 1; }, 50); // the stitch hold would hand "Bye." over again
   s._fluxDispatch = () => { lateDispatch += 1; };
   T.flushHeldWords(s);
@@ -875,12 +909,290 @@ test('flushHeldWords: what was still waiting at hang-up becomes their last turn;
   assert.equal(inbound.history.length, 0);
 });
 
+test('VERIFY 11: the hang-up flush is part of the new first exchange: not on a family call, and not with KADE_OUTBOUND_FIRST_ROUND=0', () => {
+  const family = { outbound: true, _strangerGreeting: false, history: [], _pending: 'See you Sunday.', _spokenWindow: [] };
+  T.flushHeldWords(family);
+  assert.equal(family.history.length, 0, 'a family call keeps the old hang-up (before: flushed)');
+  setEnv({ KADE_OUTBOUND_FIRST_ROUND: '0' });
+  try {
+    const business = { outbound: true, _strangerGreeting: true, history: [], _pending: 'We closed.', _spokenWindow: [] };
+    T.flushHeldWords(business);
+    assert.equal(business.history.length, 0, 'the switch gives the old path exactly (before: flushed)');
+  } finally { setEnv({ KADE_OUTBOUND_FIRST_ROUND: undefined }); }
+});
+
 test('greetingWordKind sorts what people say over a greeting', () => {
   const k = T.greetingWordKind;
-  for (const t of ['Hello?', 'hello hello', 'Hi.', 'Good morning', 'Good afternoon!', 'How can I help you?', 'um', 'Is anybody there?', 'Hello, anyone there?', 'You there?', 'Hello? Can you hear me?']) assert.equal(k(t), 'hello', t);
+  for (const t of ['Hello?', 'hello hello', 'Hi.', 'Good morning', 'Good afternoon!', 'How can I help you?', 'Is anybody there?', 'Hello, anyone there?', 'You there?', 'Hello? Can you hear me?']) assert.equal(k(t), 'hello', t);
   for (const t of ['Who is this?', "Who's calling?", 'Hi, who is this?', 'What is this about?']) assert.equal(k(t), 'who', t);
-  for (const t of ['Yeah.', 'Okay', 'Uh-huh', 'mm-hmm', 'Sure.', 'all right', 'Yes?', 'Speaking.']) assert.equal(k(t), 'nod', t);
-  for (const t of ['No.', 'Shell, this is Mike.', 'We closed down last week.', 'Yeah, we do.', 'Good!', 'Good, good.', 'Pretty good.']) assert.equal(k(t), 'words', t);
+  for (const t of ['Yeah.', 'Okay', 'Uh-huh', 'mm-hmm', 'Sure.', 'all right', 'Yes?', 'Speaking.', 'It is.', 'Yes, this is.']) assert.equal(k(t), 'nod', t);
+  for (const t of ['No.', 'Nope.', 'Nine.', 'Shell, this is Mike.', 'We closed down last week.', 'Yeah, we do.', 'Good!', 'Good, good.', 'Pretty good.', 'Hey, you.']) assert.equal(k(t), 'words', t);
+  // Verification round: nothing to answer (only fillers, or stray words line noise turns into).
+  for (const t of ['um', 'Mm.', 'You.', 'The.', 'Mm. You.', 'Mm. You. The.', 'Uh, the.']) assert.equal(k(t), 'noise', t);
   for (const t of ['Shell, can you hold on one second?', 'One moment please.', 'Please hold.', 'Hang on, let me get the manager.']) assert.ok(T.HOLD_RE.test(t), t);
   for (const t of ['We closed down last week.', 'Hello?', 'Who is this?']) assert.equal(T.HOLD_RE.test(t), false, t);
+});
+
+/* ── Verification round, Nov 14 2026 (an independent review of the branch with its own simulated calls).
+ * Each test below failed on the branch head f2b5c48. ── */
+
+const PART1 = "Hi, this is Kiana, an A I assistant calling on behalf of a customer, Kade Murdock. Is this Tony's Pizza?";
+const PART2 = "Thanks! This call may be recorded. I'm calling to ask whether you are open on Sunday.";
+const VM_RE = /Sorry I missed you/;
+
+test('VERIFY 1a: voicemail found while the machine is still talking, before the greeting started: no greeting plays over the message', async () => {
+  setEnv({ KADE_OUTBOUND_GREETING_MAX_WAIT_MS: '5000' }); // the live cap
+  world.ttsSec = 3;
+  world.ttsDelayFor = (input) => (VM_RE.test(input) ? 800 : 0); // the voice takes a moment to make the message
+  try {
+    const c = await outboundCall(60, { greetingSec: 3, ctx: { greetingBuf: Buffer.alloc(3 * SEC, GREET_BYTE) } });
+    await c.at(300);
+    await c.words("Hi, it's Mike, leave a message.", { gapMs: 200, close: false }); // a machine: Flux keeps the turn open
+    await c.at(1800);
+    const amdAt = Date.now() - c.t0;
+    vs.handleAmdResult(c.sid, 'machine'); // Twilio: machine_end_beep (not awaited: it waits for the whole message)
+    await c.at(3100); // Flux closes the machine's turn after the message has started
+    c.turn('EndOfTurn', "Hi, it's Mike, leave a message.");
+    await sleep(3000);
+    assert.equal(c.framesAfter('greet', amdAt + 100), 0, 'no greeting audio once voicemail was found (before: it started over the message)');
+    assert.ok(c.framesAfter('voice', amdAt) > 0, 'the voicemail message itself played');
+    await c.hangUp();
+  } finally { world.ttsSec = 1; world.ttsDelayFor = null; }
+});
+
+test('VERIFY 1b: a two-part greeting answered by a machine: part 2 never plays into the voicemail', async () => {
+  setEnv();
+  world.ttsSec = 3;
+  world.ttsDelayFor = (input) => (VM_RE.test(input) ? 800 : 0);
+  try {
+    const c = await outboundCall(61, { greetingSec: 2, ctx: {
+      calleeName: "Tony's Pizza", greeting: PART1, greetingAskAt: PART1.indexOf('Is this') / PART1.length,
+      greetingBuf: Buffer.alloc(2 * SEC, GREET_BYTE),
+      greeting2: PART2, greeting2Buf: Buffer.alloc(2 * SEC, GREET_BYTE), greeting2AskAt: PART2.indexOf("I'm calling") / PART2.length,
+    } });
+    await c.at(300);
+    await c.words("Hi, you've reached Tony's Pizza, please leave a message.", { gapMs: 150, eotMs: 300 }); // part 1 starts on it
+    await until(() => c.framesAfter('greet', 0) > 0, 3000, 'part 1 started');
+    await sleep(800);
+    const amdAt = Date.now() - c.t0;
+    vs.handleAmdResult(c.sid, 'machine');
+    await sleep(7600); // past the 6 s wait after part 1, which used to play part 2 anyway
+    assert.equal(c.framesAfter('greet', amdAt + 700), 0, 'no greeting part after voicemail was found (before: part 2 played 6 s later)');
+    assert.equal(c.session.history.some((m) => m.content === PART2), false, 'part 2 never went into the history');
+    await c.hangUp();
+  } finally { world.ttsSec = 1; world.ttsDelayFor = null; }
+});
+
+const NONSTOP = 'hello yeah this is Mike at the Shell on Main sorry I am with a customer right now what is this about we have gas and snacks and some CBD stuff and the vapes are on sale this week';
+
+test('VERIFY 2a: someone who talks from pickup through the whole greeting gets an answer when they stop (before: filed as pickup words, and silence)', async () => {
+  setEnv({ KADE_OUTBOUND_QUIET_ASK_MS: '1500', KADE_OUTBOUND_QUIET_END_MS: '60000' });
+  const asks0 = world.asks.length;
+  const c = await outboundCall(62, { greetingSec: 3 });
+  await c.at(300);
+  await c.words(NONSTOP, { gapMs: 220, eotMs: 300 }); // one Flux turn, about 7 s, past the cap and the 3 s greeting
+  await until(() => asksSince(asks0).includes(NONSTOP), 4000, 'their words are answered');
+  assert.ok(c.session._greetingStartedAt && greetingDone(c), 'the greeting played (it started at the cap)');
+  assert.equal(c.turnsRun(), 1);
+  await sleep(500);
+  await c.hangUp();
+});
+
+test('VERIFY 2b: someone who starts talking as the greeting starts and keeps going past its end gets an answer', async () => {
+  setEnv({ KADE_OUTBOUND_QUIET_ASK_MS: '1500', KADE_OUTBOUND_QUIET_END_MS: '60000' });
+  const asks0 = world.asks.length;
+  const c = await outboundCall(63, { greetingSec: 3 });
+  await until(() => c.session._greetingStarted, 2000, 'greeting started');
+  await sleep(Math.max(0, c.session._greetingPart.audioAt + 300 - Date.now())); // inside the 0.7 s pickup window
+  const talk = 'yeah hi sorry we are super busy today we have a line out the door what do you need I can maybe help you real quick';
+  await c.words(talk, { gapMs: 220, eotMs: 300 });
+  await until(() => asksSince(asks0).includes(talk), 4000, 'their words are answered');
+  await sleep(500);
+  await c.hangUp();
+});
+
+test('VERIFY 3a: a "Hello?" begun in the last second of the greeting, handed over after it, is a turn (they did not hear it)', async () => {
+  setEnv();
+  const asks0 = world.asks.length;
+  const c = await outboundCall(64, { greetingSec: 4 });
+  await until(() => c.session._greetingStarted, 2000, 'greeting started');
+  await sleep(Math.max(0, c.session._greetingPart.endAt - 700 - Date.now()));
+  c.turn('StartOfTurn');
+  c.turn('Update', 'Hello?');
+  await until(() => greetingDone(c), 4000, 'greeting over');
+  await sleep(250);
+  c.turn('EndOfTurn', 'Hello?'); // Flux closes it after the greeting; the 0.9 s hold follows
+  await until(() => asksSince(asks0).includes('Hello?'), 4000, 'answered (before: dropped, and the call went silent)');
+  await sleep(500);
+  await c.hangUp();
+});
+
+test('VERIFY 3b: a hello dropped as said over the greeting, but handed over after it, still leaves the quiet watch on', async () => {
+  setEnv({ KADE_OUTBOUND_QUIET_ASK_MS: '1200', KADE_OUTBOUND_QUIET_END_MS: '60000', KADE_OUTBOUND_QUIET_SPOKE_END_MS: '60000' });
+  const said0 = world.said.length;
+  const logs0 = logs.length;
+  const c = await outboundCall(65, { greetingSec: 4 });
+  await until(() => c.session._greetingStarted, 2000, 'greeting started');
+  await sleep(Math.max(0, c.session._greetingPart.audioAt + 1200 - Date.now())); // mid-greeting: not their pickup, not the end
+  c.turn('StartOfTurn');
+  c.turn('Update', 'Hello?');
+  await until(() => greetingDone(c), 5000, 'greeting over');
+  await sleep(200);
+  c.turn('EndOfTurn', 'Hello?');
+  await until(() => logs.slice(logs0).some((l) => /said over the greeting \(handed over after it\)/.test(l)), 3000, 'dropped');
+  await until(() => world.said.slice(said0).includes(T.QUIET_ASK_LINE), 4000, 'the check line still comes (before: never)');
+  await c.hangUp();
+});
+
+test('VERIFY 4: a business pickup that Flux splits in two ("Thank you for calling Shell on Main." / "This is Mike, how can I help you?") is never a turn', async () => {
+  setEnv();
+  for (const [n, gap] of [[66, 800], [67, 1500]]) {
+    const asks0 = world.asks.length;
+    const c = await outboundCall(n, { greetingSec: 4 });
+    await c.at(200);
+    await c.words('Thank you for calling Shell on Main.', { gapMs: 120, eotMs: 250 });
+    await until(() => c.session._greetingStarted, 2000, 'the greeting starts on the first part');
+    await sleep(gap); // a natural pause, then Flux opens the second part
+    await c.words('This is Mike, how can I help you?', { gapMs: 120, eotMs: 250 });
+    await until(() => greetingDone(c), 6000, 'greeting over');
+    await sleep(700);
+    assert.equal(c.turnsRun(), 0, `gap ${gap} ms: no turn as the greeting ends (before: "This is Mike, how can I help you?" was answered)`);
+    await c.say("Uh, no, we don't do deals on that.");
+    await until(() => world.asks.length > asks0, 5000, 'the answer');
+    await sleep(600);
+    assert.deepEqual(asksSince(asks0), ["Uh, no, we don't do deals on that."], `gap ${gap} ms`);
+    const kept = c.session.history.filter((m) => m.role === 'user').map((m) => m.content);
+    assert.ok(kept.includes('This is Mike, how can I help you?'), 'the second part is kept as what they said first');
+    await c.hangUp();
+  }
+});
+
+test('VERIFY 4 guard: a phone menu after the pickup line still reaches the model after the greeting, once', async () => {
+  setEnv();
+  const asks0 = world.asks.length;
+  const c = await outboundCall(68, { greetingSec: 6 });
+  await c.at(200);
+  await c.words('Thank you for calling Shell on Main.', { gapMs: 120, eotMs: 250 });
+  await sleep(900);
+  await c.words('For store hours, press 1.', { gapMs: 120, eotMs: 250 });
+  await sleep(900);
+  await c.words('For the manager, press 2.', { gapMs: 120, eotMs: 250 });
+  await until(() => greetingDone(c), 6000, 'greeting over');
+  await until(() => world.asks.length > asks0, 6000, 'a turn for the menu');
+  await sleep(1500);
+  const users = asksSince(asks0);
+  assert.equal(users.length, 1, 'one turn');
+  assert.match(users[0], /press 1\. For the manager, press 2\.$/, 'the menu options reach the model, once each');
+  await c.hangUp();
+});
+
+const FAMILY_GREETING = "Hi! It's Kiana! I'm calling to ask if you're coming Sunday.";
+const OLD_CLAIM = 'you have ALREADY greeted this person out loud, confirmed who they are, introduced yourself as an AI, and given the recording notice —';
+const OLD_HELLO_LINE = 'If they just said "hello" and you were not given a name, you may briefly confirm you reached the right place. ';
+
+test('VERIFY 5a: a family call runs the old first exchange: the 0.9 s hold before the greeting, the hello held and answered after it, the old prompt lines', async () => {
+  setEnv();
+  const asks0 = world.asks.length;
+  const logs0 = logs.length;
+  const c = await outboundCall(69, { greetingSec: 2, ctx: { business: false, tier: 'own', disclosed: false, greeting: FAMILY_GREETING, greetingAskAt: 0.3 } });
+  await c.at(200);
+  await c.say('Hello?', 200); // closed at about 0.4 s
+  await until(() => c.session._greetingStarted, 3000, 'greeting started');
+  const startedAfter = c.session._greetingStartedAt - c.t0;
+  assert.ok(startedAfter >= 900, `the start timer, as before (+${startedAfter} ms; head started it at once on the hello)`);
+  await until(() => world.asks.length > asks0, 6000, 'the held hello is answered after the greeting, as before');
+  assert.equal(lastUser(asks0), 'Hello?');
+  assert.ok(logs.slice(logs0).some((l) => /holding utterance during greeting/.test(l)), 'held the old way');
+  const content = String([...messagesOf(asks0)].reverse().find((m) => m.role === 'user').content);
+  assert.ok(content.includes(OLD_CLAIM), 'the claim it was told before');
+  assert.ok(content.includes(OLD_HELLO_LINE), 'the hello line it was told before');
+  assert.equal(content.includes('Your greeting already asked your question'), false);
+  await sleep(600);
+  await c.hangUp();
+});
+
+test('VERIFY 5b: a wellness check-in where nobody speaks: no "Can you hear me?" and no hang-up, as before (registered or not)', async () => {
+  setEnv({ KADE_OUTBOUND_QUIET_ASK_MS: '400', KADE_OUTBOUND_QUIET_END_MS: '300' });
+  const said0 = world.said.length;
+  const wellness = { scheduleId: 'w1', notifyUserId: '6a3cba4d0b0afa92194e42f7', targetName: 'Holly', topics: null };
+  const checkin = "Hi! It's Kiana — Kade's A I. I'm calling to check in and see how you're doing — kade set up these companion calls for you.";
+  const family = await outboundCall(70, { greetingSec: 1, ctx: { business: false, tier: 'family', disclosed: false, greeting: checkin, greetingAskAt: 0.3, wellness } });
+  // A check-in to a number nobody registered plays the stranger greeting, and is still a check-in.
+  const unregistered = await outboundCall(71, { greetingSec: 1, ctx: { business: false, tier: 'stranger', disclosed: true, wellness } });
+  await until(() => greetingDone(family) && greetingDone(unregistered), 4000, 'greetings over');
+  await sleep(2200);
+  assert.equal(world.said.slice(said0).includes(T.QUIET_ASK_LINE), false, 'no check line (before: "Hello? Can you hear me?")');
+  assert.equal(world.said.slice(said0).includes(T.QUIET_BYE_LINE), false);
+  assert.equal(world.ended.includes(family.sid) || world.ended.includes(unregistered.sid), false, 'never hung up on (before: hung up)');
+  assert.equal(family.ctx.quietHangUp, undefined);
+  await family.hangUp();
+  await unregistered.hangUp();
+});
+
+test('VERIFY 5c: a family call keeps the old goodbye and hang-up rules (words over its goodbye are not held back for the transcript)', async () => {
+  setEnv();
+  world.reply = 'See you Sunday! [END CALL]';
+  try {
+    const asks0 = world.asks.length;
+    const c = await outboundCall(72, { greetingSec: 1, ctx: { business: false, tier: 'own', disclosed: false, greeting: FAMILY_GREETING, greetingAskAt: 0.3 } });
+    await until(() => greetingDone(c), 4000, 'greeting over');
+    await sleep(200);
+    await c.say('Yes, I am coming.');
+    await until(() => world.asks.length > asks0, 4000, 'turn');
+    await until(() => world.ended.includes(c.sid), 6000, 'the goodbye hung up, as before');
+    assert.equal(c.session._hangingUpAt == null, true, 'the business-call goodbye rule is not on a family call');
+    await c.hangUp();
+  } finally { world.reply = 'Thanks, that helps.'; }
+});
+
+test('VERIFY 6: one thought handed over once when its second part ends 1.6 to 2.5 s after the first (before: twice, the first request thrown away)', async () => {
+  setEnv();
+  world.llmDelay = 1500;
+  try {
+    const asks0 = world.asks.length;
+    const logs0 = logs.length;
+    const c = await outboundCall(73, { greetingSec: 1 });
+    await until(() => greetingDone(c), 4000, 'greeting over');
+    await sleep(600);
+    await c.say('No.', 250);              // EndOfTurn 1: the 2.5 s cap timer and the 0.9 s hold start
+    await sleep(500);
+    await c.say('We closed down.', 1150); // EndOfTurn 2 about 1.65 s later: hold due at +2.55 s, cap at +2.5 s
+    await sleep(4500);
+    assert.deepEqual(asksSince(asks0), ['No. We closed down.'], 'one model request');
+    const seen = messagesOf(world.asks.length - 1).filter((m) => m.role === 'user').map((m) => String(m.content).split('\n\n[')[0].split('\n[')[0]);
+    assert.equal(seen.filter((t) => t === 'No. We closed down.').length, 1, 'their words once');
+    assert.equal(logs.slice(logs0).some((l) => /aborting mid-gen/.test(l)), false, 'no request thrown away');
+    await c.hangUp();
+  } finally { world.llmDelay = 400; }
+});
+
+test('VERIFY 7: line noise that opens wordless turns does not hold the greeting past the start timer', async () => {
+  setEnv();
+  const c = await outboundCall(74, { greetingSec: 1 });
+  for (const t of [400, 1300, 2200]) { await c.at(t); c.turn('StartOfTurn'); } // no words, never closed
+  await until(() => c.session._greetingStarted, 4000, 'greeting started');
+  const at = c.session._greetingStartedAt - c.t0;
+  assert.ok(at < 1500, `the greeting starts at the 1 s timer (+${at} ms; before: at the 2.5 s cap)`);
+  await c.hangUp();
+});
+
+test('VERIFY 8: stray words that line noise turns into ("Mm.", "You.", "The.") over the greeting start no turn', async () => {
+  setEnv();
+  const c = await outboundCall(75, { greetingSec: 5 });
+  await until(() => c.session._greetingStarted, 2000, 'greeting started');
+  const a0 = c.session._greetingPart.audioAt;
+  await sleep(Math.max(0, a0 + 1200 - Date.now()));
+  await c.say('Mm.', 200);
+  await sleep(600);
+  await c.say('You.', 200);
+  await sleep(600);
+  c.turn('StartOfTurn');
+  await sleep(300);
+  c.turn('EndOfTurn', '');
+  await sleep(500);
+  await c.say('The.', 200);
+  await until(() => greetingDone(c), 6000, 'greeting over');
+  await sleep(1500);
+  assert.equal(c.turnsRun(), 0, 'no turn on noise (before: a turn on "Mm. You. Mm. You. The.")');
+  await c.hangUp();
 });

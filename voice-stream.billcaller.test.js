@@ -81,6 +81,9 @@ test('phone: an inbound call is billed to the caller; an outbound call never is 
         }
       },
       buildOutboundSuffix: () => '',
+      // Nov 14 2026 verification round: the start block also asks which first exchange the call runs.
+      strangerGreetingCall: () => false,
+      firstRoundOn: () => false,
       settleRate() {},
       global: { _vsConfig: { getOutboundCtx: () => outboundCtx } },
       streamSid: 's',
