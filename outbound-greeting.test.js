@@ -66,10 +66,14 @@ test('FAMILY GREETINGS ARE WORD FOR WORD what they were (own character, family, 
   assert.equal(herTest.greeting, `Hi! It's Kiana! ${g.framePurpose(HEMP)}`);
 });
 
-test('who gets the business rules: errands and business:true always, an unregistered number unless the chat said business:false', () => {
+test('who gets the business rules: errands and business:true always; an unregistered number from a chat unless it said business:false', () => {
   const pick = (o) => g.composeOutboundGreeting({ ...base, ...o });
-  assert.deepEqual([pick({ calleeRec: null }).tier, pick({ calleeRec: null }).business], ['stranger', true]);
-  assert.deepEqual([pick({ calleeRec: null, business: false }).tier, pick({ calleeRec: null, business: false }).business], ['stranger', false]);
+  const chat = { unregisteredIsBusiness: true };
+  assert.deepEqual([pick({ ...chat, calleeRec: null }).tier, pick({ ...chat, calleeRec: null }).business], ['stranger', true]);
+  assert.deepEqual([pick({ ...chat, calleeRec: null, business: false }).tier, pick({ ...chat, calleeRec: null, business: false }).business], ['stranger', false]);
+  // The bridge's briefings and the website's nudge calls ring the person themselves: an unregistered
+  // number keeps the stranger greeting and the ordinary rules, as before.
+  assert.deepEqual([pick({ calleeRec: null }).tier, pick({ calleeRec: null }).business], ['stranger', false]);
   assert.deepEqual([pick({ calleeRec: HER_ROW, disclose: true }).tier, pick({ calleeRec: HER_ROW, disclose: true }).business], ['stranger', true]);
   assert.deepEqual([pick({ calleeRec: HER_ROW, business: false }).tier, pick({ calleeRec: HER_ROW, business: false }).business], ['own', false]);
   assert.deepEqual([pick({ calleeRec: HER_ROW }).tier, pick({ calleeRec: HER_ROW }).business], ['own', false]);

@@ -176,7 +176,7 @@ test('server.js wiring: the report rides /outbound-call, fires on Twilio\'s fina
   assert.match(result, /reportedToChat: told === 'posting' \|\| told === 'posted'/);
   assert.match(result, /reportedToChat: done\.reportState === 'posting' \|\| done\.reportState === 'posted'/);
   // The greeting: one composer, with the chat's business flag and the errands' disclose.
-  assert.match(src, /outboundGreeting\.composeOutboundGreeting\(\{[\s\S]{0,400}disclose: disclose === true,\s*business: businessFlag,/);
+  assert.match(src, /outboundGreeting\.composeOutboundGreeting\(\{[\s\S]{0,400}disclose: disclose === true,\s*business: businessFlag,\s*unregisteredIsBusiness: unregisteredIsBusiness === true,/);
   assert.match(src, /business: composed\.business,/);
   assert.match(src, /api\/kade\/soul\/speak/);
 });

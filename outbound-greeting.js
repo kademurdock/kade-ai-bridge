@@ -27,9 +27,12 @@
  *     design, July 12 2026): own character "Hi! It's Kiana! ...", other family "Hi! It's Kiana —
  *     Kade's A I. ...", and "Hi — is this Holly?" first when a name was given.
  *   - business (the stricter rules: stranger, no voice steering, no personal details, end the
- *     call once answered) is on for disclose/business:true and, by default, for every number not
- *     in the registry. business:false keeps a stranger greeting with the ordinary rules (a person
- *     who simply is not registered).
+ *     call once answered) is on for disclose/business:true. For a number not in the registry it
+ *     is also on when the caller says unregistered numbers are businesses (the chat's phone tool
+ *     does: a call a person asks for from a chat, to a number nobody registered, is a store or a
+ *     stranger unless the character said business:false). The bridge's own scheduled calls
+ *     (briefings) and the website's nudge calls ring the person themselves, so they keep the
+ *     ordinary rules on an unregistered number, as before.
  *
  * askAt / ask2At: how far into each spoken part the question starts (0..1 of its characters).
  * voice-stream.js uses it to tell a "yeah" said while the question was being asked (an answer)
@@ -153,6 +156,8 @@ const RECORDING_NOTICE = 'This call may be recorded.';
  * @param {string} o.agentId          the calling character's id
  * @param {boolean} [o.disclose]      errands: always the stranger greeting
  * @param {boolean} [o.business]      the chat tool: true = a business or a stranger; false = a person
+ * @param {boolean} [o.unregisteredIsBusiness]  the chat tool: a number not in the registry is a
+ *                                    business or a stranger unless business:false
  */
 function composeOutboundGreeting(o) {
   const agentName = String(o.agentName || 'Kiana');
@@ -162,7 +167,7 @@ function composeOutboundGreeting(o) {
   const forced = o.disclose === true || o.business === true;
   const ownAgent = !forced && !!(rec && o.agentId && rec.agentId === o.agentId);
   const tier = forced || !rec ? 'stranger' : ownAgent ? 'own' : 'family';
-  const business = forced || (!rec && o.business !== false);
+  const business = forced || (!rec && o.unregisteredIsBusiness === true && o.business !== false);
 
   if (tier !== 'stranger') {
     // Word for word what family heard before (server.js, July 12 2026).

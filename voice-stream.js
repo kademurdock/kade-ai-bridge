@@ -1965,8 +1965,9 @@ function greetingWordsVerdict(session, text, began) {
   const kind = greetingWordKind(text);
   if (kind === 'hello') return 'drop';
   if ((kind === 'nod' || kind === 'who') && began < part.askAt) return 'drop';
-  // Their speakerphone giving the greeting back: most of it the greeting's own words.
-  if (kind === 'words' && normalizeWords(text).length >= 4 && part.text && looksLikeEcho(text, part.text, 0.6)) return 'drop';
+  /* No word-overlap echo test here on purpose: a real answer said over the question repeats its
+   * words ("Yes, I'm coming Sunday" to "...if you're coming Sunday?") and would be thrown away.
+   * A phone line cancels its own echo; the app surface, where echo bit before, never calls out. */
   return 'hold';
 }
 

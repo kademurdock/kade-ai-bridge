@@ -313,6 +313,21 @@ test('TALKING OVER THE END OF THE GREETING: an answer finished during the questi
   await c.hangUp();
 });
 
+test('AN ANSWER THAT REPEATS THE QUESTION\'S WORDS, said over the question, is answered, not taken for an echo', async () => {
+  setEnv();
+  const asks0 = world.asks.length;
+  const c = await outboundCall(20, { greetingSec: 5 });
+  await until(() => c.session._greetingStarted, 2000, 'greeting started');
+  const g0 = c.session._greetingPart.audioAt;
+  await sleep(Math.max(0, g0 + 3000 - Date.now()));
+  await c.say('Deals on hemp products right now? No.', 300);
+  await until(() => greetingDone(c), 6000, 'greeting over');
+  await until(() => world.asks.length > asks0, 3000, 'answered');
+  await sleep(800);
+  assert.deepEqual(asksSince(asks0), ['Deals on hemp products right now? No.']);
+  await c.hangUp();
+});
+
 test('STILL TALKING WHEN THE GREETING ENDS: what they said over it waits for the rest, and both are answered as one turn', async () => {
   setEnv();
   const asks0 = world.asks.length;

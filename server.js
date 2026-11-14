@@ -2260,7 +2260,8 @@ app.post('/voice-ws', (req, res) => {
 //   OUTBOUND_DEST_COOLDOWN_MIN=10   same destination can't be redialed sooner
 //   OUTBOUND_RECORD=1               dual-channel recording (0 = off)
 // US/Canada 10-digit numbers only; premium (900/976) and our own number blocked.
-// The scripted greeting always discloses: AI + on whose behalf + may be recorded.
+// Strangers and businesses hear the disclosure first: an A I assistant, for whom, may be
+// recorded. Registered family hear a friend's greeting (outbound-greeting.js, Nov 14 2026).
 
 const ENABLE_OUTBOUND = !!process.env.ENABLE_OUTBOUND;
 const OUTBOUND_TIME_LIMIT_SEC     = parseInt(process.env.OUTBOUND_TIME_LIMIT_SEC || '900', 10);
@@ -2499,9 +2500,11 @@ function normalizeUsPhone(raw) {
 // Body: { to, secret, userId, userName, purpose, calleeName?, agentId?, agentName?, voice? }
 app.post('/outbound-call', async (req, res) => {
   if (!ENABLE_OUTBOUND) return res.status(503).json({ error: 'Outbound calling is not enabled on the bridge.' });
-  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness, disclose, business: rawBusiness } = req.body || {};
+  const { to, secret, userId, userName, purpose, calleeName: rawCalleeName, agentId, agentName, voice, context, wellness: rawWellness, disclose, business: rawBusiness, unregisteredIsBusiness } = req.body || {};
   // Nov 14 2026: the chat's phone tool says whether the call is to a business or a stranger
-  // (true), a person who knows the user (false), or nothing (undefined: the registry decides).
+  // (true), a person who knows the user (false), or nothing (undefined: the registry decides;
+  // for the chat tool, which also sends unregisteredIsBusiness, a number nobody registered is a
+  // business or a stranger).
   const businessFlag = rawBusiness === true || rawBusiness === 'true' ? true
     : rawBusiness === false || rawBusiness === 'false' ? false : undefined;
   // KADE July 2 2026: the model sometimes fills calleeName with junk like
@@ -2660,6 +2663,7 @@ app.post('/outbound-call', async (req, res) => {
     agentId: agentId || DEFAULT_AGENT,
     disclose: disclose === true,
     business: businessFlag,
+    unregisteredIsBusiness: unregisteredIsBusiness === true,
   });
   const greetingText  = composed.greeting;
   const greeting2Text = composed.greeting2;
