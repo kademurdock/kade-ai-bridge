@@ -414,6 +414,71 @@ test('REVIEW: after a restart, a check_result that comes while the recovered rep
   assert.equal(await writing, true);
 });
 
+/* Verification round, Nov 14 2026. The server-level races (the saved call record, the hourly sweep through
+ * the status path) are in call-report.server.test.js; these are the reporter's own parts. */
+test('VERIFY 15: the hourly sweep settles a stuck call from Twilio\'s status, leaves young and live ones, and drops old ones', async () => {
+  const now = Date.now();
+  const entry = (sid, minutesAgo, over = {}) => ({ ...cr.pendingEntry(callMeta({ callSid: sid })), startedAt: now - minutesAgo * 60000, ...over });
+  const store = memStore({
+    CA60: entry('CA60', 25, { transcript: TALK }), // its status callback was lost
+    CA61: entry('CA61', 5),                        // still young: may be ringing or talking
+    CA62: entry('CA62', 30),                       // Twilio says it is still going
+    CA63: entry('CA63', 3 * 60),                   // three hours old
+  });
+  const { r } = reporter({ store });
+  const finished = [];
+  const fetched = [];
+  const statuses = { CA60: { status: 'completed', duration: '61' }, CA62: { status: 'in-progress' } };
+  const n = await r.sweep({
+    fetchStatus: async (sid) => { fetched.push(sid); return statuses[sid]; },
+    onFinalStatus: async (sid, status, dur) => { finished.push([sid, status, dur]); },
+  });
+  assert.equal(n, 1);
+  assert.deepEqual(finished, [['CA60', 'completed', 61]], 'settled through the same path as the status callback');
+  assert.deepEqual(fetched.sort(), ['CA60', 'CA62'], 'Twilio is read only for entries older than 20 minutes');
+  assert.deepEqual(Object.keys(store.read()).sort(), ['CA60', 'CA61', 'CA62'], 'the three-hour-old one is dropped (CA60 leaves when its report settles)');
+  // Without a status path of its own, the sweep reports the entry itself.
+  const store2 = memStore({ CA64: entry('CA64', 25, { transcript: TALK }) });
+  const two = reporter({ store: store2, transcriptWaitMs: 50 });
+  assert.equal(await two.r.sweep({ fetchStatus: async () => ({ status: 'completed', duration: '40' }) }), 1);
+  await sleep(100);
+  assert.equal(two.posts.length, 1);
+  assert.deepEqual(store2.read(), {});
+});
+
+test('VERIFY 15: the list keeps at most 200 calls, dropping the oldest', () => {
+  const store = memStore();
+  const { r } = reporter({ store });
+  for (let i = 0; i < 205; i += 1) r.track(callMeta({ callSid: `CA${String(i).padStart(4, '0')}`, startedAt: 1000 + i }));
+  const kept = Object.keys(store.read());
+  assert.equal(kept.length, 200);
+  assert.equal(kept.includes('CA0000'), false);
+  assert.equal(kept.includes('CA0204'), true);
+});
+
+test('VERIFY 15: a report long after the call says it is late; one minutes after it does not', () => {
+  const late = cr.buildNote(callMeta({ finalStatus: 'completed', durationSec: 60, transcript: TALK, startedAt: Date.now() - 41 * 60000 }));
+  assert.match(late, /^The phone call you placed for them ended about 40 minutes ago\. This message is late/);
+  const fresh = cr.buildNote(callMeta({ finalStatus: 'completed', durationSec: 60, transcript: TALK, startedAt: Date.now() - 90000 }));
+  assert.match(fresh, /^The phone call you placed for them just ended\./);
+});
+
+test('VERIFY 16: the message names a chat for the call, used when the chat it came from is temporary or gone', async () => {
+  const { r, posts } = reporter();
+  await r.onFinal(callMeta({ finalStatus: 'no-answer', calleeName: 'Shell' }));
+  assert.equal(posts[0].title, 'Call to Shell');
+  const two = reporter();
+  await two.r.onFinal(callMeta({ finalStatus: 'busy' }));
+  assert.equal(two.posts[0].title, 'Phone call');
+});
+
+test('VERIFY 12: claimEntry for a call a stopped process was still posting says it went (the website finishes it)', () => {
+  const store = memStore({ CA70: { ...cr.pendingEntry(callMeta({ callSid: 'CA70' })), transcript: TALK, state: 'posting' } });
+  const { r } = reporter({ store });
+  assert.equal(r.claimEntry('CA70').told, 'posting');
+  assert.deepEqual(store.read(), {});
+});
+
 /* server.js cannot be loaded in a test (it starts the whole bridge), so the wiring is read from
  * its source: the place that would silently undo this work if it ever drifted. */
 test('server.js wiring: the report rides /outbound-call, fires on Twilio\'s final status, and check_result claims it', () => {
@@ -437,7 +502,9 @@ test('server.js wiring: the report rides /outbound-call, fires on Twilio\'s fina
   assert.match(result, /status: 'interrupted'/);
   assert.match(result, /reportedToChat: toldCut === 'posting' \|\| toldCut === 'posted'/);
   assert.match(result, /reportedToChat: told === 'posting' \|\| told === 'posted'/);
-  assert.match(result, /reportedToChat: done\.reportState === 'posting' \|\| done\.reportState === 'posted'/);
+  // Verification round: the answer from the saved record claims a report still on the list too.
+  assert.match(result, /const toldDone = callReporter\.entryFor\(done\.callSid\) \? \(callReporter\.claimEntry\(done\.callSid\) \|\| \{\}\)\.told : null;/);
+  assert.match(result, /: done\.reportState === 'posting' \|\| done\.reportState === 'posted',/);
   const end = src.slice(src.indexOf('function onCallEnd('), src.indexOf('async function endCall('));
   assert.match(end, /callReporter\.noteTranscript\(meta\)/);
   assert.match(src, /callReporter\.recover\(\{/);

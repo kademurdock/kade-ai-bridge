@@ -2846,6 +2846,14 @@ app.post('/amd-status', (req, res) => {
 app.post('/voice-status', (req, res) => {
   const { CallSid, CallStatus, To, From, CallDuration } = req.body;
   console.log(`[bridge] Call status: sid=${CallSid} ${From}->${To} status=${CallStatus}${CallDuration ? ` dur=${CallDuration}s` : ''}`);
+  finishOutboundStatus(CallSid, CallStatus, CallDuration);
+  res.status(200).end();
+});
+
+/* What a call's status means for its record and its report. Nov 14 2026 verification round: one
+ * place for it, so the hourly report sweep (call-report.js sweep) can finish a call whose status
+ * callback never came, the same way Twilio's callback would have. */
+function finishOutboundStatus(CallSid, CallStatus, CallDuration) {
   const meta = outboundMeta.get(CallSid);
   if (meta && !meta.finalized && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(CallStatus)) {
     meta.finalized = true;
@@ -2862,8 +2870,7 @@ app.post('/voice-status', (req, res) => {
     // does, honestly, from what was kept on the volume (call-report.js finishUnknown).
     callReporter.finishUnknown(CallSid, CallStatus, parseInt(CallDuration || '0', 10)).catch(() => {});
   }
-  res.status(200).end();
-});
+}
 
 // Recording status callback — stashes the recording pointer for QA review.
 app.post('/recording-status', (req, res) => {
@@ -3074,6 +3081,11 @@ app.post('/outbound/result', async (req, res) => {
         : 'No outbound calls found for this user.',
     });
   }
+  /* Nov 14 2026 verification round: the call record is saved 45 s or more after the call, but its
+   * report may still be on the list, waiting to try the website again after a 429 or a 5xx. This answer
+   * gives the person the call now, so it claims the report as the live answer above does; before, the
+   * retry posted the message as well and she heard it twice. The report says what she was already sent. */
+  const toldDone = callReporter.entryFor(done.callSid) ? (callReporter.claimEntry(done.callSid) || {}).told : null;
   res.json({
     found: true,
     status: done.status,
@@ -3085,7 +3097,9 @@ app.post('/outbound/result', async (req, res) => {
     durationSec: done.durationSec,
     transcript: (done.transcript || []).slice(-40),
     reportBack: done.reportBack === true,
-    reportedToChat: done.reportState === 'posting' || done.reportState === 'posted',
+    reportedToChat: toldDone
+      ? toldDone === 'posting' || toldDone === 'posted'
+      : done.reportState === 'posting' || done.reportState === 'posted',
   });
 });
 
@@ -6458,4 +6472,19 @@ server.listen(port, () => {
     }).then((n) => { if (n) console.log(`[call-report] reported ${n} call(s) placed before the restart`); })
       .catch((e) => console.warn('[call-report] restart recovery failed:', e.message));
   }, 20000);
+  /* Nov 14 2026 verification round: and once an hour while the bridge runs. A call whose final status
+   * never came (a lost or refused status callback) kept its entry and words on the volume until the
+   * next boot, which then reported it however old. The sweep reads Twilio's status for any entry older
+   * than 20 minutes and finishes it the way the status callback would have; entries older than 2 hours
+   * are dropped. One read of Twilio per stuck call per hour; nothing at all when the list is empty. */
+  const REPORT_SWEEP_MS = 3600 * 1000;
+  const sweepReports = () => {
+    callReporter.sweep({
+      fetchStatus: twilioClient ? (sid) => twilioClient.calls(sid).fetch() : undefined,
+      onFinalStatus: (sid, status, duration) => finishOutboundStatus(sid, status, duration),
+    }).then((n) => { if (n) console.log(`[call-report] the hourly sweep settled ${n} call(s) whose status never came`); })
+      .catch((e) => console.warn('[call-report] the hourly sweep failed:', e.message));
+  };
+  const sweepTimer = setInterval(sweepReports, REPORT_SWEEP_MS);
+  if (sweepTimer.unref) sweepTimer.unref();
 });

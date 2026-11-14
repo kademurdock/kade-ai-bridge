@@ -48,6 +48,16 @@
  *     honestly from what was saved (recover, finishUnknown).
  *   - When a report settles after the call record was saved, the record is told (onSettled).
  *
+ * Verification round, Nov 14 2026 (an independent review):
+ *   - A check_result answered from the SAVED call record (server.js, 45 s or more after the call) while
+ *     the report waits to try again after a 429 or 5xx now claims it too, so the retry does not post it.
+ *   - The list on the volume is swept hourly (sweep): a call whose final status never came is settled
+ *     from Twilio's status, through the same path as the status callback, and its message says it is
+ *     late. An entry older than 2 hours is dropped, at boot too, whatever its status, so nobody gets a
+ *     message about a call from days ago "cut off by a restart". At most 200 entries are kept.
+ *   - The message asks the website for a new chat named for the call ("Call to Shell") when the chat it
+ *     was placed from is temporary or gone, instead of an unrelated older chat (body.title).
+ *
  * Cost: each report is one character-written message on the person's seat. The website keeps
  * these on MiMo (about 1 to 2 cents) unless KADE_CLAUDE_CALL_REPORTS=1 there; see
  * services/kadeCharacterTurn.js. Off switch: KADE_CALL_REPORT_BACK=0 (the call still works; the
@@ -58,6 +68,7 @@ const AGENT_ID = /^agent_[A-Za-z0-9_-]{6,64}$/;
 const CONVO_ID = /^[0-9a-f-]{36}$/i;
 const USER_ID = /^[a-f0-9]{24}$/i;
 const FINAL_STATUSES = ['completed', 'busy', 'no-answer', 'failed', 'canceled'];
+const MAX_PENDING = 200; // calls waiting to report back, kept on the volume (a call's entry is lean)
 
 function enabled(env = process.env) {
   return String((env && env.KADE_CALL_REPORT_BACK) ?? '') !== '0';
@@ -141,6 +152,14 @@ function transcriptText(meta, { agentName, maxChars = 3500 } = {}) {
   return out;
 }
 
+/** Minutes since the call ended (it began at startedAt and ran durationSec), or 0 when unknown. */
+function minutesSinceEnd(meta, now = Date.now()) {
+  const began = Number(meta.startedAt) || 0;
+  if (!began) return 0;
+  return Math.max(0, Math.round((now - began - (Number(meta.durationSec) || 0) * 1000) / 60000));
+}
+const LATE_MIN = 10;
+
 /** The platform note the character writes its one message from (never shown to the person). */
 function buildNote(meta) {
   const caller = meta.agentName || 'the character';
@@ -148,8 +167,14 @@ function buildNote(meta) {
   const delegated = meta.reportAgentId && meta.agentId && meta.reportAgentId !== meta.agentId;
   const who = meta.calleeName ? meta.calleeName : 'the number they gave you';
   const transcript = transcriptText(meta, { agentName: delegated ? caller : reporter });
+  /* Verification round, Nov 14 2026: a report that comes long after the call (its end was only found by
+   * the hourly sweep, or after a restart) says so, so it is not read as a call that just ended. */
+  const lateMin = minutesSinceEnd(meta);
+  const opening = lateMin >= LATE_MIN
+    ? `The phone call you placed for them ended about ${lateMin} minutes ago. This message is late, so say when the call was.`
+    : 'The phone call you placed for them just ended.';
   return [
-    `The phone call you placed for them just ended. ${delegated ? `You had ${caller} make it in their own voice. ` : ''}`.trim(),
+    `${opening} ${delegated ? `You had ${caller} make it in their own voice. ` : ''}`.trim(),
     `Who was called: ${who}.`,
     `What the call was for: ${plain(meta.purpose).slice(0, 500)}`,
     `What happened: ${outcomeLine(meta)}`,
@@ -280,7 +305,15 @@ function createCallReporter(deps) {
   /** A call that will report back was just dialed. */
   function track(meta) {
     if (!meta || meta.reportBack !== true || !meta.callSid) return;
-    pend()[meta.callSid] = pendingEntry(meta);
+    const all = pend();
+    all[meta.callSid] = pendingEntry(meta);
+    // Verification round: a cap, on top of the hourly sweep. The oldest go first.
+    const ids = Object.keys(all);
+    if (ids.length > MAX_PENDING) {
+      ids.sort((a, b) => ((all[a] && all[a].startedAt) || 0) - ((all[b] && all[b].startedAt) || 0))
+        .slice(0, ids.length - MAX_PENDING)
+        .forEach((id) => { log(`[call-report] ${id}: dropped, the list is full`); delete all[id]; });
+    }
     persist();
   }
   /** Keep what a restart would need: the transcript at hang-up, the final status, the state. */
@@ -371,6 +404,9 @@ function createCallReporter(deps) {
       urgent: true,
       // What the other person said is in the note: the website treats it like text from outside.
       outsideText: true,
+      /* Verification round: the name of the new chat the website starts when the chat the call was
+       * placed from is temporary or gone (it never posts into an unrelated older chat). */
+      title: meta.calleeName ? `Call to ${String(meta.calleeName).slice(0, 40)}` : 'Phone call',
     };
     // 429 = the site is writing other messages right now; 5xx = it failed or was restarting.
     let tries429 = 0;
@@ -450,7 +486,9 @@ function createCallReporter(deps) {
     const running = active.get(callSid);
     if (running) return { ...e, told: claim(running) };
     untrack(callSid);
-    return { ...e, told: 'claimed' };
+    // Verification round: a process that stopped while the website was writing it left 'posting'
+    // behind; the website finishes that on its own, so the person was (or is being) sent it.
+    return { ...e, told: e.state === 'posting' ? 'posting' : 'claimed' };
   }
   /** Report a call this process did not place (it was placed before a restart), from the list. */
   function reportRecovered(e, finalStatus, durationSec) {
@@ -470,10 +508,18 @@ function createCallReporter(deps) {
     if (!e || !FINAL_STATUSES.includes(String(finalStatus))) return Promise.resolve(false);
     return reportRecovered(e, finalStatus, durationSec);
   }
+  /** Verification round, Nov 14 2026: an entry older than maxAgeMs is dropped, whatever its status. A
+   *  report hours or days after the call, told as cut off by a restart, would only confuse. */
+  function dropIfOld(e, maxAgeMs) {
+    if (Date.now() - (e.startedAt || 0) <= maxAgeMs) return false;
+    log(`[call-report] ${e.callSid}: dropped, the call was more than ${Math.round(maxAgeMs / 60000)} minutes ago`);
+    untrack(e.callSid);
+    return true;
+  }
   /**
    * At boot: every call still on the list. Its final status from Twilio when the list does not
-   * have one; a call still going is left for its status callback; one older than maxAgeMs with no
-   * status at all is dropped.
+   * have one; a call still going is left for its status callback; one older than maxAgeMs is dropped
+   * (verification round: with a status too, not only without one).
    * @param {{ fetchStatus?: (sid: string) => Promise<{status: string, duration?: string|number}>, isLive?: (sid: string) => boolean, maxAgeMs?: number }} o
    */
   async function recover(o = {}) {
@@ -483,6 +529,7 @@ function createCallReporter(deps) {
     for (const e of Object.values(pend())) {
       if (!e || !e.callSid || isLive(e.callSid) || active.has(e.callSid)) continue;
       if (e.state === 'posting') { await reportRecovered(e); continue; } // the website has it: off the list
+      if (dropIfOld(e, maxAgeMs)) continue;
       let status = e.finalStatus || null;
       let duration = e.durationSec || 0;
       if (!status && o.fetchStatus) {
@@ -494,17 +541,55 @@ function createCallReporter(deps) {
           log(`[call-report] ${e.callSid}: could not read its status after a restart: ${err && err.message}`);
         }
       }
-      if (!status || !FINAL_STATUSES.includes(status)) {
-        if (Date.now() - (e.startedAt || 0) > maxAgeMs) { log(`[call-report] ${e.callSid}: dropped, too old and no status`); untrack(e.callSid); }
-        continue;
-      }
+      if (!status || !FINAL_STATUSES.includes(status)) continue;
       await reportRecovered(e, status, duration);
       done += 1;
     }
     return done;
   }
 
-  return { onFinal, claim, awaited, track, noteTranscript, entryFor, newestPendingFor, claimEntry, finishUnknown, recover, pendingList: () => ({ ...pend() }) };
+  /**
+   * Verification round, Nov 14 2026: hourly while the bridge runs (server.js). A call's final status can
+   * be lost (refused by the Twilio gate, a network fault), and its entry and words then sat on the volume
+   * until the next boot, which reported it however old. Each entry older than olderThanMs (20 min: no call
+   * runs longer than its 15 minute limit plus ringing) is settled from Twilio's own status, through
+   * onFinalStatus (server.js finishOutboundStatus: the same path as Twilio's callback); one older than
+   * maxAgeMs is dropped. A call still going, or one this process is reporting, is left alone.
+   * @param {{ fetchStatus?: (sid: string) => Promise<{status: string, duration?: string|number}>,
+   *   onFinalStatus?: (sid: string, status: string, durationSec: number) => any, olderThanMs?: number, maxAgeMs?: number }} o
+   * @returns {Promise<number>} how many were settled
+   */
+  async function sweep(o = {}) {
+    const olderThanMs = o.olderThanMs ?? 20 * 60 * 1000;
+    const maxAgeMs = o.maxAgeMs ?? 2 * 3600 * 1000;
+    let settled = 0;
+    for (const e of Object.values(pend())) {
+      if (!e || !e.callSid || active.has(e.callSid)) continue;
+      if (dropIfOld(e, maxAgeMs)) continue;
+      if (Date.now() - (e.startedAt || 0) < olderThanMs || !o.fetchStatus) continue;
+      let c = null;
+      try {
+        c = await o.fetchStatus(e.callSid);
+      } catch (err) {
+        log(`[call-report] ${e.callSid}: the sweep could not read its status: ${err && err.message}`);
+        continue;
+      }
+      const status = c && c.status ? String(c.status) : null;
+      if (!status || !FINAL_STATUSES.includes(status)) continue;
+      const duration = parseInt(c && c.duration, 10) || 0;
+      log(`[call-report] ${e.callSid}: its final status never came; settling it from Twilio's (${status})`);
+      try {
+        if (o.onFinalStatus) await o.onFinalStatus(e.callSid, status, duration);
+        else await reportRecovered(e, status, duration);
+        settled += 1;
+      } catch (err) {
+        log(`[call-report] ${e.callSid}: the sweep could not settle it: ${err && err.message}`);
+      }
+    }
+    return settled;
+  }
+
+  return { onFinal, claim, awaited, track, noteTranscript, entryFor, newestPendingFor, claimEntry, finishUnknown, recover, sweep, pendingList: () => ({ ...pend() }) };
 }
 
 module.exports = {
