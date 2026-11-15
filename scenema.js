@@ -45,6 +45,9 @@ const { audioDiagnostics, privateSample } = require('./scenema-diagnostics');
 /* Nov 14 2026: Change words. One change per job, sent as data, one take per seed, and the take
  * that says the new words is the one kept (auk-words.js, CONTRACT.md in the work folder). */
 const aukWords = require('./auk-words');
+/* Nov 15 2026: Clean up or change. One trained AuK task per job, sent as a task id and fixed choices;
+ * the instruction is AuK's own template, built in auk-tasks.js, never text she typed. */
+const aukTasks = require('./auk-tasks');
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const JOBS_FILE = path.join(DATA_DIR, 'scenema-jobs.json');
@@ -283,10 +286,18 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     const src = options.reference_voice_url;
     if (typeof src === 'string' && /^https:\/\/\S+$/i.test(src) && src.length < 2048) wordEdit.sourceUrl = src;
   }
+  /* A clean-up or change task carries edit_task and edit_slots; its instruction is built here. */
+  let editTask = null;
+  if (options.auk_task === 'edit' && !wordEdit && options.edit_task != null) {
+    if (!IS_AUK) return { error: 'This change needs the AuK worker.' };
+    const checked = aukTasks.taskInput(options, { looksLikeWordChange: aukWords.looksLikeWordChange });
+    if (checked.error) return { error: checked.error };
+    editTask = checked.task;
+  }
   /* Free text that asks for a word change never reaches the worker: the deployed worker sends an
    * edit instruction to the model word for word, and AuK only follows its trained wording. */
-  if (options.auk_task === 'edit' && !wordEdit && aukWords.looksLikeWordChange(options.instruction)) return { error: aukWords.REFUSE_FREE_WORDS };
-  if (options.auk_task === 'edit' && (!options.reference_voice_url || (!wordEdit && !String(options.instruction || '').trim()))) return { error: 'Import a recording and describe the edit first.' };
+  if (options.auk_task === 'edit' && !wordEdit && !editTask && aukWords.looksLikeWordChange(options.instruction)) return { error: aukWords.REFUSE_FREE_WORDS };
+  if (options.auk_task === 'edit' && (!options.reference_voice_url || (!wordEdit && !editTask && !String(options.instruction || '').trim()))) return { error: 'Import a recording and describe the edit first.' };
   if (options.gen_seconds != null && (!Number.isFinite(options.gen_seconds) || options.gen_seconds <= 0)) return { error: 'Target seconds must be positive.' };
   const input = { prompt, out_prefix: userId };
   if (IS_AUK) {
@@ -296,6 +307,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
      * same template from kind/oldText/newText itself. */
     input.instruction = wordEdit
       ? aukWords.wordTemplate(wordEdit.kind, wordEdit.oldText, wordEdit.newText)
+      : editTask ? editTask.instruction
       : String(options.instruction || '').slice(0, MAX_PROMPT);
     if (wordEdit) {
       Object.assign(input, { kind: wordEdit.kind, oldText: wordEdit.oldText, newText: wordEdit.newText,
@@ -315,12 +327,22 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     for (const key of ['preserve_before', 'preserve_after']) {
       if (typeof options[key] === 'boolean') input[key] = options[key];
     }
+    /* A task that changes the length (speed above all) needs the output length. The fork sends it;
+     * from a range alone it is worked out here; with neither, a speed change would come back unchanged. */
+    if (editTask && input.gen_seconds == null && aukTasks.changesLength(editTask.id)) {
+      const span = Number.isFinite(input.edit_start) && Number.isFinite(input.edit_end) ? input.edit_end - input.edit_start : NaN;
+      if (span > 0) input.gen_seconds = aukTasks.targetSeconds(editTask.id, editTask.slots, span);
+      else if (editTask.id === 'speed') return { error: 'A speed change needs the recording length. Start it again from the Sound Booth.' };
+    }
   }
   const ref = options.reference_voice_url;
   if (typeof ref === 'string' && /^https?:\/\/\S+$/i.test(ref) && ref.length < 2048) input.reference_voice_url = ref;
   if (options.background_sfx === true) input.background_sfx = true;
   if (options.mode === 'voice_design') input.mode = 'voice_design';
   if (Number.isInteger(options.seed) && options.seed >= 0 && !wordEdit) input.seed = options.seed;
+  /* Every try of a task is a fresh take: the fork sends a fresh seed; without one, one is drawn
+   * here, never the worker's fixed default. */
+  if (editTask && !Number.isInteger(input.seed)) input.seed = aukTasks.freshSeed();
   if (typeof options.pace === 'number' && options.pace >= 0.5 && options.pace <= 3) input.pace = options.pace;
   if (options.keep_wav === true) input.keep_wav = true;
   /* Oct 2 2026: a private opening take sets the voice so the description is
@@ -348,6 +370,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
      * Spend is still logged; only the gallery row is skipped. */
     suppressAsset: options.suppressAsset === true,
     ...(wordEdit ? { wordEdit } : {}),
+    ...(editTask ? { editTask: { id: editTask.id, slots: editTask.slots } } : {}),
   };
   jobs.push(job); saveJobs();
   // words → a rough length estimate for the caller: ~2.6 words/s spoken, render ≈ 1.4× that at bf16
@@ -587,6 +610,7 @@ async function pump() {
         await postUsage({ userId: job.userId, seconds: out.duration_s || execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, words: job.estimate?.words, agent: job.agentName } });
         if (!job.suppressAsset) {
           await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio', ...diagnostics,
+            ...(job.editTask ? { aukTask: 'edit', editTask: job.editTask } : {}),
             ...(job.wordEdit ? { aukTask: 'edit', wordEdit: { kind: job.wordEdit.kind, oldText: job.wordEdit.oldText, newText: job.wordEdit.newText, rangeStart: job.wordEdit.rangeStart, rangeEnd: job.wordEdit.rangeEnd, matched: !!job.editReport?.matched, checked: !!job.editReport?.checked } } : {}) } });
         }
         /* A part does not buzz her phone -- the fork does that once, after the
@@ -597,6 +621,7 @@ async function pump() {
           const mins = Math.floor((out.duration_s || 0) / 60), secs = Math.round((out.duration_s || 0) % 60);
           const len = mins ? `${mins} minute${mins === 1 ? '' : 's'} ${secs} seconds` : `${secs} seconds`;
           if (job.wordEdit) await notifyResult(job, 'Your word change is ready', `${String(job.editReport?.spoken || '').slice(0, 200)} Open the Sound Booth to play it.`.trim());
+          else if (job.editTask) await notifyResult(job, 'Your change is ready', `${len} of audio is ready. Open the Sound Booth to play it.`);
           else await notifyResult(job, 'Your narration is ready', `${len} of audio is ready. Open the Sound Booth to play your take, or find it in My Creations.`);
         } catch (e) { console.warn('[scenema] notify failed:', e.message); }
       } else if (s.status === 'FAILED' || s.status === 'CANCELLED' || s.status === 'TIMED_OUT') {
