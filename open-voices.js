@@ -264,12 +264,15 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
         receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'failed', costUSD: cost }); save();
         return;
       }
+      /* Filed first, then marked done: the booth's Keep finds the take in My Creations by job id. */
+      job.state = 'filing'; save();
+      receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'done', seconds: out.duration_seconds, costUSD: cost });
+      await postUsage(job, out.duration_seconds || 1, cost);
+      await postAsset(job, out, cost);
       job.state = 'done'; job.finishedAt = new Date(now()).toISOString(); job.costUSD = cost;
       job.result = { url: out.url, wavUrl: out.wav_url, seconds: out.duration_seconds, seed: out.seed, sampleRate: out.sample_rate,
         mode: out.mode, engine: out.engine, cold: (s.delayTime || 0) > 45000, executionS: Math.round((s.executionTime || 0) / 100) / 10 };
-      receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'done', seconds: out.duration_seconds, costUSD: cost }); save();
-      await postUsage(job, out.duration_seconds || 1, cost);
-      await postAsset(job, out, cost);
+      save();
     } else if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(s.status)) {
       job.state = 'failed'; job.finishedAt = new Date(now()).toISOString(); job.costUSD = cost;
       job.error = s.status === 'TIMED_OUT' ? 'The voice engine ran out of time. Nothing was made.' : 'The voice engine stopped. Nothing was made.';
@@ -280,16 +283,16 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
   let pumping = false;
   async function pump() {
     if (pumping) return; pumping = true;
-    try { for (const job of jobs) if ((job.state === 'queued' || job.state === 'running') && job.runpodId) await pollOne(job); }
+    try { for (const job of jobs) if (['queued', 'running', 'filing'].includes(job.state) && job.runpodId) await pollOne(job); }
     finally { pumping = false; }
   }
 
   function view(job) {
     const { text, runpodId, ...rest } = job;
     let wait = null;
-    if (job.state === 'queued' || job.state === 'running') {
+    if (['queued', 'running', 'filing'].includes(job.state)) {
       const waitedS = Math.max(0, Math.round((now() - Date.parse(job.submittedAt || job.createdAt)) / 1000));
-      wait = { waitedS, spoken: job.state === 'running' ? `Speaking now. ${saySeconds(waitedS)} in.` : `Waiting for the voice engine. ${saySeconds(waitedS)} so far.` };
+      wait = { waitedS, spoken: job.state === 'filing' ? 'Saving the take.' : job.state === 'running' ? `Speaking now. ${saySeconds(waitedS)} in.` : `Waiting for the voice engine. ${saySeconds(waitedS)} so far.` };
     }
     return { ...rest, words: text.slice(0, 160), wait };
   }
