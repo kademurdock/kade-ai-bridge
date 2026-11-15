@@ -18,7 +18,8 @@
  * Env: RUNPOD_API_KEY · VOXCPM_ENDPOINT_ID (default dewjq1ibxkp2c3) · MING_ENDPOINT_ID (no default;
  * unset = Ming is hidden and refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR (default 1.75) ·
  * OPEN_VOICES_DAILY_CAP_USD (1.00) / OPEN_VOICES_MONTHLY_CAP_USD (20) · OPEN_VOICES_QUEUE_TIMEOUT_MS
- * (15 min; Ming gets twice that) · OPEN_VOICES_AUDIO_HOSTS (extra storage hosts, comma list) ·
+ * (15 min; Ming gets twice that) · OPEN_VOICES_RUN_CEILING_MS (20 min more, past which any job is given up) ·
+ * OPEN_VOICES_AUDIO_HOSTS (extra storage hosts, comma list) ·
  * OPEN_VOICES_ENABLED=0 switches the lane off.
  *
  * Routes (bridge secret): POST /audio/open-voices/start, GET /audio/open-voices/status,
@@ -49,6 +50,21 @@ const ENGINES = {
     queueFactor: 2,
   },
 };
+
+const LIVE = ['queued', 'running', 'filing'];
+const isLive = (j) => LIVE.includes(j.state);
+
+/* The worker's error text names code fields and exception classes; she hears a plain sentence.
+ * The handlers' own clip sentences ("The reference clip is ...") are already plain and pass through. */
+function plainError(out = {}) {
+  const raw = String((out && out.error) || '');
+  if (out && out.error_code === 'missing_dependency') return 'The voice engine is missing a part right now. Nothing was made. Try again later.';
+  if (/^With prompt_text/i.test(raw)) return 'The exact words only work for a clip of thirty seconds or less. Leave the words out, or use a shorter clip.';
+  if (/model cache is not ready/i.test(raw)) return 'The voice engine is still getting ready. Nothing was made. Try again in a few minutes.';
+  if (/^The reference clip (must be stored|host is not public)/i.test(raw)) return 'That clip is not stored with the platform. Import it again.';
+  if (/^The reference clip [a-z ,]+\.$/i.test(raw) && raw.length <= 80) return raw;
+  return 'The voice engine could not make this take. Nothing was made. Try again, or try a different clip.';
+}
 
 const freshSeed = () => crypto.randomInt(1, SEED_MAX);
 const oneLine = (v) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : '');
@@ -136,6 +152,8 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
   const DAILY_CAP = parseFloat(env.OPEN_VOICES_DAILY_CAP_USD || '1.00');
   const MONTHLY_CAP = parseFloat(env.OPEN_VOICES_MONTHLY_CAP_USD || '20');
   const QUEUE_TIMEOUT_MS = parseInt(env.OPEN_VOICES_QUEUE_TIMEOUT_MS || String(15 * 60 * 1000), 10);
+  /* Past the queue wait plus this, a job is given up whatever /status says (a lost record, odd answers, a stuck run). */
+  const RUN_CEILING_MS = parseInt(env.OPEN_VOICES_RUN_CEILING_MS || String(20 * 60 * 1000), 10);
   const FORK_URL = (env.FORK_USAGE_URL || env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
   const USAGE_SECRET = env.KADE_USAGE_EVENT_SECRET || '';
   const rate = (engine) => parseFloat(env[ENGINES[engine].rateEnv] || '1.75');
@@ -214,10 +232,10 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (built.error) return built;
     const capMsg = capsExceeded();
     if (capMsg) return { error: capMsg };
-    const open = jobs.find((j) => j.userId === userId && (j.state === 'queued' || j.state === 'running'));
+    const open = jobs.find((j) => j.userId === userId && isLive(j));
     if (open) return { error: 'One take at a time. The last one is still being made.', jobId: open.id };
     const cap = await readCapacity(engine);
-    const input = { ...built.input, out_prefix: userId };
+    const input = { ...built.input }; // exactly the worker contract's fields; the user id stays here
     const job = { id: `ov_${now().toString(36)}${crypto.randomBytes(3).toString('hex')}`, userId, engine, mode: input.mode,
       text: input.text, description: input.description || '', style: input.style || '', seed: input.seed,
       hasPromptText: !!input.prompt_text, state: 'queued', createdAt: new Date(now()).toISOString(), runpodId: null,
@@ -237,21 +255,67 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     return { ok: true, jobId: job.id, engine, mode: job.mode, seed: job.seed, coldLikely: job.coldLikely };
   }
 
+  function giveUp(job, error, state = 'gave-up') {
+    job.state = 'failed'; job.finishedAt = new Date(now()).toISOString(); job.error = error; job.costUSD = 0;
+    receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state, costUSD: 0 }); save();
+  }
+  async function cancelAtRunPod(job) {
+    try { await http.post(`${base(job.engine)}/cancel/${job.runpodId}`, {}, { headers: headers(), timeout: 20000 }); } catch (_) {}
+  }
+  /* The overall deadline, counted from submission: the queue wait plus the run ceiling. */
+  async function pastDeadline(job) {
+    const waited = now() - Date.parse(job.submittedAt || job.createdAt);
+    if (!(waited > QUEUE_TIMEOUT_MS * ENGINES[job.engine].queueFactor + RUN_CEILING_MS)) return false;
+    await cancelAtRunPod(job);
+    giveUp(job, `The voice engine did not finish in ${saySeconds(waited / 1000)}. Nothing was made. Try again later.`);
+    return true;
+  }
+
+  /* Files a finished take once. Each step is flagged and saved as soon as it is done, so a restart
+   * mid-way finishes from the saved output and never files a second My Creations row or receipt. */
+  async function file(job) {
+    const out = job.out || {};
+    const cost = job.costUSD || 0;
+    if (!job.receipted) {
+      receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'done', seconds: out.duration_seconds, costUSD: cost });
+      job.receipted = true; save();
+    }
+    if (!job.usagePosted) { await postUsage(job, out.duration_seconds || 1, cost); job.usagePosted = true; save(); }
+    if (!job.assetPosted) { await postAsset(job, out, cost); job.assetPosted = true; save(); }
+    job.state = 'done'; job.finishedAt = new Date(now()).toISOString();
+    job.result = { url: out.url, wavUrl: out.wav_url, seconds: out.duration_seconds, seed: out.seed, sampleRate: out.sample_rate,
+      mode: out.mode, engine: out.engine, cold: (job.delayMs || 0) > 45000, executionS: Math.round((job.executionMs || 0) / 100) / 10 };
+    delete job.out;
+    save();
+  }
+
   async function pollOne(job) {
+    if (job.state === 'filing') {
+      if (job.out) return file(job);
+      /* An older 'filing' record without its output: nothing safe to file twice, so stop it plainly. */
+      return giveUp(job, 'The take was made but could not be saved. Look in My Creations, or try again.', 'lost');
+    }
     let s;
     try {
       const r = await http.get(`${base(job.engine)}/status/${job.runpodId}`, { headers: headers(), timeout: 20000 });
-      s = r.data || {};
-    } catch (e) { console.warn(`[open-voices] status ${job.id}:`, e.message); return; }
+      s = (r && r.data) || {};
+    } catch (e) {
+      if (job.state === 'cancelled') return;
+      if (e && e.response && e.response.status === 404) {
+        console.warn(`[open-voices] ${job.id}: RunPod no longer knows job ${job.runpodId}`);
+        return giveUp(job, 'The voice engine lost this take. Nothing was made. Try again.', 'lost');
+      }
+      console.warn(`[open-voices] status ${job.id}:`, e.message);
+      await pastDeadline(job);
+      return;
+    }
     if (job.state === 'cancelled') return;
     if (s.status === 'IN_PROGRESS' && job.state !== 'running') { job.state = 'running'; job.startedAt = new Date(now()).toISOString(); save(); }
     if (s.status === 'IN_QUEUE' && !job.startedAt) {
       const waited = now() - Date.parse(job.submittedAt || job.createdAt);
       if (waited > QUEUE_TIMEOUT_MS * ENGINES[job.engine].queueFactor) {
-        try { await http.post(`${base(job.engine)}/cancel/${job.runpodId}`, {}, { headers: headers(), timeout: 20000 }); } catch (_) {}
-        job.state = 'failed'; job.finishedAt = new Date(now()).toISOString();
-        job.error = `The voice engine did not start in ${saySeconds(waited / 1000)}. Nothing was made. Try again later.`;
-        receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'gave-up', costUSD: 0 }); save();
+        await cancelAtRunPod(job);
+        giveUp(job, `The voice engine did not start in ${saySeconds(waited / 1000)}. Nothing was made. Try again later.`);
       }
       return;
     }
@@ -259,38 +323,41 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (s.status === 'COMPLETED') {
       const out = s.output || {};
       if (out.error || !out.url) {
-        job.state = 'failed'; job.error = String(out.error || 'The voice engine sent back no recording.').slice(0, 300);
+        if (out.error) console.warn(`[open-voices] ${job.id} worker error:`, String(out.error).slice(0, 300), out.error_code || '');
+        job.state = 'failed';
+        job.error = out.error ? plainError(out) : 'The voice engine sent back no recording. Nothing was made. Try again.';
         job.finishedAt = new Date(now()).toISOString(); job.costUSD = cost;
         receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'failed', costUSD: cost }); save();
         return;
       }
-      /* Filed first, then marked done: the booth's Keep finds the take in My Creations by job id. */
-      job.state = 'filing'; save();
-      receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'done', seconds: out.duration_seconds, costUSD: cost });
-      await postUsage(job, out.duration_seconds || 1, cost);
-      await postAsset(job, out, cost);
-      job.state = 'done'; job.finishedAt = new Date(now()).toISOString(); job.costUSD = cost;
-      job.result = { url: out.url, wavUrl: out.wav_url, seconds: out.duration_seconds, seed: out.seed, sampleRate: out.sample_rate,
-        mode: out.mode, engine: out.engine, cold: (s.delayTime || 0) > 45000, executionS: Math.round((s.executionTime || 0) / 100) / 10 };
+      /* Filed first, then marked done: the booth's Keep finds the take in My Creations by job id.
+       * The output is saved on the job first, so a restart finishes filing without asking RunPod. */
+      job.state = 'filing'; job.costUSD = cost; job.delayMs = s.delayTime || 0; job.executionMs = s.executionTime || 0;
+      job.out = { url: out.url, wav_url: out.wav_url, key: out.key, wav_key: out.wav_key, duration_seconds: out.duration_seconds,
+        seed: out.seed, sample_rate: out.sample_rate, mode: out.mode, engine: out.engine };
       save();
+      await file(job);
     } else if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(s.status)) {
       job.state = 'failed'; job.finishedAt = new Date(now()).toISOString(); job.costUSD = cost;
       job.error = s.status === 'TIMED_OUT' ? 'The voice engine ran out of time. Nothing was made.' : 'The voice engine stopped. Nothing was made.';
       receipt({ jobId: job.id, userId: job.userId, engine: job.engine, state: 'failed', costUSD: cost }); save();
+    } else {
+      /* Running, queued after a start, or an answer we do not know: the overall deadline still holds. */
+      await pastDeadline(job);
     }
   }
 
   let pumping = false;
   async function pump() {
     if (pumping) return; pumping = true;
-    try { for (const job of jobs) if (['queued', 'running', 'filing'].includes(job.state) && job.runpodId) await pollOne(job); }
+    try { for (const job of jobs) if (isLive(job) && job.runpodId) await pollOne(job); }
     finally { pumping = false; }
   }
 
   function view(job) {
-    const { text, runpodId, ...rest } = job;
+    const { text, runpodId, out, ...rest } = job;
     let wait = null;
-    if (['queued', 'running', 'filing'].includes(job.state)) {
+    if (isLive(job)) {
       const waitedS = Math.max(0, Math.round((now() - Date.parse(job.submittedAt || job.createdAt)) / 1000));
       wait = { waitedS, spoken: job.state === 'filing' ? 'Saving the take.' : job.state === 'running' ? `Speaking now. ${saySeconds(waitedS)} in.` : `Waiting for the voice engine. ${saySeconds(waitedS)} so far.` };
     }
@@ -313,7 +380,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
       engines: Object.fromEntries(Object.keys(ENGINES).map((k) => [k, { label: ENGINES[k].label, configured: ready(k), endpointId: endpointOf(k, env) || null }])),
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP },
       spend: { dayUSD: spendSince(now() - 86400000), monthUSD: spendSince(now() - 30 * 86400000) },
-      open: jobs.filter((j) => j.state === 'queued' || j.state === 'running').length,
+      open: jobs.filter(isLive).length,
     };
   }
 
@@ -330,7 +397,7 @@ function attachOpenVoices(app, d = {}, opts = {}) {
     if (timer) return;
     timer = setInterval(() => {
       lane.pump().catch((e) => console.warn('[open-voices] pump:', e.message)).then(() => {
-        if (!lane._jobs().some((j) => j.state === 'queued' || j.state === 'running')) { clearInterval(timer); timer = null; }
+        if (!lane._jobs().some(isLive)) { clearInterval(timer); timer = null; }
       });
     }, parseInt((opts.env || process.env).OPEN_VOICES_POLL_MS || '4000', 10));
     if (timer.unref) timer.unref();
@@ -347,7 +414,7 @@ function attachOpenVoices(app, d = {}, opts = {}) {
     const { jobId, userId } = req.query || {};
     const job = jobId ? lane.find(jobId) : userId ? lane.latest(userId) : null;
     if (!job || (userId && job.userId !== String(userId))) return res.status(404).json({ error: 'no such job' });
-    if (job.state === 'queued' || job.state === 'running') kick();
+    if (isLive(job)) kick();
     res.setHeader('Cache-Control', 'no-store');
     return res.json(lane.view(job));
   });
@@ -360,10 +427,10 @@ function attachOpenVoices(app, d = {}, opts = {}) {
     if (!(d.bridgeSecretOk && d.bridgeSecretOk(req, req.query && req.query.secret))) return res.status(403).json({ error: 'Unauthorized' });
     return res.json(lane.health());
   });
-  if (lane._jobs().some((j) => j.state === 'queued' || j.state === 'running')) kick();
+  if (lane._jobs().some(isLive)) kick();
   const h = lane.health();
   console.log(`[open-voices] lane ${h.enabled ? 'on' : 'OFF'}: ${Object.entries(h.engines).map(([k, v]) => `${k}=${v.configured ? v.endpointId : 'unset'}`).join(' ')}`);
   return lane;
 }
 
-module.exports = { attachOpenVoices, createOpenVoices, buildInput, ourClip, endpointOf, coldLikely, saySeconds, ENGINES, SEED_MAX };
+module.exports = { attachOpenVoices, createOpenVoices, buildInput, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, SEED_MAX };

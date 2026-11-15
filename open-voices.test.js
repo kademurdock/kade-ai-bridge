@@ -99,7 +99,8 @@ test('lane: Ming is refused while its endpoint is unset; VoxCPM2 runs, polls, fi
   assert.equal(r.coldLikely, true);
   const run = http.calls.find((c) => c.url.endsWith('/run'));
   assert.equal(run.url, 'https://api.runpod.ai/v2/dewjq1ibxkp2c3/run');
-  assert.deepEqual(run.body.input, { mode: 'design', text: 'Hello there.', description: 'A bright voice', seed: 99, out_prefix: 'u1' });
+  assert.deepEqual(run.body.input, { mode: 'design', text: 'Hello there.', description: 'A bright voice', seed: 99 });
+  assert.equal('out_prefix' in run.body.input, false, 'no user id goes to the GPU worker');
   assert.match((await lane.start({ engine: 'voxcpm', userId: 'u1', mode: 'design', description: 'd', text: 't' })).error, /One take at a time/);
   await lane.pump();
   assert.equal(lane.find(r.jobId).state, 'queued');
@@ -170,3 +171,86 @@ test('routes: secret required, status is per owner, health names both engines', 
 });
 
 function t_after(dir) { process.on('exit', () => { try { fs.rmSync(dir, { recursive: true }); } catch (_) {} }); }
+
+test('lane: a status 404 (RunPod forgot the job) fails the take, and her next take is accepted', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let lost = true;
+  const http = fakeHttp({
+    get: (url) => {
+      if (url.endsWith('/health')) return { workers: { idle: 1 } };
+      if (url.includes('/status/') && lost) { const e = new Error('Request failed with status code 404'); e.response = { status: 404 }; return e; }
+      return { status: 'IN_QUEUE' };
+    },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-gone', status: 'IN_QUEUE' } : {},
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k' }, http, dataDir: dir });
+  const a = await lane.start({ engine: 'voxcpm', userId: 'u1', mode: 'design', description: 'd', text: 'Words' });
+  await lane.pump();
+  assert.equal(lane.find(a.jobId).state, 'failed');
+  assert.match(lane.find(a.jobId).error, /lost this take/);
+  lost = false;
+  const b = await lane.start({ engine: 'voxcpm', userId: 'u1', mode: 'design', description: 'd', text: 'Words' });
+  assert.equal(b.ok, true);
+});
+
+test('lane: an overall deadline holds whatever /status answers', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let clock = Date.parse('2026-11-15T00:00:00Z');
+  let answer = 'blip';
+  const http = fakeHttp({
+    get: (url) => url.endsWith('/health') ? { workers: { idle: 1 } }
+      : answer === 'blip' ? new Error('socket hang up') : { error: 'something odd' },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-odd', status: 'IN_PROGRESS' } : {},
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k' }, http, dataDir: dir, now: () => clock });
+  const a = await lane.start({ engine: 'voxcpm', userId: 'u1', mode: 'design', description: 'd', text: 'Words' });
+  clock += 30 * 60 * 1000;
+  await lane.pump();
+  assert.equal(lane.find(a.jobId).state, 'running', 'a blip inside the deadline keeps waiting');
+  answer = 'odd';
+  await lane.pump();
+  assert.equal(lane.find(a.jobId).state, 'running', 'an unknown answer inside the deadline keeps waiting');
+  clock += 6 * 60 * 1000; // past 15 min queue + 20 min run ceiling
+  await lane.pump();
+  assert.equal(lane.find(a.jobId).state, 'failed');
+  assert.match(lane.find(a.jobId).error, /did not finish/);
+  assert.ok(http.calls.some((c) => c.url.endsWith('/cancel/rp-odd')));
+  assert.equal((await lane.start({ engine: 'voxcpm', userId: 'u1', mode: 'design', description: 'd', text: 'Again' })).ok, true);
+});
+
+test('lane: a take left filing by a restart is filed once, from its saved output', async () => {
+  const dir = tmp();
+  t_after(dir);
+  const out = { url: 'https://s3.us-east-005.backblazeb2.com/b/voxcpm/y.mp3?sig', wav_url: 'https://s3.us-east-005.backblazeb2.com/b/voxcpm/y.wav?sig', key: 'voxcpm/y.mp3', wav_key: 'voxcpm/y.wav', duration_seconds: 2.5, sample_rate: 48000, mode: 'design', seed: 5, engine: 'voxcpm2' };
+  fs.writeFileSync(path.join(dir, 'open-voices-jobs.json'), JSON.stringify([{ id: 'ov_filing1', userId: 'u1', engine: 'voxcpm', mode: 'design', text: 'Hi', description: 'd', style: '', seed: 5,
+    state: 'filing', createdAt: '2026-11-15T00:00:00Z', submittedAt: '2026-11-15T00:00:00Z', runpodId: 'rp-f', costUSD: 0.01, out, receipted: true, usagePosted: true, result: null, error: null }]));
+  const http = fakeHttp({ get: () => ({ status: 'COMPLETED', output: out, executionTime: 1000 }), post: () => ({ ok: true }) });
+  const app = express();
+  const lane = ov.attachOpenVoices(app, { bridgeSecretOk: () => true }, { env: { RUNPOD_API_KEY: 'k', KADE_USAGE_EVENT_SECRET: 's', FORK_USAGE_URL: 'https://fork.test', OPEN_VOICES_POLL_MS: '600000' }, http, dataDir: dir });
+  assert.equal(lane.view(lane.find('ov_filing1')).wait.spoken, 'Saving the take.');
+  await lane.pump();
+  await lane.pump();
+  const job = lane.find('ov_filing1');
+  assert.equal(job.state, 'done');
+  assert.equal(job.result.url, out.url);
+  assert.equal(job.out, undefined);
+  assert.equal(http.calls.filter((c) => c.url.endsWith('/asset-event')).length, 1, 'the asset is filed once');
+  assert.equal(http.calls.filter((c) => c.url.endsWith('/usage-event')).length, 0, 'usage was already posted before the restart');
+  assert.equal(http.calls.filter((c) => c.url.includes('/status/')).length, 0, 'no need to ask RunPod again');
+  const receipts = fs.existsSync(path.join(dir, 'open-voices-receipts.jsonl')) ? fs.readFileSync(path.join(dir, 'open-voices-receipts.jsonl'), 'utf8').trim().split('\n').filter(Boolean) : [];
+  assert.equal(receipts.length, 0, 'the done receipt was already written');
+  assert.equal(lane.health().open, 0);
+});
+
+test('worker errors reach her as plain sentences', () => {
+  assert.equal(ov.plainError({ error: 'The reference clip is silent or damaged.' }), 'The reference clip is silent or damaged.');
+  assert.match(ov.plainError({ error: 'VoxCPM2 could not finish (RuntimeError). No audio was generated.' }), /^The voice engine could not make this take/);
+  assert.match(ov.plainError({ error: 'clone mode needs reference_voice_url.' }), /^The voice engine could not make this take/);
+  assert.match(ov.plainError({ error: 'The VoxCPM2 worker is missing a required component.', error_code: 'missing_dependency' }), /missing a part/);
+  assert.match(ov.plainError({ error: 'With prompt_text the clip must be at most 30 s and the transcript must cover all of it.' }), /thirty seconds or less/);
+  for (const m of ['RuntimeError', 'reference_voice_url', 'prompt_text']) {
+    assert.equal(/RuntimeError|reference_voice_url|prompt_text/.test(ov.plainError({ error: m })), false, m);
+  }
+});
