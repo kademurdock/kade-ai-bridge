@@ -16,7 +16,7 @@
  * its GPU time through the usage lane. Jobs and receipts live on the volume.
  *
  * Env: RUNPOD_API_KEY · VOXCPM_ENDPOINT_ID (default dewjq1ibxkp2c3) · MING_ENDPOINT_ID (no default;
- * unset = Ming is hidden and refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR (default 1.75) ·
+ * unset = Ming is hidden and refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR (defaults 1.34 / 1.89) ·
  * OPEN_VOICES_DAILY_CAP_USD (1.00) / OPEN_VOICES_MONTHLY_CAP_USD (20) · OPEN_VOICES_QUEUE_TIMEOUT_MS
  * (15 min; Ming gets twice that) · OPEN_VOICES_RUN_CEILING_MS (20 min more, past which any job is given up) ·
  * OPEN_VOICES_AUDIO_HOSTS (extra storage hosts, comma list) ·
@@ -41,13 +41,13 @@ const ENGINES = {
     id: 'voxcpm', label: 'VoxCPM2', model: 'openbmb/VoxCPM2', service: 'voxcpm_audio',
     endpointEnv: 'VOXCPM_ENDPOINT_ID', defaultEndpoint: 'dewjq1ibxkp2c3', rateEnv: 'VOXCPM_RATE_PER_HR',
     maxPrefix: 400, cfg: { name: 'cfg_value', min: 0.5, max: 5 }, steps: { name: 'inference_timesteps', min: 4, max: 50 },
-    queueFactor: 1,
+    queueFactor: 1, maxText: 5000, rate: '1.34', // top of its 16/24 GB pools (4090)
   },
   ming: {
     id: 'ming', label: 'Ming', model: 'inclusionAI/Ming-3.0-tts', service: 'ming_audio',
     endpointEnv: 'MING_ENDPOINT_ID', defaultEndpoint: '', rateEnv: 'MING_RATE_PER_HR',
     maxPrefix: 600, cfg: { name: 'cfg_scale', min: 1, max: 5 }, steps: { name: 'flow_steps', min: 4, max: 50 },
-    queueFactor: 2,
+    queueFactor: 2, maxText: 2500, rate: '1.89', // top of its 48 GB pools (L40S) // Ming runs ~1.5 s per audio second; longer text passes the 600 s job limit
   },
 };
 
@@ -96,7 +96,8 @@ function buildInput(engine, b = {}, env = process.env) {
   if (mode !== 'design' && mode !== 'clone') return { error: 'Choose Design a voice or Speak with a voice.' };
   const text = typeof b.text === 'string' ? b.text.trim() : '';
   if (!text) return { error: 'Type the words to say.' };
-  if (text.length > MAX_TEXT) return { error: `The words are too long. The most is ${MAX_TEXT} characters.` };
+  const maxText = e.maxText || MAX_TEXT;
+  if (text.length > maxText) return { error: `The words are too long for ${e.label}. The most is ${maxText} characters.` };
   const input = { mode, text };
   if (mode === 'design') {
     const description = oneLine(b.description);
@@ -156,7 +157,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
   const RUN_CEILING_MS = parseInt(env.OPEN_VOICES_RUN_CEILING_MS || String(20 * 60 * 1000), 10);
   const FORK_URL = (env.FORK_USAGE_URL || env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
   const USAGE_SECRET = env.KADE_USAGE_EVENT_SECRET || '';
-  const rate = (engine) => parseFloat(env[ENGINES[engine].rateEnv] || '1.75');
+  const rate = (engine) => parseFloat(env[ENGINES[engine].rateEnv] || ENGINES[engine].rate);
   const headers = () => ({ Authorization: `Bearer ${KEY}`, 'User-Agent': UA });
   const base = (engine) => `https://api.runpod.ai/v2/${endpointOf(engine, env)}`;
   const ready = (engine) => !!(ENABLED && KEY && endpointOf(engine, env));

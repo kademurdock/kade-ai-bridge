@@ -67,7 +67,9 @@ test('speak input: our clip, style and the clip words; knobs map to each worker'
   assert.equal(m.input.cfg_scale, undefined, 'Ming takes cfg_scale from 1');
   assert.match(ov.buildInput('ming', { mode: 'clone', text: 'Words' }).error, /saved voice or a clip/);
   assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: 'https://evil.example/a.wav', text: 'Words' }).error, /not stored/);
-  assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'x'.repeat(5001) }).error, /5000/);
+  assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'x'.repeat(2501) }).error, /2500/);
+  assert.match(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'x'.repeat(5001) }).error, /5000/);
+  assert.ok(!ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'x'.repeat(2501) }).error);
   assert.match(ov.buildInput('nope', { mode: 'design' }).error, /VoxCPM2 or Ming/);
   assert.match(ov.buildInput('voxcpm', { mode: 'sing', text: 'x' }).error, /Design a voice or Speak/);
 });
