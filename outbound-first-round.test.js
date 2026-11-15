@@ -1698,3 +1698,93 @@ test('ROUND 2 8: the family and own-number voicemails end the purpose with a ful
   assert.ok(lines.some((l) => /I called to .*coming Sunday\. Sorry I missed you/.test(l)), `own: ${lines.join(' | ')}`);
   for (const c of [fam, own]) await c.hangUp();
 });
+
+/* ── Third verification round, Nov 14 2026 ── */
+const twoPartBizCtx = (p1Sec) => ({
+  calleeName: "Tony's Pizza", greeting: PART1, greetingAskAt: PART1.indexOf('Is this') / PART1.length,
+  greetingBuf: Buffer.alloc(Math.round(p1Sec * SEC), GREET_BYTE),
+  greeting2: PART2, greeting2Buf: Buffer.alloc(2 * SEC, GREET_BYTE), greeting2AskAt: PART2.indexOf("I'm calling") / PART2.length,
+});
+
+test('ROUND 3 1 (N1): a stray "You." or an early "Hello?" in the middle of a long business part 1 does not bring part 2 on top of "Is this Tony\'s Pizza?"; the clerk\'s answer 0.9 s after it plays part 2 (on 9e9abb8: part 2 about 0.5 s after part 1)', async () => {
+  setEnv();
+  // Made one after the other: each must take its own listening socket.
+  const noise = await outboundCall(300, { greetingSec: 5, ctx: twoPartBizCtx(5) });
+  const hello = await outboundCall(301, { greetingSec: 5, ctx: twoPartBizCtx(5) });
+  const run = async (c, text, intoMs) => {
+    await c.at(300);
+    await c.say("Tony's Pizza.", 300);
+    await until(() => c.session._greetingStarted && c.session._greetingPart, 4000, 'part 1 started');
+    const p1 = c.session._greetingPart;
+    await sleep(Math.max(0, p1.audioAt + intoMs - Date.now()));
+    await c.say(text, 250);
+    await until(() => p1.done, 8000, 'part 1 over');
+    await sleep(Math.max(0, p1.endAt + 900 - Date.now()));
+    c.early = saidPart2(c);
+    const answerAt = Date.now();
+    await c.say('Yes it is.', 250);
+    await until(() => saidPart2(c), 6000, 'part 2 after the answer');
+    c.after = c.session._greetingPart.audioAt - answerAt;
+    c.answerSaved = c.session.history.some((m) => m.role === 'user' && m.content === 'Yes it is.');
+  };
+  await Promise.all([run(noise, 'You.', 2500), run(hello, 'Hello?', 1500)]);
+  for (const c of [noise, hello]) {
+    assert.equal(c.early, false, 'part 2 had not started 0.9 s after "Is this Tony\'s Pizza?" (nobody had answered)');
+    assert.ok(c.after < 2500, `part 2 followed the answer (${c.after} ms), not the 6 s wait`);
+    assert.ok(c.answerSaved, 'the answer is the confirmation, in the history');
+  }
+  for (const c of [noise, hello]) await c.hangUp();
+});
+
+test('ROUND 3 2 (N1): on a family part 1, words over its start bring part 2 about 1 s after part 1 ends, never at once as it ends', async () => {
+  setEnv(LIVE);
+  const c = await outboundCall(302, { from: HOLLY, ctx: { ...checkinCtx(), greetingBuf: Buffer.alloc(3 * SEC, GREET_BYTE), greeting2Buf: Buffer.alloc(2 * SEC, GREET_BYTE) } });
+  await kadesHello(c);
+  await until(() => c.session._greetingStarted && c.session._greetingPart, 3000, 'part 1 started');
+  const p1 = c.session._greetingPart;
+  await sleep(Math.max(0, p1.audioAt + 800 - Date.now()));
+  await c.say('Hello? Who is this?', 300);
+  await until(() => saidPart2(c), 9000, 'part 2 started');
+  const gap = c.session._greetingPart.audioAt - p1.endAt;
+  assert.ok(gap >= 700, `part 2 started ${gap} ms after part 1 ended (on 9e9abb8: at once)`);
+  assert.ok(gap < 2000, `and not the old 6 s wait (${gap} ms)`);
+  await c.hangUp();
+});
+
+test('ROUND 3 3 (N2): "Hello? Who is this?" and "This is she." said over "Hi — is this Holly?" are in the call\'s history after part 1 and before part 2, as on main', async () => {
+  setEnv(LIVE);
+  const mk = (n) => outboundCall(n, { from: HOLLY, ctx: { ...checkinCtx(), greetingBuf: Buffer.alloc(Math.round(1.4 * SEC), GREET_BYTE), greeting2Buf: Buffer.alloc(2 * SEC, GREET_BYTE) } });
+  const who = await mk(303);
+  const she = await mk(304);
+  const over = async (c, text, fromStartMs, endMs) => {
+    await kadesHello(c);
+    await until(() => c.session._greetingStarted && c.session._greetingPart, 3000, 'part 1 started');
+    const p1 = c.session._greetingPart;
+    await sleep(Math.max(0, p1.audioAt + fromStartMs - Date.now()));
+    await c.say(text, endMs);
+    await until(() => saidPart2(c), 9000, 'part 2 started');
+    c.text = text;
+  };
+  await Promise.all([over(who, 'Hello? Who is this?', 300, 300), over(she, 'This is she.', 1100, 250)]);
+  for (const c of [who, she]) {
+    const h = c.session.history;
+    const iUser = h.findIndex((m) => m.role === 'user' && m.content === c.text);
+    const iP1 = h.findIndex((m) => m.role === 'assistant' && m.content === c.ctx.greeting);
+    const iP2 = h.findIndex((m) => m.role === 'assistant' && m.content === c.ctx.greeting2);
+    assert.ok(iUser >= 0, `"${c.text}" is in the history: ${JSON.stringify(h.map((m) => m.content))}`);
+    assert.ok(iP1 < iUser && iUser < iP2, `after part 1, before part 2: ${JSON.stringify(h.map((m) => m.content))}`);
+    assert.equal(h.filter((m) => m.role === 'user' && /^Hello\?$/.test(m.content)).length, 0, 'her pickup hello alone is not saved');
+  }
+  for (const c of [who, she]) await c.hangUp();
+});
+
+test('ROUND 3 4 (N1): the quick part 2 is never for a part 1 that opens with the A I disclosure, by the call\'s flag or by its words; a family part 1 still has it', () => {
+  const now = Date.now();
+  const part = (text) => ({ audioAt: now - 3000, askAt: now - 500, endAt: now + 2000, done: false, text, last: false });
+  const fam = { _greetingPart: part('Hi — is this Holly?') };
+  const bizText = { _greetingPart: part(PART1) };
+  const bizFlag = { _greetingPart: part('Is this Tony\'s Pizza?'), _part1Disclosed: true };
+  assert.equal(T.noteWordsOverPart1(fam, now - 1000, now - 500, now - 600), true);
+  assert.equal(T.noteWordsOverPart1(bizText, now - 1000, now - 500, now - 600), false);
+  assert.equal(T.noteWordsOverPart1(bizFlag, now - 1000, now - 500, now - 600), false);
+});

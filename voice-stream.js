@@ -2262,14 +2262,38 @@ function notePickupWords(session, text) {
 function noteWordsOverPart1(session, began, ended, wordsAt) {
   const part = session._greetingPart;
   if (!part || part.last || session._part2Started || businessOnlyRound()) return false;
+  /* Third verification round (N1): only the short family / check-in part 1 ("Hi — is this Holly?").
+   * A part 1 that opens with the A I disclosure (a business, or a check-in to a number nobody
+   * registered) is long, and its "Is this Shell on Main?" comes last: a stray "You." or an early
+   * "Hello?" in the middle of it brought part 2 about 0.5 s after the question, before anyone could
+   * answer. Those calls keep main's wait for the answer. */
+  if (session._part1Disclosed || DISCLOSED_PART1_RE.test(part.text || '')) return false;
   if (began < part.audioAt && (wordsAt || ended) < part.audioAt + envMs('KADE_OUTBOUND_PICKUP_GRACE_MS', 700)) return false;
   session._part1WordsEndAt = Math.max(session._part1WordsEndAt || 0, ended);
   return true;
 }
-/** When part 2 should play after words noted by noteWordsOverPart1 (ms from now), or null. */
+const DISCLOSED_PART1_RE = /\bA ?I assistant\b/i;
+/* N2: "This is she." or "Hello? Who is this?" said over part 1 goes into the call's history, as on
+ * main (where it was taken as the answer to "is this ...?" and saved). After part 1, before part 2.
+ * A hello alone or a stray word of line noise is not saved. */
+function savePart1Words(session, text, began) {
+  const part = session._greetingPart;
+  if (part && began < part.audioAt) return notePickupWords(session, text); // begun before part 1: their pickup, before it
+  const kind = greetingWordKind(text, session.agentName);
+  // A sentence of short words ("This is she.") reads as noise to greetingWordKind; one stray word does not.
+  const sentence = kind === 'noise' && String(text).trim().split(/\s+/).length >= 3;
+  if (kind === 'hello' || (kind === 'noise' && !sentence)) return false;
+  session.history.push({ role: 'user', content: text });
+  return true;
+}
+/** When part 2 should play after words noted by noteWordsOverPart1 (ms from now), or null. It counts
+ *  from the LATER of the end of those words and the end of part 1 (N1): words over the middle of
+ *  part 1 never bring part 2 sooner than about 1 s after part 1's question. */
 function part2Delay(session) {
   if (!session._part1WordsEndAt) return null;
-  return Math.max(0, session._part1WordsEndAt + envMs('KADE_OUTBOUND_PART2_AFTER_MS', 1000) - Date.now());
+  const part = session._greetingPart;
+  const p1End = part && !part.last ? part.endAt : 0;
+  return Math.max(0, Math.max(session._part1WordsEndAt, p1End) + envMs('KADE_OUTBOUND_PART2_AFTER_MS', 1000) - Date.now());
 }
 
 /* Second verification round: someone who was talking before the greeting started (it starts at the
@@ -2970,15 +2994,16 @@ async function handleUtterance(session, text) {
         verdict = 'hold';
       }
       if (verdict === 'pickup') {
-        const kept = notePickupWords(session, text);
         session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended); // verification round: the pickup chain
-        noteWordsOverPart1(session, began, ended, wordsAt); // second verification round: part 2 comes soon after them
+        // Second verification round: part 2 comes soon after them. N2: kept after part 1, as on main.
+        const over = noteWordsOverPart1(session, began, ended, wordsAt);
+        const kept = over ? savePart1Words(session, text, began) : notePickupWords(session, text);
         console.log(`[voice-stream] pickup words, not an answer (${kept ? 'kept as what they said first' : 'a hello'}): ${textReceipt(text)}`);
         if (session._startGreeting) session._startGreeting(text); // family calls round: a machine's message waits for the verdict
         return;
       }
       if (verdict === 'drop') {
-        noteWordsOverPart1(session, began, ended, wordsAt);
+        if (noteWordsOverPart1(session, began, ended, wordsAt)) savePart1Words(session, text, began);
         console.log(`[voice-stream] said over the greeting, nothing to answer: ${textReceipt(text)}`);
         return;
       }
@@ -2997,13 +3022,13 @@ async function handleUtterance(session, text) {
     if (firstRound) {
       const verdict = greetingWordsVerdict(session, text, began);
       if (verdict === 'pickup' || verdict === 'drop') {
-        if (verdict === 'pickup') {
-          notePickupWords(session, text);
-          session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended);
-        }
+        if (verdict === 'pickup') session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended);
         /* Second verification round: said over "is this ...?" and not its answer. Part 2 (who is
          * calling) follows about 1 s after these words end, not 6 s after part 1. */
-        const soon = noteWordsOverPart1(session, began, ended, wordsAt) ? part2Delay(session) : null;
+        const over = noteWordsOverPart1(session, began, ended, wordsAt);
+        if (over) savePart1Words(session, text, began);
+        else if (verdict === 'pickup') notePickupWords(session, text);
+        const soon = over ? part2Delay(session) : null;
         if (soon !== null && session._schedulePart2) session._schedulePart2(soon);
         console.log(verdict === 'pickup'
           ? `[voice-stream] pickup words while waiting for "is this ...?", ${soon !== null ? `part 2 in ${soon} ms` : 'still waiting'}: ${textReceipt(text)}`
@@ -5154,6 +5179,7 @@ function attachMediaStreams(server, users, cfg) {
             // open with the A I greeting only. Since the evening of Nov 14 the new first exchange runs on
             // every outbound call, family calls and check-ins too (firstRoundOn).
             session._strangerGreeting = strangerGreetingCall(outboundCtx);
+            session._part1Disclosed = outboundCtx.disclosed === true; // N1: part 2's quick follow is not for these
             session.outboundSuffix = buildOutboundSuffix(outboundCtx, { firstRound: firstRoundOn(session) });
             /* Nov 14 2026: a business or stranger call is not a talk with whoever the dialed
              * number belongs to in the registry. Kade's test dialed her own number as "the gas
