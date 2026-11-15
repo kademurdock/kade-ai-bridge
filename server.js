@@ -6371,6 +6371,14 @@ try {
   attachScenema(app, { bridgeSecretOk, notifySecretOk, runNotify });
 } catch (e) { console.warn('[scenema] attach failed (bridge unaffected):', e.message); }
 
+// Open voices (Nov 15 2026): VoxCPM2 and Ming on RunPod serverless, one job shape
+// (design from a description, or speak with a clip). Kill switch OPEN_VOICES_ENABLED=0;
+// VOXCPM_ENDPOINT_ID defaults to dewjq1ibxkp2c3, MING_ENDPOINT_ID has no default.
+try {
+  const { attachOpenVoices } = require('./open-voices');
+  attachOpenVoices(app, { bridgeSecretOk, notifySecretOk });
+} catch (e) { console.warn('[open-voices] attach failed (bridge unaffected):', e.message); }
+
 // NVDA Agent lane (Aug 14 2026): her own relay + the screen-reader-driving
 // agent, folded in per her choice. Additive + fail-soft; kill switch
 // NVDA_AGENT_ENABLED=0. Endpoints /nvda/{start,confirm,stop,status,transcript}.
