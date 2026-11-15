@@ -51,6 +51,89 @@ const ENGINES = {
   },
 };
 
+/* Ming's extra controls (worker ming_contract.py). Ming runs one task per take and refuses a mix,
+ * so the bridge checks the same rules first and says them plainly:
+ *   design: `voice` (a built-in voice) instead of a description -> ip.
+ *   clone:  `emotion` -> emotion; `speed` / `pitch` / `volume` -> basic; `style` -> freeform; one of
+ *           the three per take. prompt_text -> seed, or paralinguistic when the words carry sound
+ *           tags, or multilingual for de es fr ko ja (`language`). Tags and those languages need
+ *           prompt_text and no style or controls.
+ * Built-in voices: upstream tts_tasks.EN_IP_VOICES at a39b806 (inclusionAI/Ming-3.0-tts), plus the
+ * two Chinese voices its README recommends. Never sent to VoxCPM2. */
+const MING = {
+  voices: ['US_Emma', 'UK_George', 'UK_Charlotte', '灵小柔', '灵楷'],
+  emotions: ['happy', 'sad', 'angry', 'neutral', 'surprised', 'fearful', 'disgusted'],
+  speeds: ['slow', 'medium', 'fast'],
+  levels: ['low', 'medium', 'high'],
+  languages: ['en', 'zh', 'de', 'es', 'fr', 'ko', 'ja'],
+  /* ming_tiny.task_protocol.PARALINGUISTIC_TAGS, and the other spellings the worker rewrites. */
+  tags: ['[Breathing]', '[Cough]', '[Sigh]', '[Laughter]', '[Surprise-ah]', '[Surprise-oh]', '[Dissatisfaction-hnn]', '[Uhm]',
+    '[Confirmation-en]', '[Question-ei]', '[Question-ah]', '[Question-en]', '[Question-oh]', '[Question-huh]'],
+  aliases: ['laugh', 'laughs', 'laughing', 'chuckle', 'chuckles', 'giggle', 'giggles', 'sighs', 'sighing', 'coughs', 'coughing',
+    'breath', 'breathes', 'breathe', 'inhale', 'inhales', 'exhale', 'exhales', 'um', 'uh', 'umm', 'hmm', 'huh'],
+};
+const LANGUAGE_NAMES = { en: 'English', zh: 'Chinese', de: 'German', es: 'Spanish', fr: 'French', ko: 'Korean', ja: 'Japanese' };
+const MING_FIELDS = ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language'];
+const TAG_RE = /\[([A-Za-z][A-Za-z -]{0,30})\]/g; // the worker's own pattern; anything else is read as words
+const KNOWN_TAG = new Set([...MING.tags.map((t) => t.slice(1, -1).toLowerCase()), ...MING.aliases]);
+const NO_MIX = 'no style, emotion, speed, pitch or volume';
+const WORDS_CLIP = 'a clip of thirty seconds or less whose words are typed in';
+
+/* Sound tags in the words: { tags, unknown } (unknown = the first bracketed word Ming does not know). */
+function soundTags(text) {
+  const tags = [];
+  let unknown = '';
+  for (const m of String(text || '').matchAll(TAG_RE)) {
+    if (KNOWN_TAG.has(m[1].trim().toLowerCase())) tags.push(m[0]);
+    else if (!unknown) unknown = m[0];
+  }
+  return { tags, unknown };
+}
+
+/* The Ming controls of a booth request -> fields for the worker input, or { error }. `input` already
+ * holds mode, description or style and prompt_text. Empty values mean "not set". */
+function mingControls(engine, b, input) {
+  const set = {};
+  for (const k of MING_FIELDS) {
+    const v = typeof b[k] === 'string' ? b[k].trim() : b[k];
+    if (v !== undefined && v !== null && v !== '') set[k] = v;
+  }
+  const { tags, unknown } = engine === 'ming' ? soundTags(input.text) : { tags: [] };
+  if (engine !== 'ming') return Object.keys(set).length ? { error: 'Built-in voices, emotion, speed, pitch, volume and language work only with Ming.' } : { fields: {} };
+  if (unknown) return { error: `Ming does not know the sound tag ${unknown}. Pick one from Sound tags, or take it out.` };
+  const lower = (k) => (typeof set[k] === 'string' ? set[k].toLowerCase() : set[k]);
+  const checks = [['voice', MING.voices, 'Pick a built-in voice from the list.'], ['emotion', MING.emotions, 'Pick an emotion from the list.'],
+    ['speed', MING.speeds, 'Pick slow, medium or fast for the speed.'], ['pitch', MING.levels, 'Pick low, medium or high for the pitch.'],
+    ['volume', MING.levels, 'Pick low, medium or high for the volume.'], ['language', MING.languages, 'Pick a language from the list.']];
+  const fields = {};
+  for (const [k, allowed, said] of checks) {
+    if (!(k in set)) continue;
+    const v = k === 'voice' ? set[k] : lower(k);
+    if (typeof v !== 'string' || !allowed.includes(v)) return { error: said };
+    fields[k] = v;
+  }
+  const level = !!(fields.speed || fields.pitch || fields.volume);
+  const controls = !!(fields.emotion || level);
+  if (input.mode === 'design') {
+    if (controls || fields.language) return { error: 'Emotion, speed, pitch, volume and language are for Speak with a voice.' };
+    if (tags.length) return { error: `Sound tags need Speak with a voice, with ${WORDS_CLIP}.` };
+    if (fields.voice && input.description) return { error: 'Use a built-in voice or a description, not both. Clear one of them.' };
+    return { fields };
+  }
+  if (fields.voice) return { error: 'Built-in voices are for Design a voice.' };
+  if ([fields.emotion, level, input.style].filter(Boolean).length > 1) {
+    return { error: 'Ming takes one of these per take: a style, an emotion, or speed, pitch and volume. Clear the others.' };
+  }
+  if (tags.length && (controls || input.style)) return { error: `Sound tags work only with ${NO_MIX}. Clear those, or take the tags out.` };
+  if (tags.length && !input.prompt_text) return { error: `Sound tags need ${WORDS_CLIP}. Take the tags out, or use such a clip.` };
+  if (fields.language && !['en', 'zh'].includes(fields.language)) {
+    const name = LANGUAGE_NAMES[fields.language];
+    if (controls || input.style) return { error: `${name} works only with ${NO_MIX}. Clear those, or set the language back.` };
+    if (!input.prompt_text) return { error: `${name} needs ${WORDS_CLIP}. Use such a clip, or set the language back.` };
+  }
+  return { fields };
+}
+
 const LIVE = ['queued', 'running', 'filing'];
 const isLive = (j) => LIVE.includes(j.state);
 
@@ -101,9 +184,10 @@ function buildInput(engine, b = {}, env = process.env) {
   const input = { mode, text };
   if (mode === 'design') {
     const description = oneLine(b.description);
-    if (!description) return { error: 'Describe the voice first.' };
+    const builtIn = engine === 'ming' && typeof b.voice === 'string' && b.voice.trim();
+    if (!description && !builtIn) return { error: engine === 'ming' ? 'Describe the voice first, or pick a built-in voice.' : 'Describe the voice first.' };
     if (description.length > e.maxPrefix) return { error: `The description is too long. The most is ${e.maxPrefix} characters.` };
-    input.description = description;
+    if (description) input.description = description;
   } else {
     const url = typeof b.reference_voice_url === 'string' ? b.reference_voice_url.trim() : '';
     if (!url) return { error: 'Pick a saved voice or a clip first.' };
@@ -116,6 +200,9 @@ function buildInput(engine, b = {}, env = process.env) {
     if (promptText.length > MAX_PROMPT_TEXT) return { error: `The clip's words are too long. The most is ${MAX_PROMPT_TEXT} characters.` };
     if (promptText) input.prompt_text = promptText;
   }
+  const ming = mingControls(engine, b, input);
+  if (ming.error) return { error: ming.error };
+  Object.assign(input, ming.fields);
   /* Every try is a new take: a fresh seed, unless she typed one. */
   const typed = b.seed;
   const seed = typeof typed === 'string' && /^\d+$/.test(typed.trim()) ? Number(typed.trim()) : typed;
@@ -211,12 +298,13 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
   async function postAsset(job, out, costUSD) {
     if (!USAGE_SECRET) return;
     const e = ENGINES[job.engine];
-    const prompt = job.mode === 'design' ? `${job.description}\n\n${job.text}` : job.text;
+    const voice = job.controls && job.controls.voice;
+    const prompt = job.mode === 'design' ? `${job.description || `Built-in voice ${voice}`}\n\n${job.text}` : job.text;
     try {
       await http.post(`${FORK_URL}/api/kade/asset-event`, { secret: USAGE_SECRET, userId: job.userId, kind: 'audio', service: e.service,
         url: out.url, prompt, model: e.model, costUSD,
         metadata: { jobId: job.id, openVoice: { engine: job.engine, mode: job.mode, seed: out.seed, description: job.description || undefined,
-          style: job.style || undefined, words: job.text.slice(0, 1000), seconds: out.duration_seconds },
+          style: job.style || undefined, words: job.text.slice(0, 1000), seconds: out.duration_seconds, ...(job.controls ? { controls: job.controls } : {}) },
         durationS: out.duration_seconds, seed: out.seed, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, engine: e.label, agent: 'Sound Booth' } },
       { headers: { 'User-Agent': UA }, timeout: 15000 });
     } catch (err) { console.warn('[open-voices] asset post failed:', err.message); }
@@ -239,6 +327,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     const input = { ...built.input }; // exactly the worker contract's fields; the user id stays here
     const job = { id: `ov_${now().toString(36)}${crypto.randomBytes(3).toString('hex')}`, userId, engine, mode: input.mode,
       text: input.text, description: input.description || '', style: input.style || '', seed: input.seed,
+      ...(MING_FIELDS.some((k) => input[k]) ? { controls: Object.fromEntries(MING_FIELDS.filter((k) => input[k]).map((k) => [k, input[k]])) } : {}),
       hasPromptText: !!input.prompt_text, state: 'queued', createdAt: new Date(now()).toISOString(), runpodId: null,
       coldLikely: coldLikely(cap), result: null, error: null, costUSD: null };
     try {
@@ -434,4 +523,4 @@ function attachOpenVoices(app, d = {}, opts = {}) {
   return lane;
 }
 
-module.exports = { attachOpenVoices, createOpenVoices, buildInput, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, SEED_MAX };
+module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, SEED_MAX };

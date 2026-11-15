@@ -256,3 +256,86 @@ test('worker errors reach her as plain sentences', () => {
     assert.equal(/RuntimeError|reference_voice_url|prompt_text/.test(ov.plainError({ error: m })), false, m);
   }
 });
+
+/* ---------- Ming's own controls (worker ming_contract.py) ---------- */
+
+test('Ming design: a built-in voice instead of a description; never both', () => {
+  const r = ov.buildInput('ming', { mode: 'design', voice: 'US_Emma', text: 'Hello.', seed: 3 });
+  assert.deepEqual(r.input, { mode: 'design', text: 'Hello.', voice: 'US_Emma', seed: 3 });
+  for (const v of ['UK_George', 'UK_Charlotte', '灵小柔', '灵楷']) assert.equal(ov.buildInput('ming', { mode: 'design', voice: v, text: 'Hi' }).input.voice, v);
+  assert.match(ov.buildInput('ming', { mode: 'design', voice: 'US_Emma', description: 'warm', text: 'Hi' }).error, /built-in voice or a description, not both/);
+  assert.match(ov.buildInput('ming', { mode: 'design', voice: 'Somebody', text: 'Hi' }).error, /Pick a built-in voice/);
+  assert.match(ov.buildInput('ming', { mode: 'design', text: 'Hi' }).error, /or pick a built-in voice/);
+  assert.match(ov.buildInput('ming', { mode: 'design', description: 'd', text: 'Hi', emotion: 'happy' }).error, /are for Speak with a voice/);
+  assert.match(ov.buildInput('ming', { mode: 'design', description: 'd', text: 'Hi', language: 'de' }).error, /are for Speak with a voice/);
+  assert.match(ov.buildInput('ming', { mode: 'design', description: 'd', text: 'Hi [Laughter]' }).error, /Sound tags need Speak with a voice/);
+  assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, voice: 'US_Emma', text: 'Hi' }).error, /for Design a voice/);
+});
+
+test('Ming speak: one of style, emotion, or speed/pitch/volume, passed as the worker names them', () => {
+  const base = { mode: 'speak', reference_voice_url: CLIP, text: 'Words', seed: 1 };
+  assert.deepEqual(ov.buildInput('ming', { ...base, emotion: 'Happy' }).input, { mode: 'clone', text: 'Words', reference_voice_url: CLIP, emotion: 'happy', seed: 1 });
+  assert.deepEqual(ov.buildInput('ming', { ...base, speed: 'fast', pitch: 'low', volume: '' }).input,
+    { mode: 'clone', text: 'Words', reference_voice_url: CLIP, speed: 'fast', pitch: 'low', seed: 1 });
+  assert.equal(ov.buildInput('ming', { ...base, style: 'cheerful', emotion: '', speed: null }).input.style, 'cheerful');
+  for (const mix of [{ emotion: 'sad', speed: 'slow' }, { emotion: 'sad', style: 'calm' }, { volume: 'high', style: 'calm' }]) {
+    assert.match(ov.buildInput('ming', { ...base, ...mix }).error, /one of these per take/, JSON.stringify(mix));
+  }
+  assert.match(ov.buildInput('ming', { ...base, emotion: 'bored' }).error, /Pick an emotion/);
+  assert.match(ov.buildInput('ming', { ...base, speed: 'very fast' }).error, /slow, medium or fast/);
+  assert.match(ov.buildInput('ming', { ...base, pitch: 'loud' }).error, /low, medium or high for the pitch/);
+  assert.match(ov.buildInput('ming', { ...base, language: 'it' }).error, /Pick a language/);
+});
+
+test('Ming sound tags need the clip words and nothing else; an unknown tag is refused plainly', () => {
+  const base = { mode: 'speak', reference_voice_url: CLIP, seed: 1 };
+  const ok = ov.buildInput('ming', { ...base, text: 'Well [Sigh] fine. [laughs]', prompt_text: 'what the clip says' });
+  assert.equal(ok.error, undefined);
+  assert.equal(ok.input.prompt_text, 'what the clip says');
+  assert.deepEqual(ov.soundTags('Hi [Uhm] there [Question-huh] [chuckles]').tags, ['[Uhm]', '[Question-huh]', '[chuckles]']);
+  assert.equal(ov.MING.tags.length, 14);
+  assert.match(ov.buildInput('ming', { ...base, text: 'Well [Sigh] fine.' }).error, /Sound tags need a clip of thirty seconds or less whose words are typed in/);
+  assert.match(ov.buildInput('ming', { ...base, text: 'Well [Sigh] fine.', prompt_text: 'p', style: 'calm' }).error, /Sound tags work only with no style/);
+  assert.match(ov.buildInput('ming', { ...base, text: 'Well [Sigh] fine.', prompt_text: 'p', emotion: 'sad' }).error, /Sound tags work only with no style/);
+  assert.match(ov.buildInput('ming', { ...base, text: 'Well [Yawn] fine.', prompt_text: 'p' }).error, /does not know the sound tag \[Yawn\]/);
+  assert.match(ov.buildInput('ming', { mode: 'design', description: 'd', text: 'A [Yawn]' }).error, /\[Yawn\]/);
+  assert.equal(ov.buildInput('ming', { ...base, text: 'Chapter [3] and [x1]' }).error, undefined, 'only the worker pattern counts as a tag');
+});
+
+test('Ming languages: German and the rest need the clip words and no other control; English and Chinese pass', () => {
+  const base = { mode: 'speak', reference_voice_url: CLIP, text: 'Guten Tag.', seed: 1 };
+  assert.deepEqual(ov.buildInput('ming', { ...base, language: 'DE', prompt_text: 'Hello there.' }).input,
+    { mode: 'clone', text: 'Guten Tag.', reference_voice_url: CLIP, prompt_text: 'Hello there.', language: 'de', seed: 1 });
+  assert.match(ov.buildInput('ming', { ...base, language: 'de' }).error, /^German needs a clip of thirty seconds or less/);
+  assert.match(ov.buildInput('ming', { ...base, language: 'ja', prompt_text: 'p', speed: 'slow' }).error, /^Japanese works only with no style/);
+  assert.equal(ov.buildInput('ming', { ...base, language: 'en', emotion: 'happy' }).input.language, 'en');
+});
+
+test('VoxCPM2 is unchanged and refuses Ming controls plainly', () => {
+  const v = ov.buildInput('voxcpm', { mode: 'speak', reference_voice_url: CLIP, text: 'Words [Laughter] [Yawn]', seed: 2 });
+  assert.deepEqual(v.input, { mode: 'clone', text: 'Words [Laughter] [Yawn]', reference_voice_url: CLIP, seed: 2 });
+  for (const k of ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language']) {
+    assert.match(ov.buildInput('voxcpm', { mode: 'speak', reference_voice_url: CLIP, text: 'W', [k]: 'x' }).error, /work only with Ming/, k);
+  }
+  assert.equal(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'W', emotion: '' }).error, undefined, 'an empty control is not set');
+});
+
+test('lane: a Ming take sends exactly the worker fields and files its controls', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let done = false;
+  const out = { url: 'https://s3.us-east-005.backblazeb2.com/b/ming/x.mp3?sig', wav_url: 'https://s3.us-east-005.backblazeb2.com/b/ming/x.wav?sig', key: 'ming/x.mp3', wav_key: 'ming/x.wav', duration_seconds: 2, sample_rate: 44100, mode: 'design', seed: 8, engine: 'ming-3.0-tts-tiny' };
+  const http = fakeHttp({
+    get: (url) => url.endsWith('/health') ? { workers: { idle: 1 } } : done ? { status: 'COMPLETED', executionTime: 2000, output: out } : { status: 'IN_PROGRESS' },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-m', status: 'IN_QUEUE' } : { ok: true },
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k', MING_ENDPOINT_ID: 'ming0001', KADE_USAGE_EVENT_SECRET: 's', FORK_USAGE_URL: 'https://fork.test' }, http, dataDir: dir });
+  const r = await lane.start({ engine: 'ming', userId: 'u1', mode: 'design', voice: 'UK_George', text: 'Good evening.', seed: 8, emotion: '' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(http.calls.find((c) => c.url.endsWith('/run')).body.input, { mode: 'design', text: 'Good evening.', voice: 'UK_George', seed: 8 });
+  done = true;
+  await lane.pump();
+  const asset = http.calls.find((c) => c.url.endsWith('/asset-event'));
+  assert.deepEqual(asset.body.metadata.openVoice.controls, { voice: 'UK_George' });
+  assert.equal(asset.body.prompt, 'Built-in voice UK_George\n\nGood evening.');
+});
