@@ -72,6 +72,13 @@ const MING = {
   aliases: ['laugh', 'laughs', 'laughing', 'chuckle', 'chuckles', 'giggle', 'giggles', 'sighs', 'sighing', 'coughs', 'coughing',
     'breath', 'breathes', 'breathe', 'inhale', 'inhales', 'exhale', 'exhales', 'um', 'uh', 'umm', 'hmm', 'huh'],
 };
+/* Spoken names for the built-in voices (the fork's MING_CONTROLS labels), so My Creations reads
+ * "Built-in voice: Ling Xiaorou, Chinese, young woman", not raw ids a screen reader stumbles on.
+ * The raw id stays in metadata.openVoice.controls. */
+const VOICE_LABELS = {
+  US_Emma: 'Emma, American English, woman', UK_George: 'George, British English, man', UK_Charlotte: 'Charlotte, British English, woman',
+  '\u7075\u5c0f\u67d4': 'Ling Xiaorou, Chinese, young woman', '\u7075\u6977': 'Ling Kai, Chinese, young man',
+};
 const LANGUAGE_NAMES = { en: 'English', zh: 'Chinese', de: 'German', es: 'Spanish', fr: 'French', ko: 'Korean', ja: 'Japanese' };
 const MING_FIELDS = ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language'];
 const TAG_RE = /\[([A-Za-z][A-Za-z -]{0,30})\]/g; // the worker's own pattern; anything else is read as words
@@ -299,7 +306,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (!USAGE_SECRET) return;
     const e = ENGINES[job.engine];
     const voice = job.controls && job.controls.voice;
-    const prompt = job.mode === 'design' ? `${job.description || `Built-in voice ${voice}`}\n\n${job.text}` : job.text;
+    const prompt = job.mode === 'design' ? `${job.description || `Built-in voice: ${VOICE_LABELS[voice] || voice}`}\n\n${job.text}` : job.text;
     try {
       await http.post(`${FORK_URL}/api/kade/asset-event`, { secret: USAGE_SECRET, userId: job.userId, kind: 'audio', service: e.service,
         url: out.url, prompt, model: e.model, costUSD,
@@ -467,7 +474,10 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
   function health() {
     return {
       enabled: ENABLED,
-      engines: Object.fromEntries(Object.keys(ENGINES).map((k) => [k, { label: ENGINES[k].label, configured: ready(k), endpointId: endpointOf(k, env) || null }])),
+      /* `controls: true` tells the fork this bridge reads Ming's extra controls (mingControls), so
+       * the fork offers them only once this code is live. */
+      engines: Object.fromEntries(Object.keys(ENGINES).map((k) => [k, { label: ENGINES[k].label, configured: ready(k), endpointId: endpointOf(k, env) || null,
+        ...(k === 'ming' ? { controls: true } : {}) }])),
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP },
       spend: { dayUSD: spendSince(now() - 86400000), monthUSD: spendSince(now() - 30 * 86400000) },
       open: jobs.filter(isLive).length,
@@ -523,4 +533,4 @@ function attachOpenVoices(app, d = {}, opts = {}) {
   return lane;
 }
 
-module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, SEED_MAX };
+module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, VOICE_LABELS, SEED_MAX };

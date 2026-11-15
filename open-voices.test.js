@@ -168,6 +168,8 @@ test('routes: secret required, status is per owner, health names both engines', 
   const health = await (await fetch(`${url}/audio/open-voices/health?secret=test-only`)).json();
   assert.equal(health.engines.voxcpm.configured, true);
   assert.equal(health.engines.ming.configured, false);
+  assert.equal(health.engines.ming.controls, true, 'the fork offers Ming controls only when the bridge says it reads them');
+  assert.equal(health.engines.voxcpm.controls, undefined);
   const stop = await (await post('/audio/open-voices/cancel', { secret: 'test-only', jobId: started.jobId, userId: 'u1' })).json();
   assert.equal(stop.state, 'cancelled');
 });
@@ -337,5 +339,10 @@ test('lane: a Ming take sends exactly the worker fields and files its controls',
   await lane.pump();
   const asset = http.calls.find((c) => c.url.endsWith('/asset-event'));
   assert.deepEqual(asset.body.metadata.openVoice.controls, { voice: 'UK_George' });
-  assert.equal(asset.body.prompt, 'Built-in voice UK_George\n\nGood evening.');
+  assert.equal(asset.body.prompt, 'Built-in voice: George, British English, man\n\nGood evening.');
+});
+
+test('every built-in voice has a spoken name for My Creations', () => {
+  for (const v of ov.MING.voices) assert.ok(ov.VOICE_LABELS[v], v);
+  assert.equal(ov.VOICE_LABELS['\u7075\u5c0f\u67d4'], 'Ling Xiaorou, Chinese, young woman');
 });
