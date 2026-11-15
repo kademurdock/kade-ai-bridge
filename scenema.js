@@ -42,6 +42,9 @@ const path = require('path');
 const axios = require('axios');
 const express = require('express');
 const { audioDiagnostics, privateSample } = require('./scenema-diagnostics');
+/* Nov 14 2026: Change words. One change per job, sent as data, one take per seed, and the take
+ * that says the new words is the one kept (auk-words.js, CONTRACT.md in the work folder). */
+const aukWords = require('./auk-words');
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
 const JOBS_FILE = path.join(DATA_DIR, 'scenema-jobs.json');
@@ -269,15 +272,37 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   const open = jobs.find((j) => j.userId === userId && (j.state === 'queued' || j.state === 'running'));
   if (open) return { error: `one render at a time: ${open.id} is still ${open.state}`, jobId: open.id };
 
-  if (options.auk_task === 'edit' && (!options.reference_voice_url || !String(options.instruction || '').trim())) return { error: 'Import a recording and describe the edit first.' };
+  /* A word edit carries oldText/newText; anything else that is an edit carries an instruction. */
+  const wordsAsked = options.auk_task === 'edit' && (options.oldText != null || options.newText != null);
+  let wordEdit = null;
+  if (wordsAsked) {
+    if (!IS_AUK) return { error: 'Changing words needs the AuK worker.' };
+    const checked = aukWords.wordEditInput(options);
+    if (checked.error) return { error: checked.error };
+    wordEdit = checked.edit;
+  }
+  if (options.auk_task === 'edit' && (!options.reference_voice_url || (!wordEdit && !String(options.instruction || '').trim()))) return { error: 'Import a recording and describe the edit first.' };
   if (options.gen_seconds != null && (!Number.isFinite(options.gen_seconds) || options.gen_seconds <= 0)) return { error: 'Target seconds must be positive.' };
   const input = { prompt, out_prefix: userId };
   if (IS_AUK) {
     input.auk_task = options.auk_task === 'edit' ? 'edit' : 'speech';
-    input.instruction = String(options.instruction || '').slice(0, MAX_PROMPT);
-    if (options.gen_seconds != null) input.gen_seconds = options.gen_seconds;
+    /* A word edit's instruction is AuK's own template, built here from the two boxes, never text
+     * she typed. It is sent for a worker that predates the word fields; the new worker builds the
+     * same template from kind/oldText/newText itself. */
+    input.instruction = wordEdit
+      ? aukWords.wordTemplate(wordEdit.kind, wordEdit.oldText, wordEdit.newText)
+      : String(options.instruction || '').slice(0, MAX_PROMPT);
+    if (wordEdit) {
+      Object.assign(input, { kind: wordEdit.kind, oldText: wordEdit.oldText, newText: wordEdit.newText,
+        rangeStart: wordEdit.rangeStart, rangeEnd: wordEdit.rangeEnd, seeds: wordEdit.seeds,
+        /* The worker's own names for the same change (worker auk_edit.py, Nov 14 2026), and for an
+         * older worker the range as its edit window and the first seed as its one seed. */
+        edit_kind: wordEdit.kind, old_words: wordEdit.oldText, new_words: wordEdit.newText,
+        edit_start: wordEdit.rangeStart, edit_end: wordEdit.rangeEnd, seed: wordEdit.seeds[0] });
+    }
+    if (options.gen_seconds != null && !wordEdit) input.gen_seconds = options.gen_seconds;
     for (const key of ['edit_start', 'edit_end']) {
-      if (options[key] != null) {
+      if (options[key] != null && !wordEdit) {
         if (!Number.isFinite(options[key]) || options[key] < 0) return { error: 'Edit start and end must be valid seconds.' };
         input[key] = options[key];
       }
@@ -290,7 +315,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
   if (typeof ref === 'string' && /^https?:\/\/\S+$/i.test(ref) && ref.length < 2048) input.reference_voice_url = ref;
   if (options.background_sfx === true) input.background_sfx = true;
   if (options.mode === 'voice_design') input.mode = 'voice_design';
-  if (Number.isInteger(options.seed) && options.seed >= 0) input.seed = options.seed;
+  if (Number.isInteger(options.seed) && options.seed >= 0 && !wordEdit) input.seed = options.seed;
   if (typeof options.pace === 'number' && options.pace >= 0.5 && options.pace <= 3) input.pace = options.pace;
   if (options.keep_wav === true) input.keep_wav = true;
   /* Oct 2 2026: a private opening take sets the voice so the description is
@@ -317,6 +342,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
      * fills her gallery with five files and only one of them is the story.
      * Spend is still logged; only the gallery row is skipped. */
     suppressAsset: options.suppressAsset === true,
+    ...(wordEdit ? { wordEdit } : {}),
   };
   jobs.push(job); saveJobs();
   // words → a rough length estimate for the caller: ~2.6 words/s spoken, render ≈ 1.4× that at bf16
@@ -362,6 +388,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
       renderSeconds: null, renderSecondsWarm: null, renderSecondsCold: null, costUSD: null,
       spokenWait: `AuK HQ uses a sleeping GPU, billed at up to $${RATE_PER_HR.toFixed(2)} per hour while active. Startup and processing are billed. A reliable wait and total cost estimate is not available yet.`,
     });
+    if (wordEdit) job.estimate.spokenWait += ` It makes ${wordEdit.seeds.length} take${wordEdit.seeds.length === 1 ? '' : 's'} of this change and keeps one that says the new words.`;
   }
   saveJobs();
   submit(input).then(async (r) => {
@@ -382,6 +409,30 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     await notifyFail(job);
   });
   return { ok: true, jobId: job.id, estimate: job.estimate };
+}
+
+/* ---------- Change words: the take that is kept ----------
+ * Returns { out } with the kept take's fields in the shape the rest of the pump reads, or
+ * { done: true } when the job has already been ended here (no take said the new words). */
+async function pickWordTake(job, out, s) {
+  const candidates = aukWords.candidatesOf(out);
+  const { best, report } = await aukWords.rankCandidates(candidates, job.wordEdit, { axios, env: process.env });
+  job.editReport = report;
+  if (best) {
+    return { out: { ...out, url: best.url || best.audio_url, wav_url: best.wav_url, key: best.key, wav_key: best.wav_key,
+      seed: Number.isInteger(best.seed) ? best.seed : out.seed, duration_s: best.duration_s ?? out.duration_s, bytes: best.bytes ?? out.bytes } };
+  }
+  /* No take said the new words. The GPU time was spent, so it is logged and counts against the
+   * caps, but nothing reaches her library and the original stays as it was. */
+  const execS = (s.executionTime || out.processing_ms || 0) / 1000;
+  const costUSD = Math.round((execS / 3600 * RATE_PER_HR + report.listenUSD) * 1000) / 1000;
+  job.state = 'failed'; job.noMatch = true; job.error = report.spoken; job.costUSD = costUSD; job.finishedAt = new Date().toISOString();
+  job.result = { engine: out.engine || job.engine, editReport: report, executionS: execS };
+  saveJobs();
+  receipt({ jobId: job.id, userId: job.userId, state: 'no-match', executionS: execS, costUSD, takes: report.takes.length });
+  await postUsage({ userId: job.userId, seconds: execS, costUSD, metadata: { jobId: job.id, executionS: execS, wordEdit: true, matched: false, agent: job.agentName } });
+  await notifyResult(job, 'Sound Booth: the words did not change', report.spoken.slice(0, 220));
+  return { done: true };
 }
 
 /* ---------- the pump ---------- */
@@ -471,7 +522,13 @@ async function pump() {
         }
       }
       if (s.status === 'COMPLETED') {
-        const out = s.output || {};
+        let out = s.output || {};
+        /* Change words: listen to every take, keep the one that says the new words, or keep none. */
+        if (job.wordEdit && !out.error) {
+          const picked = await pickWordTake(job, out, s);
+          if (picked.done) continue;
+          out = picked.out;
+        }
         if (out.error || !out.url) {
           job.state = 'failed'; job.error = out.error || 'worker returned no url'; job.finishedAt = new Date().toISOString(); saveJobs();
           receipt({ jobId: job.id, userId: job.userId, state: 'failed', error: job.error, executionMs: s.executionTime, costUSD: Math.round(((s.executionTime || 0) / 3600000 * RATE_PER_HR) * 1000) / 1000 });
@@ -480,10 +537,12 @@ async function pump() {
         const execS = (s.executionTime || out.processing_ms || 0) / 1000;
         const delayS = (s.delayTime || 0) / 1000;
         const cold = delayS > 45; // a wake, not a warm worker
-        const costUSD = Math.round((execS / 3600 * RATE_PER_HR + (cold ? WAKE_USD : 0)) * 1000) / 1000;
+        const listenUSD = job.editReport?.listenUSD || 0;
+        const costUSD = Math.round((execS / 3600 * RATE_PER_HR + (cold ? WAKE_USD : 0) + listenUSD) * 1000) / 1000;
         job.state = 'done'; job.finishedAt = new Date().toISOString(); job.costUSD = costUSD;
         const diagnostics = audioDiagnostics(out);
-        job.result = { engine: out.engine || job.engine, wavKey: out.wav_key, wavUrl: out.wav_url, url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold, ...diagnostics };
+        job.result = { engine: out.engine || job.engine, wavKey: out.wav_key, wavUrl: out.wav_url, url: out.url, key: out.key, durationS: out.duration_s, bytes: out.bytes, seed: out.seed, processingMs: out.processing_ms, executionS: execS, delayS, cold, ...diagnostics,
+          ...(job.editReport ? { editReport: job.editReport } : {}) };
         const sample = privateSample(out, job.userId);
         if (sample) job.result.diagnosticSample = sample;
         if (out.diagnostic_sample_error === 'retention_failed') job.result.diagnosticSampleError = 'retention_failed';
@@ -492,7 +551,8 @@ async function pump() {
         console.log(`[scenema] ${job.id} done: ${out.duration_s}s audio in ${execS.toFixed(0)}s (${cold ? 'cold' : 'warm'}), $${costUSD}`);
         await postUsage({ userId: job.userId, seconds: out.duration_s || execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, words: job.estimate?.words, agent: job.agentName } });
         if (!job.suppressAsset) {
-          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio', ...diagnostics } });
+          await postAsset({ userId: job.userId, url: out.url, prompt: job.prompt, costUSD, metadata: { jobId: job.id, durationS: out.duration_s, seed: out.seed, hasReference: job.hasReference, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, agent: job.agentName, engine: job.engine || 'scenema-audio', ...diagnostics,
+            ...(job.wordEdit ? { aukTask: 'edit', wordEdit: { kind: job.wordEdit.kind, oldText: job.wordEdit.oldText, newText: job.wordEdit.newText, rangeStart: job.wordEdit.rangeStart, rangeEnd: job.wordEdit.rangeEnd, matched: !!job.editReport?.matched, checked: !!job.editReport?.checked } } : {}) } });
         }
         /* A part does not buzz her phone -- the fork does that once, after the
          * parts are joined. Five pushes for one story is not five times the
@@ -501,7 +561,8 @@ async function pump() {
           if (job.suppressAsset) { continue; }
           const mins = Math.floor((out.duration_s || 0) / 60), secs = Math.round((out.duration_s || 0) % 60);
           const len = mins ? `${mins} minute${mins === 1 ? '' : 's'} ${secs} seconds` : `${secs} seconds`;
-          await notifyResult(job, 'Your narration is ready', `${len} of audio is ready. Open the Sound Booth to play your take, or find it in My Creations.`);
+          if (job.wordEdit) await notifyResult(job, 'Your word change is ready', `${String(job.editReport?.spoken || '').slice(0, 200)} Open the Sound Booth to play it.`.trim());
+          else await notifyResult(job, 'Your narration is ready', `${len} of audio is ready. Open the Sound Booth to play your take, or find it in My Creations.`);
         } catch (e) { console.warn('[scenema] notify failed:', e.message); }
       } else if (s.status === 'FAILED' || s.status === 'CANCELLED' || s.status === 'TIMED_OUT') {
         job.state = 'failed'; job.error = /timeout|timed.out/i.test(String(s.error || s.status))
