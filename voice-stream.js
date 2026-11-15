@@ -1992,13 +1992,20 @@ function openDeepgram(session) {
  * and the single hand-over; every outbound call back on the old path), KADE_OUTBOUND_FIRST_ROUND=business
  * (only calls that open with the A I greeting run it, as on main 422e758: family calls, a character's
  * own person and check-ins back on the old path, business calls keep it), KADE_OUTBOUND_QUIET_WATCH=0
- * (the silence watch). */
+ * (the silence watch).
+ * Second verification round (Nov 14 2026, late): "business" now undoes this branch for business calls
+ * too. They get main's timing back: the 5 s wait for a talker (not 10 s), no hold for machine words,
+ * and none of the newer first-exchange rules below (businessOnlyRound). */
 function firstRoundOn(session) {
   if (!session || session.outbound !== true) return false;
   const sw = process.env.KADE_OUTBOUND_FIRST_ROUND;
   if (sw === '0') return false;
   if (sw === 'business') return session._strangerGreeting === true;
   return true;
+}
+/** KADE_OUTBOUND_FIRST_ROUND=business: the first exchange exactly as on main 422e758. */
+function businessOnlyRound() {
+  return process.env.KADE_OUTBOUND_FIRST_ROUND === 'business';
 }
 const envMs = (name, dflt) => {
   const n = parseInt(process.env[name] || '', 10);
@@ -2042,13 +2049,21 @@ function calleeTalkingNow(session) {
  * first exchange on family calls. Now, when what they said before the greeting sounds like a machine's
  * message, the greeting waits for the verdict: while the machine talks, then up to
  * KADE_OUTBOUND_VOICEMAIL_HOLD_MS (4000) after its last words, and never past
- * KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS (15000) after pickup (the greeting lock's 35 s safety valve,
- * counted from pickup, must not fire while a late greeting still plays). The verdict leaves the one voicemail
- * message (handleAmdResult). No verdict by then: the greeting starts, as it would have. A person who
- * says one of these things at pickup only waits a few seconds more for the greeting.
+ * KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS (15000) after pickup. The verdict leaves the one voicemail
+ * message (handleAmdResult). Twilio's "human" verdict ends the wait at once (second verification
+ * round: server.js /amd-status passed on only machine_end, so a person who said "can I take a
+ * message?" waited out the hold, and every later "Hello?" restarted it). No verdict by then: the
+ * greeting starts, as it would have. A person who says one of these things at pickup only waits a
+ * few seconds more for the greeting.
  * Only phrases a machine says, never a person answering: "leave a message", "after the tone",
  * "record your message", "voicemail", "mailbox", "the person you are trying to reach is not
- * available", "I'm not available", "can't come to the phone", "sorry I missed your call". */
+ * available", "4 1 7 5 5 5 ... is not available", "I'm not available", "can't come to the phone",
+ * "sorry I missed your call", "automated (or automatic) voice message".
+ * What this does NOT cover (second verification round): a machine whose message has none of these
+ * phrases, or one that Flux splits so the first piece ("Hi, you've reached Holly.") ends before the
+ * phrase, still gets the greeting over its message, and possibly into the recording until the
+ * verdict cuts it off. So "a family voicemail gets only the voicemail message" holds only when one
+ * of these phrases is heard in the machine's first turn. */
 const VOICEMAIL_CUE_RE = new RegExp([
   String.raw`\bleave (?:me |us |him |her )?(?:a |your )?(?:(?:brief|short|quick|detailed) )?(?:message|name and (?:phone )?number|voice ?mail)\b`,
   String.raw`\b(?:after|at) the (?:tone|beep)\b`,
@@ -2059,7 +2074,8 @@ const VOICEMAIL_CUE_RE = new RegExp([
   String.raw`\b(?:i|we) (?:am|are|m|re) (?:not available|unavailable)\b`,
   String.raw`\b(?:cannot|can not|can t|cant) (?:come|get) to the phone\b`,
   String.raw`\bsorry (?:i|we) (?:have |ve )?missed (?:you|your call)\b`,
-  String.raw`\bautomated voice\b`,
+  String.raw`\bautomat(?:ed|ic) voice\b`,
+  String.raw`\b\d(?:[\s-]*\d){6,}\s+(?:is|are) (?:not available|unavailable)\b`, // "4 1 7 5 5 5 0 1 4 2 is not available"
 ].join('|'));
 function voicemailCue(text) {
   const t = String(text || '').toLowerCase().replace(/[’']/g, ' ').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -2078,15 +2094,19 @@ function noteVoicemailCue(session, where) {
  */
 function greetingStartWait(session, pickupAt) {
   const now = Date.now();
-  if (!session._vmCueAt && voicemailCue(`${session._fluxTurnText || ''} ${session.finalBuf || ''}`)) noteVoicemailCue(session, 'still talking');
-  if (session._vmCueAt && now - pickupAt < envMs('KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS', 15000)) {
-    if (calleeSaysWords(session)) return 'voicemail';
-    const lastWords = Math.max(session._vmCueAt, session._fluxWordsAt || 0, session._pickupEndedAt || 0, session._lastFinalAt || 0);
-    if (now - lastWords < envMs('KADE_OUTBOUND_VOICEMAIL_HOLD_MS', 4000)) return 'voicemail';
+  // KADE_OUTBOUND_FIRST_ROUND=business: main's start (no machine-words hold, the 5 s cap).
+  const mainTiming = businessOnlyRound();
+  if (!mainTiming && !session._amdHuman) {
+    if (!session._vmCueAt && voicemailCue(`${session._fluxTurnText || ''} ${session.finalBuf || ''}`)) noteVoicemailCue(session, 'still talking');
+    if (session._vmCueAt && now - pickupAt < envMs('KADE_OUTBOUND_VOICEMAIL_MAX_WAIT_MS', 15000)) {
+      if (calleeSaysWords(session)) return 'voicemail';
+      const lastWords = Math.max(session._vmCueAt, session._fluxWordsAt || 0, session._pickupEndedAt || 0, session._lastFinalAt || 0);
+      if (now - lastWords < envMs('KADE_OUTBOUND_VOICEMAIL_HOLD_MS', 4000)) return 'voicemail';
+    }
   }
   // Family calls, Nov 14 2026 (evening): 10 s, was 5 s. A clerk's long pickup line got the greeting,
   // which cannot be interrupted, over it, and could miss "an A I assistant".
-  if (calleeSaysWords(session) && now - pickupAt < envMs('KADE_OUTBOUND_GREETING_MAX_WAIT_MS', 10000)) return 'talking';
+  if (calleeSaysWords(session) && now - pickupAt < envMs('KADE_OUTBOUND_GREETING_MAX_WAIT_MS', mainTiming ? 5000 : 10000)) return 'talking';
   return null;
 }
 
@@ -2113,8 +2133,14 @@ const PRESENCE_RE = /^(?:(?:hello|hi|hey|yes|yeah|uh|um|oh)\s+)*(?:(?:is|are)\s+
  *   'noise' nothing to answer: only "uh", "oh", "well", or stray words line noise turns into ("You.",
  *           "The."), with no hello and no nod (verification round, Nov 14 2026)
  *   'words' anything else: an answer, a name, a question of their own
+ * name (second verification round): the calling character's name. "Hi Kiana!", "Hey Kiana!" and
+ * "Kiana!" are a greeting back, so 'hello'; "Yes, Kiana." is still a nod. Without a name, a name is
+ * words, as before.
  */
-function greetingWordKind(text) {
+function characterNameWords(name) {
+  return String(name || '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter((w) => w.length >= 2);
+}
+function greetingWordKind(text, name) {
   let t = String(text || '').toLowerCase()
     .replace(/\b(?:uh-huh|uh huh)\b/g, 'uhhuh').replace(/\bmm-?hmm\b/g, 'mmhmm').replace(/\ball right\b/g, 'alright')
     .replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim()
@@ -2128,17 +2154,20 @@ function greetingWordKind(text) {
   }
   const words = t.split(' ');
   if (words.length > 6) return 'words';
+  const nameWords = new Set(characterNameWords(name));
   let hello = 0;
   let nod = 0;
   let stray = 0;
+  let named = 0;
   for (const w of words) {
     if (HELLO_WORDS.has(w)) hello++;
+    else if (nameWords.has(w)) named++;
     else if (NOD_WORDS.has(w)) nod++;
     else if (STRAY_WORDS.has(w)) stray++;
     else if (!FILLER_WORDS.has(w)) return 'words';
   }
-  if (stray) return hello || nod ? 'words' : 'noise'; // "Hey, you." reads on as before
-  if (hello) return 'hello';
+  if (stray) return hello || nod || named ? 'words' : 'noise'; // "Hey, you." reads on as before
+  if (hello || (named && !nod)) return 'hello';
   if (nod) return 'nod';
   return 'noise'; // only "uh", "oh", "well": nothing to answer
 }
@@ -2183,7 +2212,8 @@ function greetingWordsVerdict(session, text, began) {
    * "Speaking." can begin within 1.6 s of the "Hello?" that started it, and the chain dropped it as more
    * of her pickup: no confirmation, and part 2 waited 6 s for an answer she had given. A business
    * greeting part is far longer than the chain, so nothing changes there. */
-  if (part.done && began >= part.endAt) return 'hold';
+  const mainRules = businessOnlyRound(); // KADE_OUTBOUND_FIRST_ROUND=business: main 422e758's order and words
+  if (!mainRules && part.done && began >= part.endAt) return 'hold';
   /* Verification round, Nov 14 2026: a sentence that opens just after a pickup line ended is more of
    * the same pickup. Flux splits "Thank you for calling Shell on Main. [pause] This is Mike, how can I
    * help you?" in two; the greeting starts on the first part, so the second used to be held and answered
@@ -2192,8 +2222,12 @@ function greetingWordsVerdict(session, text, began) {
    * pharmacy, press 2") is the exception: the model needs it to press a key. */
   if (session._pickupEndedAt && began - session._pickupEndedAt <= envMs('KADE_OUTBOUND_PICKUP_CHAIN_MS', 1600)
       && !PHONE_MENU_RE.test(text)) return 'pickup';
-  const kind = greetingWordKind(text);
+  if (mainRules && part.done && began >= part.endAt) return 'hold'; // said after this part ended: a reply to it
+  const kind = greetingWordKind(text, mainRules ? null : session.agentName);
   if (kind === 'noise') return 'drop'; // verification round: "You.", "The." (line noise) is never a reply
+  /* Second verification round: "Hi Kiana!" or "Hey Kiana!" over a short family greeting is a greeting
+   * back. They heard who it is, so it is never the "did not hear it" hello below, and never a turn. */
+  if (kind === 'hello' && !mainRules && greetingWordKind(text) !== 'hello') return 'drop';
   /* Verification round: a hello or "who's this?" begun in the last moments of the greeting means they
    * did not hear it (it reaches us late: Flux closes the turn after the greeting, then holds it). It is
    * a turn, and the prompt has the character ask its question again. Before, it was dropped as said over
@@ -2215,6 +2249,38 @@ function notePickupWords(session, text) {
   const idx = session._greetingEntry ? session.history.indexOf(session._greetingEntry) : -1;
   session.history.splice(idx >= 0 ? idx : session.history.length, 0, { role: 'user', content: text });
   return true;
+}
+
+/* ── Second verification round, Nov 14 2026 (late) ──
+ * "Hi — is this Holly?" lasts about 1.4 s, shorter than the 1.6 s pickup chain, so what someone says
+ * over it ("Hello? Who is this?", "This is she.") is dropped as more of their pickup, or as a hello, or
+ * as noise. The confirm wait then ran its full 6 s: 6.5 s of silence after they spoke, against 0.5 s on
+ * main. Now words they said while part 1 played (begun after it started, or still coming after it
+ * started) that are not taken as the answer bring part 2 forward: it plays about 1 s
+ * (KADE_OUTBOUND_PART2_AFTER_MS) after those words end. Part 2 says who is calling, which is what they
+ * are asking. Returns true when it noted them. */
+function noteWordsOverPart1(session, began, ended, wordsAt) {
+  const part = session._greetingPart;
+  if (!part || part.last || session._part2Started || businessOnlyRound()) return false;
+  if (began < part.audioAt && (wordsAt || ended) < part.audioAt + envMs('KADE_OUTBOUND_PICKUP_GRACE_MS', 700)) return false;
+  session._part1WordsEndAt = Math.max(session._part1WordsEndAt || 0, ended);
+  return true;
+}
+/** When part 2 should play after words noted by noteWordsOverPart1 (ms from now), or null. */
+function part2Delay(session) {
+  if (!session._part1WordsEndAt) return null;
+  return Math.max(0, session._part1WordsEndAt + envMs('KADE_OUTBOUND_PART2_AFTER_MS', 1000) - Date.now());
+}
+
+/* Second verification round: someone who was talking before the greeting started (it starts at the
+ * 10 s cap over a talker) and went on well into it (KADE_OUTBOUND_TALKED_INTO_MS, 2 s past its start)
+ * missed who was calling. Their words used to be filed as pickup words, and nothing answered them;
+ * a family call has no quiet watch, so the line stayed silent. They are answered after the greeting. */
+function talkedIntoGreeting(session, text, began, wordsAt) {
+  const part = session._greetingPart;
+  if (!part || businessOnlyRound() || began >= part.audioAt) return false;
+  if (greetingWordKind(text, session.agentName) === 'noise') return false;
+  return wordsAt >= part.audioAt + envMs('KADE_OUTBOUND_TALKED_INTO_MS', 2000);
 }
 
 /* ── Words held over the greeting wait for the rest of what they say (Nov 14 2026) ──
@@ -2897,15 +2963,22 @@ async function handleUtterance(session, text) {
   if (session._greetingLock) {
     // Nov 14 2026 (outbound): pickup words and greeting-time hellos are never an answer.
     if (firstRound) {
-      const verdict = greetingWordsVerdict(session, text, began);
+      let verdict = greetingWordsVerdict(session, text, began);
+      // Second verification round: talked from before the greeting well into it: answered after it.
+      if (verdict === 'pickup' && talkedIntoGreeting(session, text, began, wordsAt)) {
+        console.log(`[voice-stream] pickup words that ran well into the greeting: they missed who is calling, answered after it ${textReceipt(text)}`);
+        verdict = 'hold';
+      }
       if (verdict === 'pickup') {
         const kept = notePickupWords(session, text);
         session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended); // verification round: the pickup chain
+        noteWordsOverPart1(session, began, ended, wordsAt); // second verification round: part 2 comes soon after them
         console.log(`[voice-stream] pickup words, not an answer (${kept ? 'kept as what they said first' : 'a hello'}): ${textReceipt(text)}`);
         if (session._startGreeting) session._startGreeting(text); // family calls round: a machine's message waits for the verdict
         return;
       }
       if (verdict === 'drop') {
+        noteWordsOverPart1(session, began, ended, wordsAt);
         console.log(`[voice-stream] said over the greeting, nothing to answer: ${textReceipt(text)}`);
         return;
       }
@@ -2923,14 +2996,18 @@ async function handleUtterance(session, text) {
     // Nov 14 2026 (outbound): a hello said over "is this X?" is not their answer to it.
     if (firstRound) {
       const verdict = greetingWordsVerdict(session, text, began);
-      if (verdict === 'pickup') {
-        notePickupWords(session, text);
-        session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended);
-        console.log(`[voice-stream] pickup words while waiting for "is this ...?", still waiting: ${textReceipt(text)}`);
-        return;
-      }
-      if (verdict === 'drop') {
-        console.log(`[voice-stream] said over "is this ...?", still waiting for the answer: ${textReceipt(text)}`);
+      if (verdict === 'pickup' || verdict === 'drop') {
+        if (verdict === 'pickup') {
+          notePickupWords(session, text);
+          session._pickupEndedAt = Math.max(session._pickupEndedAt || 0, ended);
+        }
+        /* Second verification round: said over "is this ...?" and not its answer. Part 2 (who is
+         * calling) follows about 1 s after these words end, not 6 s after part 1. */
+        const soon = noteWordsOverPart1(session, began, ended, wordsAt) ? part2Delay(session) : null;
+        if (soon !== null && session._schedulePart2) session._schedulePart2(soon);
+        console.log(verdict === 'pickup'
+          ? `[voice-stream] pickup words while waiting for "is this ...?", ${soon !== null ? `part 2 in ${soon} ms` : 'still waiting'}: ${textReceipt(text)}`
+          : `[voice-stream] said over "is this ...?", ${soon !== null ? `part 2 in ${soon} ms` : 'still waiting for the answer'}: ${textReceipt(text)}`);
         return;
       }
     }
@@ -2956,6 +3033,10 @@ async function handleUtterance(session, text) {
      * before the end of the greeting) is still their pickup. */
     if (verdict === 'pickup' && wordsAt >= session._greetingOverAt - 1000) {
       console.log(`[voice-stream] pickup words that ran through the whole greeting: they did not hear it, answered as their reply ${textReceipt(text)}`);
+      verdict = 'hold';
+    } else if (verdict === 'pickup' && talkedIntoGreeting(session, text, began, wordsAt)) {
+      // Second verification round: past the 10 s cap and well into the greeting, stopped before its end.
+      console.log(`[voice-stream] pickup words that ran well into the greeting: they missed who is calling, answered as their reply ${textReceipt(text)}`);
       verdict = 'hold';
     }
     // Verification round: nothing answers these, so the quiet watch (disarmed above) looks again.
@@ -4927,7 +5008,18 @@ const sessionsByCallSid = new Map();
  * Fail-soft: no session found (already ended) — do nothing. */
 async function handleAmdResult(callSid, result) {
   const session = sessionsByCallSid.get(callSid);
-  if (!session || session.voicemailMode || result !== 'machine') return;
+  if (!session) return;
+  /* Second verification round, Nov 14 2026 (late): Twilio says a person answered. A pickup line with
+   * machine words ("do you want to leave a message?") no longer waits out the voicemail hold for a
+   * machine verdict that will never come (greetingStartWait). */
+  if (result === 'human') {
+    if (!session._amdHuman) {
+      session._amdHuman = true;
+      if (session._vmCueAt && !session._greetingStarted) console.log(`[voice-stream] Twilio says a person answered: the greeting stops waiting for a machine verdict ${session.streamSid}`);
+    }
+    return;
+  }
+  if (session.voicemailMode || result !== 'machine') return;
   session.voicemailMode = true;
   disarmQuietWatch(session); // Nov 14 2026: a machine is not a silent person
   /* Nov 14 2026 verification round: no greeting part starts after this. Not the greeting (its start
@@ -4946,6 +5038,8 @@ async function handleAmdResult(callSid, result) {
   const who = String(ctx.userName || 'a Kade-AI user').trim().split(/\s+/)[0];
   let mission = String(ctx.purpose || '').replace(/^(?:i'?m calling (?:because|about|to)\s*)/i, '').trim();
   if (mission.length > 160) mission = mission.slice(0, 157) + '...';
+  // Second verification round: the purpose is pasted in as it was typed; it ends its sentence.
+  if (mission && !/[.!?…]$/.test(mission)) mission += '.';
   // July 12 2026 (Kade): voicemail matches the greeting tiers — your OWN
   // companion sounds like your own companion, family gets a natural
   // possessive, strangers get the honest formal version.
@@ -5280,6 +5374,22 @@ function attachMediaStreams(server, users, cfg) {
           // the MUTABLE `session` variable, which the 'stop' handler nulls at
           // hang-up. Capture the object.
           const sess = session;
+          /* Safety: the lock must never outlive a stuck playback. Second verification round: on an
+           * outbound call it counts from the greeting's START (armed again there), not from pickup. The
+           * start can now come at 10 s (a talker) or 15 s (machine words), and a two-part greeting
+           * that got no quick answer could still be playing at 35 s: the valve dropped the lock in
+           * the middle of part 2, and the clerk's first words barged in and cut it short. */
+          const armLockValve = () => {
+            if (sess._lockValveTimer) clearTimeout(sess._lockValveTimer);
+            sess._lockValveTimer = setTimeout(() => {
+              sess._lockValveTimer = null;
+              // Safety valve: nothing in the greeting machinery may brick the
+              // call. Two-phase adds a confirm wait, so the window is wider.
+              if (sess._confirmTimer) { clearTimeout(sess._confirmTimer); sess._confirmTimer = null; }
+              if (sess._confirmPhase && !sess._part2Started) { sess._playGreetingPart2?.(); return; }
+              releaseGreetingLock(sess);
+            }, envMs('KADE_GREETING_LOCK_VALVE_MS', 35000));
+          };
           const playGreeting = async (greetingBuf) => {
             if (!outboundCtx) {
               sess._ringbackActive = false; // stop ring loop
@@ -5338,8 +5448,30 @@ function attachMediaStreams(server, users, cfg) {
               handleUtterance(sess, t);
               return;
             }
-            sess._confirmTimer = setTimeout(playPart2, 6000);
+            sess._confirmDeadline = Date.now() + 6000;
+            /* Second verification round: words said over part 1 that were not its answer (a hello,
+             * "who is this?", more of their pickup) bring part 2 forward: about 1 s after they end. */
+            const soon = part2Delay(sess);
+            if (soon !== null) schedulePart2(soon);
+            else sess._confirmTimer = setTimeout(playPart2, 6000);
           };
+          /* Part 2 in `ms`, but not over someone still saying words (then a moment later, never past
+           * the 6 s the confirm wait always had). Their answer, if it comes, plays it at once. */
+          const schedulePart2 = (ms) => {
+            if (sess._part2Started || !sess._confirmPhase) return;
+            if (sess._confirmTimer) clearTimeout(sess._confirmTimer);
+            const fire = () => {
+              sess._confirmTimer = null;
+              if (!sess._confirmPhase || sess._part2Started) return;
+              if (calleeSaysWords(sess) && Date.now() < (sess._confirmDeadline || 0)) {
+                sess._confirmTimer = setTimeout(fire, 200);
+                return;
+              }
+              playPart2();
+            };
+            sess._confirmTimer = setTimeout(fire, Math.max(0, ms));
+          };
+          sess._schedulePart2 = schedulePart2;
           sess._playGreetingPart2 = playPart2;
           const greetingFailed = (err) => {
             console.error('[voice-stream] greeting playback/synthesis error:', err.message);
@@ -5361,6 +5493,7 @@ function attachMediaStreams(server, users, cfg) {
               if (sess._greetingStarted) return;
               sess._greetingStarted = true;
               sess._greetingStartedAt = Date.now();
+              armLockValve(); // second verification round: 35 s from here, not from pickup
               /* Nov 14 2026 verification round: a machine answered before the greeting began (the start
                * can wait up to 5 s while it talks, and its greeting is pickup words, never the cue to
                * stop waiting). Voicemail mode leaves its one message; the greeting would play over it. */
@@ -5400,7 +5533,8 @@ function attachMediaStreams(server, users, cfg) {
              * voicemail machine: then the greeting waits for the verdict. */
             sess._startGreeting = (pickupText) => {
               if (sess._greetingStarted) return;
-              if (firstRoundOn(sess) && typeof pickupText === 'string' && (sess._vmCueAt || voicemailCue(pickupText))) {
+              if (firstRoundOn(sess) && !businessOnlyRound() && !sess._amdHuman && typeof pickupText === 'string'
+                  && (sess._vmCueAt || voicemailCue(pickupText))) {
                 noteVoicemailCue(sess, 'pickup line');
                 if (waitTimer) clearTimeout(waitTimer);
                 startWhenQuiet();
@@ -5430,14 +5564,8 @@ function attachMediaStreams(server, users, cfg) {
               await playGreeting(buf);
             })().catch(greetingFailed);
           }
-          // Safety: the lock must never outlive a stuck playback.
-          setTimeout(() => {
-            // Safety valve: nothing in the greeting machinery may brick the
-            // call. Two-phase adds a confirm wait, so the window is wider.
-            if (sess._confirmTimer) { clearTimeout(sess._confirmTimer); sess._confirmTimer = null; }
-            if (sess._confirmPhase && !sess._part2Started) { sess._playGreetingPart2?.(); return; }
-            releaseGreetingLock(sess);
-          }, 35000);
+          // Safety: the lock must never outlive a stuck playback (armLockValve; again at the greeting's start).
+          armLockValve();
 
           break;
         }
@@ -6235,4 +6363,6 @@ module.exports._test = {
   markGreetingPart, parkHeld, flushHeldWords, hangingUp, HOLD_RE,
   // Nov 14 2026 (evening): every outbound call, and a voicemail machine at pickup.
   firstRoundOn, strangerGreetingCall, voicemailCue, greetingStartWait,
+  // Nov 14 2026 (late): the second verification round.
+  businessOnlyRound, talkedIntoGreeting, noteWordsOverPart1,
 };

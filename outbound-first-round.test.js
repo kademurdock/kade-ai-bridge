@@ -1395,7 +1395,10 @@ test('FAMILY CALLS 5: A 7 SECOND BUSINESS PICKUP LINE: the greeting waits for it
   await c.hangUp();
 });
 
-test('FAMILY CALLS 6: A 12 SECOND BUSINESS PICKUP LINE: the greeting starts at the 10 s cap, over them (on 422e758: at 5 s); the line stays what they said first, and their answer after the greeting is the one turn', async () => {
+/* Second verification round (Nov 14, late): the clerk talked about 2 s into the greeting, so they missed
+ * who was calling. On 392218e their line was filed as pickup words and nothing answered it; now it is
+ * answered once the greeting is over (talkedIntoGreeting), and what they say next is the second turn. */
+test('FAMILY CALLS 6: A 12 SECOND BUSINESS PICKUP LINE: the greeting starts at the 10 s cap, over them (on 422e758: at 5 s); the line ran 2 s into the greeting, so it is answered after it (on 392218e: never), and their next words are the second turn', async () => {
   setEnv(LIVE);
   const c = await outboundCall(87, { greetingSec: 4 });
   await c.at(300);
@@ -1403,12 +1406,15 @@ test('FAMILY CALLS 6: A 12 SECOND BUSINESS PICKUP LINE: the greeting starts at t
   const startedAt = c.session._greetingStartedAt - c.t0;
   assert.ok(startedAt >= 9900 && startedAt < 11000, `started at the cap while they were still talking (+${startedAt} ms; on 422e758: +5000)`);
   await until(() => greetingDone(c), 8000, 'greeting over');
-  await sleep(800);
-  assert.equal(c.turnsRun(), 0, 'the pickup line is not a turn');
+  await until(() => c.turnsRun() > 0, 4000, 'the line they talked into the greeting is answered');
+  await sleep(1500);
+  assert.equal(c.turnsRun(), 1, 'once');
+  assert.deepEqual(userTurns(c), [CLERK_12S]);
+  await sleep(1000); // the reply plays out
   await c.say('Sorry, what was that about hemp?');
-  await until(() => c.turnsRun() > 0, 5000, 'their answer');
+  await until(() => c.turnsRun() > 1, 5000, 'their next words');
   await sleep(1000);
-  assert.equal(c.turnsRun(), 1);
+  assert.equal(c.turnsRun(), 2);
   assert.deepEqual(userTurns(c), [CLERK_12S, 'Sorry, what was that about hemp?']);
   await c.hangUp();
 });
@@ -1531,4 +1537,164 @@ test('FAMILY CALLS 11: KADE_OUTBOUND_FIRST_ROUND=business rolls back only the fa
     assert.ok(biz.session.outboundSuffix.includes(NEW_HELLO_LINE));
     for (const c of [own, biz]) await c.hangUp();
   } finally { setEnv({ KADE_OUTBOUND_FIRST_ROUND: undefined }); }
+});
+
+/* ── Second verification round, Nov 14 2026 (late): an independent review of 392218e with its own
+ * simulated calls (verify2/harness.js). Every ROUND 2 test below fails on 392218e. ── */
+
+test('ROUND 2 1: words said over "Hi — is this Holly?" that are not its answer ("Hello? Who is this?", "This is she.") bring part 2 about 1 s after them, not 6 s after part 1', async () => {
+  setEnv(LIVE);
+  const mk = (n) => outboundCall(n, { from: HOLLY, ctx: { ...checkinCtx(), greetingBuf: Buffer.alloc(Math.round(1.4 * SEC), GREET_BYTE), greeting2Buf: Buffer.alloc(3 * SEC, GREET_BYTE) } });
+  const who = await mk(100);
+  const she = await mk(101);
+  const over = async (c, text, fromStartMs, endMs) => {
+    await kadesHello(c);
+    await until(() => c.session._greetingStarted && c.session._greetingPart, 3000, 'part 1 started');
+    const p1 = c.session._greetingPart;
+    await sleep(Math.max(0, p1.audioAt + fromStartMs - Date.now()));
+    await c.say(text, endMs);
+    c.closedAt = Date.now();
+    await until(() => saidPart2(c), 9000, 'part 2 started');
+    c.gap = c.session._greetingPart.audioAt - c.closedAt;
+  };
+  await Promise.all([over(who, 'Hello? Who is this?', 300, 300), over(she, 'This is she.', 1100, 250)]);
+  for (const c of [who, she]) {
+    assert.ok(c.gap < 2500, `part 2 came ${c.gap} ms after their words closed (on 392218e: about 6 s of silence)`);
+  }
+  for (const c of [who, she]) await until(() => greetingDone(c), 6000, 'greeting over');
+  await sleep(1200);
+  for (const c of [who, she]) assert.equal(c.turnsRun(), 0, 'nothing answered as a turn; part 2 says who is calling');
+  for (const c of [who, she]) await c.hangUp();
+});
+
+test('ROUND 2 2: "Hey Kiana!" said back over a short family greeting is a hello, never a turn; her answer after it is the one turn', async () => {
+  const k = T.greetingWordKind;
+  for (const t of ['Hi Kiana!', 'Hey Kiana!', 'Kiana!', 'Oh hi, Kiana.', 'Hi, Kiana!']) assert.equal(k(t, 'Kiana'), 'hello', t);
+  assert.equal(k('Yes, Kiana.', 'Kiana'), 'nod');
+  assert.equal(k('Kiana, we closed.', 'Kiana'), 'words');
+  assert.equal(k('Hi Kiana!'), 'words', 'without a name, as before');
+  setEnv(LIVE);
+  const c = await outboundCall(102, { ctx: { ...herOwnCtx(), greetingBuf: Buffer.alloc(3 * SEC, GREET_BYTE) } });
+  await kadesHello(c);
+  await until(() => c.session._greetingStarted && c.session._greetingPart, 3000, 'greeting started');
+  const p = c.session._greetingPart;
+  await sleep(Math.max(0, p.audioAt + 2000 - Date.now())); // inside its last 1.5 s
+  await c.say('Hey Kiana!', 250);
+  await until(() => greetingDone(c), 6000, 'greeting over');
+  const overAt = Date.now();
+  await sleep(1200);
+  assert.equal(c.turnsRun(), 0, 'no turn on "Hey Kiana!" (on 392218e: answered as if it were her reply)');
+  assert.equal(typingFrom(c, overAt), 0, 'no typing sound as Kiana stops');
+  await c.say('No, they closed down last week.');
+  await until(() => c.turnsRun() > 0, 5000, 'her answer');
+  await sleep(1200);
+  assert.equal(c.turnsRun(), 1);
+  assert.deepEqual(userTurns(c), ['No, they closed down last week.']);
+  await c.hangUp();
+});
+
+test('ROUND 2 3: a person whose pickup line has machine words is not held for a machine verdict once Twilio says "human"; server.js /amd-status passes "human" on', async () => {
+  // server.js, the /amd-status handler cut from its source and run with a stand-in for voice-stream.
+  const src = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+  const a = src.indexOf("app.post('/amd-status'");
+  const b = src.indexOf("app.post('/voice-status'", a);
+  assert.ok(a >= 0 && b > a, 'server.js has the /amd-status handler');
+  const handlers = {};
+  const verdicts = [];
+  const quiet = { log: () => {}, warn: () => {}, error: () => {} };
+  // eslint-disable-next-line no-new-func
+  new Function('app', 'TWILIO_TOKEN', 'twilio', 'PUBLIC_URL', 'vsHandleAmd', 'console', src.slice(a, b))(
+    { post: (p, h) => { handlers[p] = h; } }, '', {}, 'http://bridge.invalid', (sid, r) => verdicts.push([sid, r]), quiet);
+  for (const AnsweredBy of ['human', 'machine_end_beep', 'unknown', 'fax']) {
+    handlers['/amd-status']({ body: { CallSid: 'CA1', AnsweredBy }, get: () => '' }, { status() { return this; }, end() {} });
+  }
+  assert.deepEqual(verdicts, [['CA1', 'human'], ['CA1', 'machine']], 'human and machine_end are passed on (on 392218e: only machine_end)');
+
+  setEnv(LIVE);
+  const c = await outboundCall(103, { greetingSec: 2 });
+  await c.at(300);
+  await c.words("Mike can't come to the phone right now, can I help you?", { gapMs: 150, eotMs: 300 });
+  await sleep(300);
+  const humanAt = Date.now();
+  vs.handleAmdResult(c.sid, 'human');
+  await until(() => c.session._greetingStarted, 6000, 'greeting started');
+  const after = c.session._greetingStartedAt - humanAt;
+  assert.ok(after < 1500, `the greeting started ${after} ms after Twilio said human (on 392218e: the 4 s hold ran out first)`);
+  assert.equal(c.session.voicemailMode, undefined);
+  await c.hangUp();
+});
+
+test('ROUND 2 4: the greeting lock\'s 35 s safety valve counts from the greeting\'s start: a greeting that starts late and is still playing at 36 s keeps its lock, and words then do not cut it', async () => {
+  setEnv({ ...LIVE, KADE_OUTBOUND_GREETING_WAIT_MS: '9000' });
+  try {
+    const c = await outboundCall(104, { ctx: { greetingBuf: Buffer.alloc(32 * SEC, GREET_BYTE) } });
+    await until(() => c.session._greetingStarted, 11000, 'greeting started');
+    assert.ok(c.session._greetingStartedAt - c.t0 >= 8900, 'a late start, as at the 10 s cap');
+    await c.at(36000);
+    assert.equal(c.session._greetingLock, true, 'the lock is still on at 36 s (on 392218e the valve dropped it at 35 s, counted from pickup)');
+    const clears0 = c.clears;
+    await c.say('Thank you for holding, this is Mike.', 300);
+    await c.at(37800);
+    assert.equal(c.clears, clears0, 'no barge-in cut the greeting');
+    assert.equal(c.session._greetingLock, true, 'and the lock is still on');
+    await c.hangUp();
+  } finally { setEnv({ KADE_OUTBOUND_GREETING_WAIT_MS: BASE_ENV.KADE_OUTBOUND_GREETING_WAIT_MS }); }
+});
+
+test('ROUND 2 5: someone who talks past the 10 s cap and stops before the greeting\'s end is answered after it (on 392218e: filed as pickup words, and silence)', async () => {
+  setEnv(LIVE);
+  const talk = 'hey sorry I was just walking in from the yard and the dogs are going crazy hold on let me put my bag down okay so anyway I was going to call you later about Sunday because we are trying to figure out who is bringing what and I think Holly said she would bring the potato salad okay go ahead who is this';
+  const c = await outboundCall(105, { ctx: { ...herOwnCtx(), greetingBuf: Buffer.alloc(6 * SEC, GREET_BYTE) } });
+  await c.at(300);
+  await c.words(talk, { gapMs: 190, eotMs: 300 });
+  const startedAt = c.session._greetingStartedAt - c.t0;
+  assert.ok(startedAt >= 9900 && startedAt < 11000, `the greeting started at the cap (+${startedAt} ms)`);
+  // Well before its end, so the older rule for words that ran through the whole greeting does not cover it.
+  assert.ok(Date.now() < c.session._greetingPart.endAt - 1800, 'they stopped well before the greeting\'s end');
+  await until(() => greetingDone(c), 8000, 'greeting over');
+  await until(() => c.turnsRun() > 0, 4000, 'their words are answered');
+  await sleep(1000);
+  assert.equal(c.turnsRun(), 1);
+  assert.deepEqual(userTurns(c), [talk]);
+  await c.hangUp();
+});
+
+test('ROUND 2 6: KADE_OUTBOUND_FIRST_ROUND=business puts business calls back on main\'s timing too: the 5 s wait for a talker, no hold for machine words', async () => {
+  setEnv({ ...LIVE, KADE_OUTBOUND_FIRST_ROUND: 'business' });
+  try {
+    const quietMachine = { outbound: true, _vmCueAt: Date.now() - 500, _fluxTurnText: '', finalBuf: '' };
+    assert.equal(T.greetingStartWait(quietMachine, Date.now() - 3000), null, 'no machine-words hold (on 392218e: "voicemail")');
+    const talker = { outbound: true, _fluxTurnOpen: true, _fluxTurnHasWords: true, _fluxTurnText: 'thank you for calling' };
+    assert.equal(T.greetingStartWait(talker, Date.now() - 6000), null, 'past 5 s a talker no longer holds the start');
+    const c = await outboundCall(106, { greetingSec: 2 });
+    await c.at(300);
+    await c.words(CLERK_7S, { gapMs: 190, eotMs: 300 });
+    const at = c.session._greetingStartedAt - c.t0;
+    assert.ok(at >= 4900 && at < 5800, `main's 5 s cap (+${at} ms; on 392218e: after the 7 s line)`);
+    await c.hangUp();
+  } finally { setEnv({ KADE_OUTBOUND_FIRST_ROUND: undefined }); }
+  const t = T.greetingStartWait({ outbound: true, _vmCueAt: Date.now() - 500, _fluxTurnText: '', finalBuf: '' }, Date.now() - 3000);
+  assert.equal(t, 'voicemail', 'with the switch unset the machine-words hold is on');
+});
+
+test('ROUND 2 7: the voicemail phrases cover "automatic voice" and a number read out as "is not available"', () => {
+  for (const s of ['Your call has been forwarded to an automatic voice message system.', '4 1 7 5 5 5 0 1 4 2 is not available.', '417-555-0142 is unavailable']) assert.equal(T.voicemailCue(s), true, s);
+  for (const s of ['Hello?', 'Speaking.', 'Room 12 is not available yet, sorry.', 'Sorry, the manager stepped out, can I take a message?']) assert.equal(T.voicemailCue(s), false, s);
+});
+
+test('ROUND 2 8: the family and own-number voicemails end the purpose with a full stop', async () => {
+  setEnv(LIVE);
+  const purpose = 'Kade wants to know if you are coming Sunday';
+  const fam = await outboundCall(107, { from: HOLLY, ctx: { ...composedCtx({ purpose, calleeRec: { name: 'Holly', agentId: 'agent_harley_test' } }), to: HOLLY } });
+  const own = await outboundCall(108, { ctx: { ...composedCtx({ purpose, calleeRec: { name: 'Kade', agentId: 'agent_kiana_test' } }) } });
+  assert.equal(fam.ctx.tier, 'family');
+  assert.equal(own.ctx.tier, 'own');
+  const said0 = world.said.length;
+  vs.handleAmdResult(fam.sid, 'machine');
+  vs.handleAmdResult(own.sid, 'machine');
+  await until(() => world.said.slice(said0).filter((l) => /coming Sunday/.test(l)).length >= 2, 5000, 'both voicemails made');
+  const lines = world.said.slice(said0).filter((l) => /coming Sunday/.test(l));
+  assert.ok(lines.some((l) => /I was calling to .*coming Sunday\. Catch me in the app/.test(l)), `family: ${lines.join(' | ')}`);
+  assert.ok(lines.some((l) => /I called to .*coming Sunday\. Sorry I missed you/.test(l)), `own: ${lines.join(' | ')}`);
+  for (const c of [fam, own]) await c.hangUp();
 });

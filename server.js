@@ -2839,6 +2839,10 @@ app.post('/amd-status', (req, res) => {
   console.log(`[amd] ${CallSid}: AnsweredBy=${AnsweredBy}`);
   if (CallSid && /^machine_end/.test(String(AnsweredBy || ''))) {
     try { vsHandleAmd(CallSid, 'machine'); } catch (e) { console.warn('[amd] handler failed:', e.message); }
+  } else if (CallSid && String(AnsweredBy || '') === 'human') {
+    // Nov 14 2026 (late): a person answered. A pickup line with machine words stops waiting for a
+    // machine verdict (voice-stream.js greetingStartWait); nothing else changes.
+    try { vsHandleAmd(CallSid, 'human'); } catch (e) { console.warn('[amd] handler failed:', e.message); }
   }
   res.status(200).end();
 });
