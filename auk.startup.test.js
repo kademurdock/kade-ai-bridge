@@ -32,7 +32,7 @@ test('AuK forwards edit ranges and edge preservation, rejecting invalid numbers 
     module: mod, require: name => name === 'axios' ? provider : name === 'fs' ? storage : require(name), console, Buffer, URL, setTimeout, clearTimeout,
     process: { env: { AUK_ENDPOINT_ID: 'test-only', RUNPOD_API_KEY: 'test-only' } },
   });
-  const options = { auk_task: 'edit', instruction: 'Replace Tuesday with Thursday.', reference_voice_url: 'https://storage.test/recording.wav', edit_start: 12.5, edit_end: 15, gen_seconds: 3, preserve_before: false, preserve_after: true };
+  const options = { auk_task: 'edit', instruction: 'Make this part a whisper.', reference_voice_url: 'https://storage.test/recording.wav', edit_start: 12.5, edit_end: 15, gen_seconds: 3, preserve_before: false, preserve_after: true };
   for (const edit_start of [-1, Infinity, NaN, '12']) {
     const result = mod.exports.makeJob({ userId: 'invalid', prompt: '', options: { ...options, edit_start } });
     assert.match(result.error, /valid seconds/);
@@ -43,5 +43,7 @@ test('AuK forwards edit ranges and edge preservation, rejecting invalid numbers 
   assert.match(result.estimate.spokenWait, /\$1\.75/);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sent.length, 1);
+  /* A word change in free text is refused before submission: AuK only follows its trained wording. */
+  assert.match(mod.exports.makeJob({ userId: 'words', prompt: '', options: { ...options, instruction: 'Replace Tuesday with Thursday.' } }).error, /use Change words/);
   for (const key of Object.keys(options)) assert.equal(sent[0][key], options[key], key);
 });

@@ -280,7 +280,12 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
     const checked = aukWords.wordEditInput(options);
     if (checked.error) return { error: checked.error };
     wordEdit = checked.edit;
+    const src = options.reference_voice_url;
+    if (typeof src === 'string' && /^https:\/\/\S+$/i.test(src) && src.length < 2048) wordEdit.sourceUrl = src;
   }
+  /* Free text that asks for a word change never reaches the worker: the deployed worker sends an
+   * edit instruction to the model word for word, and AuK only follows its trained wording. */
+  if (options.auk_task === 'edit' && !wordEdit && aukWords.looksLikeWordChange(options.instruction)) return { error: aukWords.REFUSE_FREE_WORDS };
   if (options.auk_task === 'edit' && (!options.reference_voice_url || (!wordEdit && !String(options.instruction || '').trim()))) return { error: 'Import a recording and describe the edit first.' };
   if (options.gen_seconds != null && (!Number.isFinite(options.gen_seconds) || options.gen_seconds <= 0)) return { error: 'Target seconds must be positive.' };
   const input = { prompt, out_prefix: userId };
@@ -388,7 +393,7 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
       renderSeconds: null, renderSecondsWarm: null, renderSecondsCold: null, costUSD: null,
       spokenWait: `AuK HQ uses a sleeping GPU, billed at up to $${RATE_PER_HR.toFixed(2)} per hour while active. Startup and processing are billed. A reliable wait and total cost estimate is not available yet.`,
     });
-    if (wordEdit) job.estimate.spokenWait += ` It makes ${wordEdit.seeds.length} take${wordEdit.seeds.length === 1 ? '' : 's'} of this change and keeps one that says the new words.`;
+    if (wordEdit) job.estimate.spokenWait += ` It asks for ${wordEdit.seeds.length} take${wordEdit.seeds.length === 1 ? '' : 's'} of this change and keeps one that says the new words.`;
   }
   saveJobs();
   submit(input).then(async (r) => {
@@ -412,25 +417,48 @@ function makeJob({ userId, agentId, agentName, prompt, options = {} }) {
 }
 
 /* ---------- Change words: the take that is kept ----------
- * Returns { out } with the kept take's fields in the shape the rest of the pump reads, or
- * { done: true } when the job has already been ended here (no take said the new words). */
-async function pickWordTake(job, out, s) {
+ * Listening can take minutes (three downloads and three MiMo calls), and the pump is one loop for
+ * every user's jobs. So the listening runs on its own: the pump starts it and moves on, and a
+ * later pump applies the answer. The job stays 'running' meanwhile, so Stop still works; a job
+ * stopped while it was being listened to is left stopped and nothing is filed. */
+const picks = new Map(); // job id -> { promise, s, out, result? }
+
+function startWordPick(job, out, s) {
+  const entry = { s, out };
   const candidates = aukWords.candidatesOf(out);
-  const { best, report } = await aukWords.rankCandidates(candidates, job.wordEdit, { axios, env: process.env });
+  entry.promise = aukWords.rankCandidates(candidates, job.wordEdit, {
+    axios, env: process.env,
+    geometry: { cropStart: Number.isFinite(out.crop_start) ? out.crop_start : null },
+    sourceUrl: job.wordEdit.sourceUrl || null,
+    asked: Array.isArray(job.wordEdit.seeds) ? job.wordEdit.seeds.length : null,
+    legacy: !(Array.isArray(out.candidates) && out.candidates.length),
+  }).then((result) => { entry.result = result; }, (error) => {
+    entry.result = { best: null, report: { matched: false, checked: false, picked: null, pickedSeed: null, takes: [], listenUSD: 0,
+      spoken: `I could not check the takes this time (${String(error.message || error).slice(0, 80)}). Your original recording is unchanged.` }, crashed: true };
+  }).then(() => { setTimeout(() => { pump().catch((e) => console.warn('[scenema] pump:', e.message)); }, 0); });
+  picks.set(job.id, entry);
+  return entry;
+}
+
+/* Returns { out } with the kept take's fields in the shape the rest of the pump reads, or
+ * { done: true } when the job has been ended here (no take said the new words). */
+async function finishWordPick(job, out, s, { best, report }) {
   job.editReport = report;
   if (best) {
     return { out: { ...out, url: best.url || best.audio_url, wav_url: best.wav_url, key: best.key, wav_key: best.wav_key,
       seed: Number.isInteger(best.seed) ? best.seed : out.seed, duration_s: best.duration_s ?? out.duration_s, bytes: best.bytes ?? out.bytes } };
   }
-  /* No take said the new words. The GPU time was spent, so it is logged and counts against the
-   * caps, but nothing reaches her library and the original stays as it was. */
+  /* No take said the new words. The GPU time and any cold start were spent, so they are logged
+   * and count against the caps, but nothing reaches her library and the original stays. */
   const execS = (s.executionTime || out.processing_ms || 0) / 1000;
-  const costUSD = Math.round((execS / 3600 * RATE_PER_HR + report.listenUSD) * 1000) / 1000;
+  const delayS = (s.delayTime || 0) / 1000;
+  const cold = delayS > 45;
+  const costUSD = Math.round((execS / 3600 * RATE_PER_HR + (cold ? WAKE_USD : 0) + report.listenUSD) * 1000) / 1000;
   job.state = 'failed'; job.noMatch = true; job.error = report.spoken; job.costUSD = costUSD; job.finishedAt = new Date().toISOString();
-  job.result = { engine: out.engine || job.engine, editReport: report, executionS: execS };
+  job.result = { engine: out.engine || job.engine, editReport: report, executionS: execS, delayS, cold };
   saveJobs();
-  receipt({ jobId: job.id, userId: job.userId, state: 'no-match', executionS: execS, costUSD, takes: report.takes.length });
-  await postUsage({ userId: job.userId, seconds: execS, costUSD, metadata: { jobId: job.id, executionS: execS, wordEdit: true, matched: false, agent: job.agentName } });
+  receipt({ jobId: job.id, userId: job.userId, state: 'no-match', executionS: execS, delayS, cold, costUSD, takes: report.takes.length });
+  await postUsage({ userId: job.userId, seconds: execS, costUSD, metadata: { jobId: job.id, executionS: execS, delayS, cold, wordEdit: true, matched: false, agent: job.agentName } });
   await notifyResult(job, 'Sound Booth: the words did not change', report.spoken.slice(0, 220));
   return { done: true };
 }
@@ -442,9 +470,12 @@ async function pump() {
   if (pumping) return; pumping = true;
   try {
     for (const job of jobs) {
-      if (!(job.state === 'queued' || job.state === 'running') || !job.runpodId) continue;
+      if (!(job.state === 'queued' || job.state === 'running') || !job.runpodId) { picks.delete(job.id); continue; }
+      const pick = picks.get(job.id);
+      if (pick && !pick.result) continue; // still listening
       let s;
-      try {
+      if (pick) s = pick.s;
+      else try {
         s = await status(job.runpodId);
         if (job.missingStatusCount) { job.missingStatusCount = 0; saveJobs(); }
       } catch (e) {
@@ -523,9 +554,13 @@ async function pump() {
       }
       if (s.status === 'COMPLETED') {
         let out = s.output || {};
-        /* Change words: listen to every take, keep the one that says the new words, or keep none. */
+        /* Change words: listen to every take, keep the one that says the new words, or keep none.
+         * The listening runs outside this loop (startWordPick); this pass only applies its answer. */
         if (job.wordEdit && !out.error) {
-          const picked = await pickWordTake(job, out, s);
+          if (!pick) { startWordPick(job, out, s); continue; }
+          picks.delete(job.id);
+          if (job.state === 'cancelled') continue;
+          const picked = await finishWordPick(job, out, s, pick.result);
           if (picked.done) continue;
           out = picked.out;
         }
@@ -636,7 +671,10 @@ function attachScenema(app, d = {}) {
     if (!job) return res.status(404).json({ error: 'no such job' });
     if (!['queued', 'running'].includes(job.state)) return res.json({ ok: true, state: job.state });
     try {
-      if (job.runpodId) await cancel(job.runpodId);
+      /* A word edit whose takes are being listened to has already finished on the GPU: there is
+       * nothing to cancel there, and the pump drops the listening once the job is stopped. */
+      if (job.runpodId && !picks.has(job.id)) await cancel(job.runpodId);
+      picks.delete(job.id);
       if (job.state === 'done') return res.json({ ok: true, state: 'done' });
       job.state = 'cancelled'; job.finishedAt = new Date().toISOString(); saveJobs();
       return res.json({ ok: true, state: job.state });
@@ -668,4 +706,4 @@ function attachScenema(app, d = {}) {
   }
 }
 
-module.exports = { attachScenema, makeJob, _internals: { pump, capsExceeded, spendSince, waitInfo, saySeconds, isZombie, queueLimitMs, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
+module.exports = { attachScenema, makeJob, _internals: { pump, whenPicked: () => Promise.all([...picks.values()].map((p) => p.promise)), capsExceeded, spendSince, waitInfo, saySeconds, isZombie, queueLimitMs, QUEUE_TIMEOUT_MS, COLD_WAKE_S, ZOMBIE_MS } };
