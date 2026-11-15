@@ -1,7 +1,8 @@
 'use strict';
-/* Clean up or change on AuK (Nov 15 2026): a task id and fixed choices in, AuK's own template out.
- * The templates are pinned here byte for byte as they appear in pe.config.yaml `tasks:` (upstream
- * src/auk/infer/pe.config.yaml), rendered the way pe.py renders them.
+/* Clean up or change on AuK (Nov 15 2026): a task id and fixed choices in, AuK's own phrase out.
+ * Every phrase is pinned here byte for byte as upstream pe.py _render_instruction sends it for an
+ * English request, with the FIRST pool entry where upstream picks one at random (upstream
+ * src/auk/infer/pe.config.yaml `template_pools`, else `tasks:`).
  * No network: the provider is a fixture. Run: node --test auk-tasks.test.js */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -31,42 +32,45 @@ test('the task ids and their choices are the ones the fork offers', () => {
   });
 });
 
-test('restoration tasks send Tencent\'s templates exactly, Chinese where there is no English one', () => {
-  assert.equal(say('clean_up'), '请清理这段输入语音，不做说话人删除，并去除房间混响，输出干净的人声结果。');
-  assert.equal(say('restore_muffled'), '请对这段语音做超分辨率/带宽扩展处理，恢复被削掉的高频成分，输出宽带纯净人声。');
-  /* effect_aliases: telephone [电话 ...], megaphone [扩音器 ...], underwater [水下 ...] */
-  assert.equal(say('remove_effect', { effect: 'phone' }), '请消除这段音频的电话音色，这段音频带有混响，请恢复成无混响的干声，输出自然清晰的人声。');
-  assert.equal(say('remove_effect', { effect: 'megaphone' }), '请消除这段音频的扩音器音色，这段音频带有混响，请恢复成无混响的干声，输出自然清晰的人声。');
-  assert.equal(say('remove_effect', { effect: 'underwater' }), '请消除这段音频的水下音色，这段音频带有混响，请恢复成无混响的干声，输出自然清晰的人声。');
+test('restoration tasks send upstream\'s first English pool phrase (template_pools.restoration)', () => {
+  assert.equal(say('clean_up'), 'Please clean up this input speech and keep all speakers intact, while removing the background noise and room reverberation. Output the restored clean speech with the same length as the input.');
+  assert.equal(say('restore_muffled'), 'This audio suffers from limited bandwidth. Please restore it to a wideband, clear-sounding speech.');
+  /* remove_effect buckets from runtime.effect_aliases: phone -> telephone */
+  assert.equal(say('remove_effect', { effect: 'phone' }), 'This speech carries telephone-band coloration. Please restore it to a natural wideband voice.');
+  assert.equal(say('remove_effect', { effect: 'megaphone' }), 'This audio has a megaphone-like coloration. Please restore it to a natural-sounding voice.');
+  assert.equal(say('remove_effect', { effect: 'underwater' }), 'This audio sounds underwater / muffled. Please restore it to a normal, clear-sounding voice.');
+  /* the first English pool phrase is also the tasks: template here */
   assert.equal(say('keep_singing'), 'Keep only the singing voice, drop everything else.');
   assert.equal(say('keep_voices'), 'Keep all human voices, speech and singing alike, drop everything else.');
-  /* n_zh is pe.py _integer_to_zh */
-  assert.equal(say('keep_speaker', { speaker: 1 }), '这段音频中只保留第一个开始说话的人对应的语音，去掉其余说话人。');
-  assert.equal(say('keep_speaker', { speaker: '2' }), '这段音频中只保留第二个开始说话的人对应的语音，去掉其余说话人。');
-  assert.equal(say('keep_speaker', { speaker: 3 }), '这段音频中只保留第三个开始说话的人对应的语音，去掉其余说话人。');
+  /* {n_ord} is pe.py _ordinal_en */
+  assert.equal(say('keep_speaker', { speaker: 1 }), 'Please keep the first speaker to start talking and remove the other speakers, outputting a single clean speech track.');
+  assert.equal(say('keep_speaker', { speaker: '2' }), 'Please keep the second speaker to start talking and remove the other speakers, outputting a single clean speech track.');
+  assert.equal(say('keep_speaker', { speaker: 3 }), 'Please keep the third speaker to start talking and remove the other speakers, outputting a single clean speech track.');
 });
 
-test('editing tasks send the English templates, filled the way pe.py fills them', () => {
-  /* speed_multiplier is a float in pe.py, so 2 is "2.0" */
+test('editing tasks send upstream\'s first English pool frame with its first value wording (template_pools.editing)', () => {
   assert.deepEqual([0.5, 0.75, 1.25, 1.5, 2].map((speed) => say('speed', { speed })), [
-    'Adjust the speech speed to 0.5x.', 'Adjust the speech speed to 0.75x.', 'Adjust the speech speed to 1.25x.',
-    'Adjust the speech speed to 1.5x.', 'Adjust the speech speed to 2.0x.']);
-  assert.equal(say('speed', { speed: '0.75' }), 'Adjust the speech speed to 0.75x.');
-  assert.equal(say('pitch', { direction: 'up', semitones: 2 }), 'Raise the pitch by 2 semitones.');
-  assert.equal(say('pitch', { direction: 'down', semitones: 1 }), 'Lower the pitch by 1 semitones.');
-  assert.equal(say('volume', { direction: 'up', db: 5 }), 'Increase the volume by 5 dB.');
-  assert.equal(say('volume', { direction: 'down', db: '15' }), 'Decrease the volume by 15 dB.');
+    'Please slow down to 0.5x for this speech.', 'Please slow down to 0.75x for this speech.', 'Please speed up to 1.25x for this speech.',
+    'Please speed up to 1.5x for this speech.', 'Please speed up to 2x for this speech.']);
+  assert.equal(say('speed', { speed: '0.75' }), 'Please slow down to 0.75x for this speech.');
+  assert.equal(say('pitch', { direction: 'up', semitones: 1 }), 'Please raise by 1 semitone for this speech.');
+  assert.equal(say('pitch', { direction: 'up', semitones: 2 }), 'Please raise by 2 semitones for this speech.');
+  assert.equal(say('pitch', { direction: 'down', semitones: 3 }), 'Please lower by 3 semitones for this speech.');
+  assert.equal(say('volume', { direction: 'up', db: 5 }), 'Please increase by 5 dB for this speech.');
+  assert.equal(say('volume', { direction: 'down', db: '15' }), 'Please decrease by 15 dB for this speech.');
   for (const emotion of ['happy', 'angry', 'sad', 'fearful', 'surprised', 'disgusted', 'calm', 'excited']) {
-    assert.equal(say('emotion', { emotion }), `Change the emotion to ${emotion}.`);
+    assert.equal(say('emotion', { emotion }), `Switch the emotion to ${emotion}.`);
   }
+  /* no English pool: pe.py falls back to the tasks: template, Chinese only */
   assert.equal(say('whisper_to_normal'), '把这段耳语转换成正常说话的声音。');
   assert.equal(say('remove_accent'), '请去掉这段语音里的方言口音，保持说话人音色一致。');
-  /* nonverbal_events: English names for English audio; uhm has none, so it falls back to Chinese, template and all */
+  /* nonverbal_events: English names for an English request; uhm has none, so the Chinese name and pool */
   assert.equal(say('remove_sound', { sound: 'breaths' }), 'Remove all the breath from the audio.');
   assert.equal(say('remove_sound', { sound: 'laughs' }), 'Remove all the laugh from the audio.');
   assert.equal(say('remove_sound', { sound: 'sighs' }), 'Remove all the sigh from the audio.');
   assert.equal(say('remove_sound', { sound: 'coughs' }), 'Remove all the cough from the audio.');
   assert.equal(say('remove_sound', { sound: 'ums' }), '删除音频中所有的"呃"的语气词。');
+  /* the tasks: template, which is also in the English voice_edit pool */
   assert.equal(say('voice', { description: 'a deep, warm older man' }), 'Keep the spoken content unchanged and change the timbre to: "a deep, warm older man".');
 });
 
@@ -122,7 +126,7 @@ test('the bridge builds the instruction from the task, ignores any free text, an
   assert.equal(r.ok, true, JSON.stringify(r));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sent[0].auk_task, 'edit');
-  assert.equal(sent[0].instruction, '请清理这段输入语音，不做说话人删除，并去除房间混响，输出干净的人声结果。');
+  assert.equal(sent[0].instruction, 'Please clean up this input speech and keep all speakers intact, while removing the background noise and room reverberation. Output the restored clean speech with the same length as the input.');
   assert.doesNotMatch(JSON.stringify(sent[0]), /joke|Tuesday/);
   assert.equal(sent[0].seed, 31337, 'the fork\'s fresh seed is used');
   assert.equal(sent[0].edit_start, 2);
@@ -135,7 +139,7 @@ test('the bridge builds the instruction from the task, ignores any free text, an
   job('two', { edit_task: 'pitch', edit_slots: { direction: 'down', semitones: 3 } });
   job('three', { edit_task: 'pitch', edit_slots: { direction: 'down', semitones: 3 } });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(sent[1].instruction, 'Lower the pitch by 3 semitones.');
+  assert.equal(sent[1].instruction, 'Please lower by 3 semitones for this speech.');
   assert.ok(Number.isInteger(sent[1].seed) && sent[1].seed > 0);
   assert.notEqual(sent[1].seed, sent[2].seed);
   assert.notEqual(sent[1].seed, 42);
@@ -151,7 +155,7 @@ test('a speed change gets its output length from the fork, or from the range, an
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sent[0].gen_seconds, 8);
   assert.equal(sent[1].gen_seconds, 8);
-  assert.equal(sent[1].instruction, 'Adjust the speech speed to 1.25x.');
+  assert.equal(sent[1].instruction, 'Please speed up to 1.25x for this speech.');
   assert.match(job('three', {}).error, /^A speed change needs the recording length\./);
   /* a bad choice is refused before anything is sent */
   assert.equal(job('four', { edit_slots: { speed: 3 } }).error, 'Choose a speed from the list.');

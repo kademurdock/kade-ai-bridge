@@ -4,13 +4,22 @@
  * AuK follows only its own trained instruction phrases, one task per request
  * (AUK_EDIT_DIAGNOSIS.md, Nov 14). So, as with Change words (auk-words.js), the fork never sends
  * an instruction for these. It sends a task id and a few fixed choices (slots); the instruction is
- * built here from Tencent's templates, copied byte for byte from the `tasks:` section of
- * upstream src/auk/infer/pe.config.yaml. A task with no English template there uses the Chinese one,
- * as upstream does. Nothing she types becomes an instruction, except the voice description, which
- * only ever fills the one slot inside AuK's own timbre template.
+ * built here, and it is what Tencent's own prompt builder (upstream src/auk/infer/pe.py
+ * _render_instruction) sends for an English request:
+ *   1. a phrase from pe.config.yaml `template_pools` (editing pools for speed, pitch, volume, mood
+ *      and removed sounds; restoration pools for clean-up, muffled audio, effects, singing, voices
+ *      and speakers), in English when the pool has English;
+ *   2. only when the pool has nothing for the language, the `tasks:` template (whisper to normal and
+ *      remove accent, Chinese only), or the Chinese pool when the sound has no English name (ums).
+ * Upstream picks a pool phrase (and a value wording) at random, seeded by the request. Here it is
+ * always the FIRST entry, so the instruction is fixed and testable; only the seed varies between
+ * tries. The voice change keeps its `tasks:` template, which is also in the English pool.
+ * auk-tasks.test.js pins every string; the work folder's check script renders them with pe.py itself.
+ * Nothing she types becomes an instruction, except the voice description, which only ever fills the
+ * one slot inside AuK's own timbre template.
  *
  * Fork -> bridge: `edit_task` (an id below) and `edit_slots` (an object), with auk_task 'edit'.
- * Bridge -> worker: the usual edit input, `instruction` = the template, one fresh `seed`.
+ * Bridge -> worker: the usual edit input, `instruction` = the phrase, one fresh `seed`.
  * The worker (eb93b87) passes a non-word instruction through unchanged and gives every window of a
  * long recording the same instruction, which suits these whole-recording tasks.
  * Contract: F:/KadeAI-work/auk-20261114/CONTRACT.md. */
@@ -20,13 +29,19 @@ const crypto = require('crypto');
 const MAX_DESCRIPTION = 300;
 const freshSeed = () => crypto.randomInt(1, 2147483647);
 
-/* pe.config.yaml runtime.effect_aliases: the first (Chinese) name of each effect, since the
- * remove_effect template has only a Chinese form. */
-const EFFECT_WORDS = { phone: '电话', megaphone: '扩音器', underwater: '水下' };
-/* pe.py _integer_to_zh for 1-3: the speaker's place in Chinese. */
-const ORDER_ZH = { 1: '一', 2: '二', 3: '三' };
-/* pe.config.yaml nonverbal_events: English audio uses the event's English name (the first one);
- * an event with no English name falls back to its Chinese name and the Chinese template (uhm). */
+/* restoration.improve_quality.remove_effect.<bucket>.en[0]; the buckets are runtime.effect_aliases
+ * (phone -> telephone). */
+const EFFECT_PHRASES = {
+  phone: 'This speech carries telephone-band coloration. Please restore it to a natural wideband voice.',
+  megaphone: 'This audio has a megaphone-like coloration. Please restore it to a natural-sounding voice.',
+  underwater: 'This audio sounds underwater / muffled. Please restore it to a normal, clear-sounding voice.',
+};
+/* pe.py _ordinal_en for 1-3: the {n_ord} slot of restoration.separate_speech.by_order.en[0]. */
+const ORDER_EN = { 1: 'first', 2: 'second', 3: 'third' };
+/* editing.speed_edit.values.<x.xx>x.en[0]: the {value} of editing.speed_edit.templates.en[0]. */
+const SPEED_VALUES = { 0.5: 'slow down to 0.5x', 0.75: 'slow down to 0.75x', 1.25: 'speed up to 1.25x', 1.5: 'speed up to 1.5x', 2: 'speed up to 2x' };
+/* pe.config.yaml nonverbal_events: an English request uses the event's English name (the first one);
+ * an event with no English name falls back to its Chinese name and the Chinese pool (uhm). */
 const SOUND_EVENTS = {
   breaths: { lang: 'en', name: 'breath' },
   laughs: { lang: 'en', name: 'laugh' },
@@ -39,79 +54,75 @@ const EMOTION_LENGTH = { sad: 1.22, fearful: 1.16, happy: 1.06, angry: 1.06, sur
 /* pe.config.yaml tasks.nonverbal_edit.duration.nonverbal_adjustments, delete side. */
 const SOUND_DELTA = { breaths: -0.6, laughs: -1.05, sighs: -1.05, coughs: -1.05, ums: -0.9 };
 
-/** Python's str() of the speed choices, since upstream formats the float: 2 -> "2.0". */
-const pyFloat = (n) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
+/* editing.{speed,pitch,volume}_edit.templates.en[0] is 'Please {value} for this speech.' */
+const pleaseFor = (value) => `Please ${value} for this speech.`;
 
 /* Each task: its slots (allowed values) and its instruction. `seconds` is the output length for an
  * input of `s` seconds (pe.py duration strategies); absent means the same length. */
 const TASKS = {
-  /* enhance_speech */
+  /* enhance_speech: restoration.enhance_speech.en[0] */
   clean_up: {
     slots: {},
-    instruction: () => '请清理这段输入语音，不做说话人删除，并去除房间混响，输出干净的人声结果。',
+    instruction: () => 'Please clean up this input speech and keep all speakers intact, while removing the background noise and room reverberation. Output the restored clean speech with the same length as the input.',
   },
-  /* improve_quality, bandwidth_extension */
+  /* improve_quality, bandwidth_extension: restoration.improve_quality.bandwidth_extension.en[0] */
   restore_muffled: {
     slots: {},
-    instruction: () => '请对这段语音做超分辨率/带宽扩展处理，恢复被削掉的高频成分，输出宽带纯净人声。',
+    instruction: () => 'This audio suffers from limited bandwidth. Please restore it to a wideband, clear-sounding speech.',
   },
   /* improve_quality, remove_effect */
   remove_effect: {
     slots: { effect: ['phone', 'megaphone', 'underwater'] },
-    instruction: ({ effect }) => `请消除这段音频的${EFFECT_WORDS[effect]}音色，这段音频带有混响，请恢复成无混响的干声，输出自然清晰的人声。`,
+    instruction: ({ effect }) => EFFECT_PHRASES[effect],
   },
-  /* extract_vocals, singing_only */
+  /* extract_vocals, singing_only: restoration pool en[0], the same as the tasks: template */
   keep_singing: {
     slots: {},
     instruction: () => 'Keep only the singing voice, drop everything else.',
   },
-  /* extract_vocals, all_human_voices */
+  /* extract_vocals, all_human_voices: restoration pool en[0], the same as the tasks: template */
   keep_voices: {
     slots: {},
     instruction: () => 'Keep all human voices, speech and singing alike, drop everything else.',
   },
-  /* separate_speech, by_order */
+  /* separate_speech, by_order: restoration.separate_speech.by_order.en[0] */
   keep_speaker: {
     slots: { speaker: [1, 2, 3] },
-    instruction: ({ speaker }) => `这段音频中只保留第${ORDER_ZH[speaker]}个开始说话的人对应的语音，去掉其余说话人。`,
+    instruction: ({ speaker }) => `Please keep the ${ORDER_EN[speaker]} speaker to start talking and remove the other speakers, outputting a single clean speech track.`,
   },
   /* speed_edit */
   speed: {
     slots: { speed: [0.5, 0.75, 1.25, 1.5, 2] },
-    instruction: ({ speed }) => `Adjust the speech speed to ${pyFloat(speed)}x.`,
+    instruction: ({ speed }) => pleaseFor(SPEED_VALUES[speed]),
     seconds: (s, { speed }) => s / speed,
   },
-  /* pitch_edit */
+  /* pitch_edit: editing.pitch_edit.values.{p,n}0N.en[0] */
   pitch: {
     slots: { direction: ['up', 'down'], semitones: [1, 2, 3] },
-    instruction: ({ direction, semitones }) => direction === 'up'
-      ? `Raise the pitch by ${semitones} semitones.`
-      : `Lower the pitch by ${semitones} semitones.`,
+    instruction: ({ direction, semitones }) => pleaseFor(`${direction === 'up' ? 'raise' : 'lower'} by ${semitones} semitone${semitones === 1 ? '' : 's'}`),
   },
-  /* volume_edit */
+  /* volume_edit: editing.volume_edit.values.{p,m}NNdB.en[0] */
   volume: {
     slots: { direction: ['up', 'down'], db: [5, 10, 15] },
-    instruction: ({ direction, db }) => direction === 'up'
-      ? `Increase the volume by ${db} dB.`
-      : `Decrease the volume by ${db} dB.`,
+    instruction: ({ direction, db }) => pleaseFor(`${direction === 'up' ? 'increase' : 'decrease'} by ${db} dB`),
   },
-  /* emotion_edit */
+  /* emotion_edit: editing.emotion_edit.templates.en[0], {emo} = values.<emotion>.en[0] */
   emotion: {
     slots: { emotion: ['happy', 'angry', 'sad', 'fearful', 'surprised', 'disgusted', 'calm', 'excited'] },
-    instruction: ({ emotion }) => `Change the emotion to ${emotion}.`,
+    instruction: ({ emotion }) => `Switch the emotion to ${emotion}.`,
     seconds: (s, { emotion }) => s * EMOTION_LENGTH[emotion],
   },
-  /* whisper_edit, to_normal */
+  /* whisper_edit, to_normal: no pool, so the tasks: template (Chinese only) */
   whisper_to_normal: {
     slots: {},
     instruction: () => '把这段耳语转换成正常说话的声音。',
   },
-  /* accent_edit */
+  /* accent_edit: the pool has no English, so pe.py falls back to the tasks: template (Chinese only) */
   remove_accent: {
     slots: {},
     instruction: () => '请去掉这段语音里的方言口音，保持说话人音色一致。',
   },
-  /* nonverbal_edit, delete */
+  /* nonverbal_edit, delete: editing.nonverbal_edit.templates.<lang>.delete.global[0] */
   remove_sound: {
     slots: { sound: ['breaths', 'laughs', 'sighs', 'coughs', 'ums'] },
     instruction: ({ sound }) => SOUND_EVENTS[sound].lang === 'en'
@@ -119,7 +130,8 @@ const TASKS = {
       : `删除音频中所有的${SOUND_EVENTS[sound].name}。`,
     seconds: (s, { sound }) => Math.max(0.1, s + SOUND_DELTA[sound]),
   },
-  /* voice_edit, English template; the one typed slot */
+  /* voice_edit: the tasks: English template, which is also in editing.voice_edit.templates.en;
+   * the one typed slot */
   voice: {
     slots: { description: 'text' },
     instruction: ({ description }) => `Keep the spoken content unchanged and change the timbre to: "${description}".`,
@@ -177,4 +189,4 @@ function targetSeconds(id, slots, seconds) {
 /** Whether the task changes the length (speed must; emotion and sound removal a little). */
 const changesLength = (id) => !!(TASKS[id] && TASKS[id].seconds);
 
-module.exports = { TASKS, TASK_IDS, taskInput, targetSeconds, changesLength, freshSeed, cleanDescription, EFFECT_WORDS, SOUND_EVENTS, EMOTION_LENGTH, SOUND_DELTA, MAX_DESCRIPTION };
+module.exports = { TASKS, TASK_IDS, taskInput, targetSeconds, changesLength, freshSeed, cleanDescription, EFFECT_PHRASES, SOUND_EVENTS, EMOTION_LENGTH, SOUND_DELTA, MAX_DESCRIPTION };
