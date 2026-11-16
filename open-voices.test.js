@@ -70,7 +70,7 @@ test('speak input: our clip, style and the clip words; knobs map to each worker'
   assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'x'.repeat(2501) }).error, /2500/);
   assert.match(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'x'.repeat(5001) }).error, /5000/);
   assert.ok(!ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'x'.repeat(2501) }).error);
-  assert.match(ov.buildInput('nope', { mode: 'design' }).error, /VoxCPM2 or Ming/);
+  assert.match(ov.buildInput('nope', { mode: 'design' }).error, /Pick a voice engine/);
   assert.match(ov.buildInput('voxcpm', { mode: 'sing', text: 'x' }).error, /Design a voice or Speak/);
 });
 
@@ -170,6 +170,10 @@ test('routes: secret required, status is per owner, health names both engines', 
   assert.equal(health.engines.ming.configured, false);
   assert.equal(health.engines.ming.controls, true, 'the fork offers Ming controls only when the bridge says it reads them');
   assert.equal(health.engines.voxcpm.controls, undefined);
+  assert.deepEqual(Object.keys(health.engines), ['voxcpm', 'ming', 'chatterbox', 'dramabox']);
+  assert.equal(health.engines.chatterbox.configured, false, 'off until CHATTERBOX_ENDPOINT_ID is set');
+  assert.equal(health.engines.dramabox.configured, false, 'off until DRAMABOX_ENDPOINT_ID is set');
+  assert.equal(health.engines.dramabox.maxText, 4000);
   const stop = await (await post('/audio/open-voices/cancel', { secret: 'test-only', jobId: started.jobId, userId: 'u1' })).json();
   assert.equal(stop.state, 'cancelled');
 });
@@ -345,4 +349,168 @@ test('lane: a Ming take sends exactly the worker fields and files its controls',
 test('every built-in voice has a spoken name for My Creations', () => {
   for (const v of ov.MING.voices) assert.ok(ov.VOICE_LABELS[v], v);
   assert.equal(ov.VOICE_LABELS['\u7075\u5c0f\u67d4'], 'Ling Xiaorou, Chinese, young woman');
+});
+
+/* ---------- Chatterbox and DramaBox (Nov 16 2026; workers chatterbox_contract.py, dramabox_contract.py) ---------- */
+
+test('Chatterbox and DramaBox are off until their endpoint env is set', () => {
+  assert.equal(ov.endpointOf('chatterbox', {}), '');
+  assert.equal(ov.endpointOf('dramabox', {}), '');
+  assert.equal(ov.endpointOf('chatterbox', { CHATTERBOX_ENDPOINT_ID: 'cbox0001' }), 'cbox0001');
+  assert.equal(ov.endpointOf('dramabox', { DRAMABOX_ENDPOINT_ID: 'dbox0001' }), 'dbox0001');
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k' }, http: fakeHttp(), dataDir: tmp() });
+  assert.equal(lane.ready('chatterbox'), false);
+  assert.equal(lane.ready('dramabox'), false);
+  assert.equal(ov.ENGINES.chatterbox.maxText, 5000);
+  assert.equal(ov.ENGINES.dramabox.maxText, 4000);
+});
+
+test('Chatterbox design: its own built-in voice, the version as model; a description or style is refused', () => {
+  assert.deepEqual(ov.buildInput('chatterbox', { mode: 'design', text: ' Hello there. ', seed: 4 }).input, { mode: 'design', text: 'Hello there.', model: 'turbo', seed: 4 });
+  assert.deepEqual(ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', version: 'Original', exaggeration: '0.7', cfg_weight: 0.3, temperature: 1.2, seed: 1 }).input,
+    { mode: 'design', text: 'Hi', model: 'original', temperature: 1.2, exaggeration: 0.7, cfg_weight: 0.3, seed: 1 });
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', description: 'warm' }).error, /own built-in voice here\. To use your own voice, choose Speak with a voice/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'speak', reference_voice_url: CLIP, text: 'Hi', style: 'calm' }).error, /takes no style/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', version: 'mega' }).error, /Turbo, Original or Multilingual/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'x'.repeat(5001) }).error, /too long for Chatterbox. The most is 5000/);
+  for (const k of ['voice', 'emotion', 'language']) assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', [k]: 'x' }).error, /work only with Ming/, k);
+});
+
+test('Chatterbox speak: our clip as reference_url, no prompt_text, no description', () => {
+  const r = ov.buildInput('chatterbox', { mode: 'speak', reference_voice_url: CLIP, text: 'Words', prompt_text: 'clip words', seed: 2 });
+  assert.deepEqual(r.input, { mode: 'clone', text: 'Words', reference_url: CLIP, model: 'turbo', seed: 2 });
+  assert.match(ov.buildInput('chatterbox', { mode: 'speak', text: 'Words' }).error, /saved voice or a clip/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'speak', reference_voice_url: 'https://evil.example/a.wav', text: 'Words' }).error, /not stored/);
+});
+
+test('Chatterbox sound tags: Turbo knows its own list and the other spellings; the others refuse them', () => {
+  const ok = ov.buildInput('chatterbox', { mode: 'design', text: 'Well [sigh] fine. [Laughs] [clear throat] [whispering] ok', seed: 1 });
+  assert.equal(ok.error, undefined);
+  assert.equal(ok.input.text, 'Well [sigh] fine. [Laughs] [clear throat] [whispering] ok', 'the worker rewrites spellings itself');
+  assert.equal(ov.CHATTERBOX.eventTags.length + ov.CHATTERBOX.styleTags.length, 19);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Well [yawn] fine.' }).error, /Turbo does not know the sound tag \[yawn\]/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Chapter [3]' }).error, /\[3\]/, 'Turbo reads any brackets as a tag');
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: '[laugh] [sigh]' }).error, /not only sound tags/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Well [sigh] fine.', version: 'original' }).error, /work only with Chatterbox Turbo/);
+  assert.equal(ov.buildInput('chatterbox', { mode: 'design', text: 'Chapter [3]', version: 'original' }).error, undefined, 'other brackets are words for Original');
+});
+
+test('Chatterbox knobs: ranges per version, as the worker checks them', () => {
+  const d = (b) => ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', ...b });
+  assert.match(d({ temperature: 3 }).error, /Variety must be a number from 0.05 to 2 for Turbo/);
+  assert.equal(d({ version: 'original', temperature: 3 }).input.temperature, 3);
+  assert.match(d({ version: 'original', temperature: 6 }).error, /0.05 to 5/);
+  assert.match(d({ exaggeration: 1 }).error, /for Original and Multilingual/);
+  assert.match(d({ cfg_weight: 0.5 }).error, /for Original and Multilingual/);
+  assert.equal(d({ exaggeration: '', cfg_weight: null }).error, undefined, 'empty knobs are not set');
+  assert.match(d({ version: 'original', exaggeration: 0.2 }).error, /Expressiveness must be a number from 0.25 to 2/);
+  assert.match(d({ version: 'original', cfg_weight: 0 }).error, /above 0 and at most 1 for Original/);
+  assert.match(d({ version: 'original', cfg_weight: 1.5 }).error, /above 0/);
+  assert.equal(d({ version: 'multilingual', language_id: 'de', cfg_weight: 0 }).input.cfg_weight, 0);
+  assert.match(d({ version: 'multilingual' }).error, /Pick a language for Multilingual/);
+  assert.match(d({ version: 'multilingual', language_id: 'xx' }).error, /Pick a language/);
+  assert.deepEqual(d({ version: 'multilingual', language_id: 'DE', seed: 3 }).input, { mode: 'design', text: 'Hi', model: 'multilingual', language_id: 'de', seed: 3 });
+  assert.match(d({ version: 'original', language_id: 'fr' }).error, /English only/);
+  assert.equal(d({ version: 'turbo', language_id: 'en' }).input.language_id, undefined, 'English is the default and is not sent');
+  assert.equal(ov.CHATTERBOX.languages.length, 23);
+  assert.match(d({ temperature: 'warm' }).error, /Variety/);
+});
+
+test('DramaBox: the scene goes as prompt, watermark off, quotes checked, optional length and clip seconds', () => {
+  const scene = 'An old sailor leans on the rail. "Storm\'s coming." He laughs softly. "Always is."';
+  assert.deepEqual(ov.buildInput('dramabox', { mode: 'design', text: scene, seed: 9 }).input, { mode: 'design', prompt: scene, watermark: false, seed: 9 });
+  const clone = ov.buildInput('dramabox', { mode: 'speak', reference_voice_url: CLIP, text: scene, duration: '12', reference_seconds: 15, seed: 1 }).input;
+  assert.deepEqual(clone, { mode: 'clone', prompt: scene, reference_url: CLIP, watermark: false, duration: 12, reference_seconds: 15, seed: 1 });
+  assert.equal(ov.buildInput('dramabox', { mode: 'design', text: 'She smiles. “Hello.”' }).error, undefined, 'curly quotes count');
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: 'She smiles. "Hello.' }).error, /not closed/);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: 'She smiles and waves.' }).error, /at least one spoken line inside double quotes/);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: '' }).error, /Write the scene first/);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: '"' + 'x'.repeat(4000) + '"' }).error, /scene is too long for DramaBox. The most is 4000/);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: scene, description: 'a sailor' }).error, /takes no description/);
+  assert.match(ov.buildInput('dramabox', { mode: 'speak', reference_voice_url: CLIP, text: scene, style: 'calm' }).error, /DramaBox takes no style/);
+  for (const bad of [2, 46, 'long']) assert.match(ov.buildInput('dramabox', { mode: 'design', text: scene, duration: bad }).error, /Scene length must be from 3 to 45 seconds/, String(bad));
+  assert.equal(ov.buildInput('dramabox', { mode: 'design', text: scene, duration: 0 }).input.duration, undefined, '0 is automatic');
+  assert.equal(ov.buildInput('dramabox', { mode: 'design', text: scene, duration: '' }).input.duration, undefined);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: scene, reference_seconds: 10 }).error, /for Speak with a voice/);
+  assert.match(ov.buildInput('dramabox', { mode: 'speak', reference_voice_url: CLIP, text: scene, reference_seconds: 40 }).error, /from 3 to 30 seconds/);
+  assert.equal(ov.spokenLines(scene), "Storm's coming. Always is.");
+});
+
+test('lane: a Chatterbox take sends exactly the worker fields; its title, words and version are filed', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let done = false;
+  const out = { url: 'https://s3.us-east-005.backblazeb2.com/b/chatterbox/x.mp3?sig', wav_url: 'https://s3.us-east-005.backblazeb2.com/b/chatterbox/x.wav?sig', key: 'chatterbox/x.mp3', wav_key: 'chatterbox/x.wav', duration_seconds: 2.4, sample_rate: 24000, mode: 'clone', seed: 6, engine: 'chatterbox', model: 'turbo' };
+  const http = fakeHttp({
+    get: (url) => url.endsWith('/health') ? { workers: { idle: 1 } } : done ? { status: 'COMPLETED', executionTime: 3600000, output: out } : { status: 'IN_PROGRESS' },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-c', status: 'IN_QUEUE' } : { ok: true },
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k', CHATTERBOX_ENDPOINT_ID: 'cbox0001', KADE_USAGE_EVENT_SECRET: 's', FORK_USAGE_URL: 'https://fork.test' }, http, dataDir: dir });
+  assert.match((await lane.start({ engine: 'dramabox', userId: 'u1', mode: 'design', text: '"Hi."' })).error, /DramaBox is not set up/);
+  const r = await lane.start({ engine: 'chatterbox', userId: 'u1', mode: 'speak', reference_voice_url: CLIP, text: 'Oh [laugh] that is good.', version: 'turbo', temperature: 0.9, seed: 6 });
+  assert.equal(r.ok, true);
+  const run = http.calls.find((c) => c.url.endsWith('/run'));
+  assert.equal(run.url, 'https://api.runpod.ai/v2/cbox0001/run');
+  assert.deepEqual(run.body.input, { mode: 'clone', text: 'Oh [laugh] that is good.', reference_url: CLIP, model: 'turbo', temperature: 0.9, seed: 6 });
+  assert.equal(lane.view(lane.find(r.jobId)).version, 'turbo');
+  done = true;
+  await lane.pump();
+  const job = lane.find(r.jobId);
+  assert.equal(job.state, 'done');
+  assert.equal(job.result.version, 'turbo');
+  assert.equal(job.costUSD, 1.34, 'the 24 GB rate');
+  const asset = http.calls.find((c) => c.url.endsWith('/asset-event'));
+  assert.equal(asset.body.service, 'chatterbox_audio');
+  assert.equal(asset.body.metadata.engine, 'Chatterbox Turbo');
+  assert.equal(asset.body.metadata.openVoice.version, 'turbo');
+  assert.equal(asset.body.metadata.openVoice.words, 'Oh that is good.', 'the clip words carry no tags');
+  assert.deepEqual(asset.body.metadata.openVoice.controls, { model: 'turbo', temperature: 0.9 });
+});
+
+test('lane: a DramaBox design take files the scene as the prompt and only the spoken lines as words; it waits twice as long to start', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let clock = Date.parse('2026-11-16T00:00:00Z');
+  let state = 'IN_QUEUE';
+  const out = { url: 'https://s3.us-east-005.backblazeb2.com/b/dramabox/x.mp3?sig', key: 'dramabox/x.mp3', duration_seconds: 4, sample_rate: 48000, mode: 'design', seed: 2, engine: 'dramabox' };
+  const http = fakeHttp({
+    get: (url) => url.endsWith('/health') ? { workers: { idle: 0 } } : state === 'COMPLETED' ? { status: 'COMPLETED', executionTime: 1800000, output: out } : { status: state },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-d', status: 'IN_QUEUE' } : { ok: true },
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k', DRAMABOX_ENDPOINT_ID: 'dbox0001', KADE_USAGE_EVENT_SECRET: 's', FORK_USAGE_URL: 'https://fork.test' }, http, dataDir: dir, now: () => clock });
+  const scene = 'A tired nurse, gentle. "You did well." She sighs. "Rest now."';
+  const r = await lane.start({ engine: 'dramabox', userId: 'u1', mode: 'design', text: scene, duration: 8, seed: 2 });
+  assert.equal(r.ok, true);
+  assert.equal(r.coldLikely, true);
+  assert.deepEqual(http.calls.find((c) => c.url.endsWith('/run')).body.input, { mode: 'design', prompt: scene, watermark: false, duration: 8, seed: 2 });
+  clock += 20 * 60 * 1000; // past VoxCPM2's 15 minutes, inside DramaBox's 30
+  await lane.pump();
+  assert.equal(lane.find(r.jobId).state, 'queued');
+  state = 'COMPLETED';
+  await lane.pump();
+  assert.equal(lane.find(r.jobId).state, 'done');
+  assert.equal(lane.find(r.jobId).costUSD, 0.945, 'the 48 GB rate');
+  const asset = http.calls.find((c) => c.url.endsWith('/asset-event'));
+  assert.equal(asset.body.service, 'dramabox_audio');
+  assert.equal(asset.body.prompt, scene);
+  assert.equal(asset.body.metadata.engine, 'DramaBox');
+  assert.equal(asset.body.metadata.openVoice.words, 'You did well. Rest now.');
+  assert.deepEqual(asset.body.metadata.openVoice.controls, { duration: 8 });
+  assert.equal('version' in asset.body.metadata.openVoice, false);
+});
+
+test('Chatterbox and DramaBox worker sentences reach her plainly', () => {
+  assert.match(ov.plainError({ error: 'The reference clip must be longer than 5 seconds for model turbo (5 to 10 seconds of clear speech is best).' }), /^Chatterbox Turbo needs a clip longer than 5 seconds/);
+  assert.match(ov.plainError({ error: 'The reference clip must be at least 3 seconds long.' }), /too short/);
+  assert.match(ov.plainError({ error: 'The reference clip is mostly silent. It needs at least 3 seconds of clear voice (half the clip, if it is shorter than 6 seconds).' }), /mostly silent/);
+  assert.equal(ov.plainError({ error: 'The scene is too long: about 320 s of audio, at most 300 s.' }), 'The scene is too long: about 320 seconds of audio. The most is 300 seconds.');
+  assert.match(ov.plainError({ error: 'One sentence is too long to say in one take (about 50 s, at most 45 s). Break it into shorter sentences.' }), /^One spoken sentence is too long/);
+  assert.match(ov.plainError({ error: 'Chatterbox could not finish (RuntimeError). No audio was generated.' }), /^The voice engine could not make this take/);
+  assert.match(ov.plainError({ error: 'The DramaBox worker is missing a required component.', error_code: 'missing_dependency' }), /missing a part/);
+});
+
+test('every engine keeps one shape for Ming, VoxCPM2 and the labels', () => {
+  assert.equal(ov.engineLabel({ engine: 'chatterbox', version: 'multilingual' }), 'Chatterbox Multilingual');
+  assert.equal(ov.engineLabel({ engine: 'ming' }), 'Ming');
+  assert.deepEqual(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'W', version: 'turbo', duration: 9, seed: 1 }).input, { mode: 'design', text: 'W', description: 'd', seed: 1 }, 'the new fields never reach VoxCPM2');
 });

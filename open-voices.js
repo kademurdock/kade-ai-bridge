@@ -1,5 +1,5 @@
 'use strict';
-/* open-voices.js — VoxCPM2 and Ming voices on RunPod serverless (Nov 15 2026).
+/* open-voices.js — VoxCPM2, Ming, Chatterbox and DramaBox voices on RunPod serverless (Nov 15-16 2026).
  *
  * Two open voice engines for the Sound Booth, with one job shape (worker voxcpm_contract.py and
  * ming_contract.py in F:/KadeAI-work/{voxcpm,ming}-20261115/worker):
@@ -15,8 +15,14 @@
  * user's My Creations through the fork's asset lane (which mirrors it to our storage for good) and
  * its GPU time through the usage lane. Jobs and receipts live on the volume.
  *
- * Env: RUNPOD_API_KEY · VOXCPM_ENDPOINT_ID (default dewjq1ibxkp2c3) · MING_ENDPOINT_ID (no default;
- * unset = Ming is hidden and refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR (defaults 1.34 / 1.89) ·
+ * Nov 16 2026: Chatterbox (worker chatterbox_contract.py: turbo / original / multilingual, built-in
+ * voice or a clip at reference_url) and DramaBox (dramabox_contract.py: one prose scene as `prompt`,
+ * words in double quotes spoken, the rest acted; optional clip). See CHATTERBOX / DRAMABOX below.
+ *
+ * Env: RUNPOD_API_KEY · VOXCPM_ENDPOINT_ID (default dewjq1ibxkp2c3) · MING_ENDPOINT_ID,
+ * CHATTERBOX_ENDPOINT_ID, DRAMABOX_ENDPOINT_ID (no defaults; unset = that engine is hidden and
+ * refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR / CHATTERBOX_RATE_PER_HR / DRAMABOX_RATE_PER_HR
+ * (defaults 1.34 / 1.89 / 1.34 / 1.89) ·
  * OPEN_VOICES_DAILY_CAP_USD (1.00) / OPEN_VOICES_MONTHLY_CAP_USD (20) · OPEN_VOICES_QUEUE_TIMEOUT_MS
  * (15 min; Ming gets twice that) · OPEN_VOICES_RUN_CEILING_MS (20 min more, past which any job is given up) ·
  * OPEN_VOICES_AUDIO_HOSTS (extra storage hosts, comma list) ·
@@ -49,7 +55,125 @@ const ENGINES = {
     maxPrefix: 600, cfg: { name: 'cfg_scale', min: 1, max: 5 }, steps: { name: 'flow_steps', min: 4, max: 50 },
     queueFactor: 2, maxText: 2500, rate: '1.89', // top of its 48 GB pools (L40S) // Ming runs ~1.5 s per audio second; longer text passes the 600 s job limit
   },
+  /* Nov 16 2026. Both off until their endpoint env is set (no default endpoint). Neither takes a
+   * description or a style: Chatterbox's design is its own built-in voice; DramaBox's design is the
+   * speaker the scene itself describes. */
+  chatterbox: {
+    id: 'chatterbox', label: 'Chatterbox', model: 'ResembleAI/chatterbox', service: 'chatterbox_audio',
+    endpointEnv: 'CHATTERBOX_ENDPOINT_ID', defaultEndpoint: '', rateEnv: 'CHATTERBOX_RATE_PER_HR',
+    queueFactor: 1, maxText: 5000, rate: '1.34', // top of its 24 GB pools (4090); worker chatterbox_contract.MAX_TEXT_CHARS
+  },
+  dramabox: {
+    id: 'dramabox', label: 'DramaBox', model: 'ResembleAI/Dramabox', service: 'dramabox_audio',
+    endpointEnv: 'DRAMABOX_ENDPOINT_ID', defaultEndpoint: '', rateEnv: 'DRAMABOX_RATE_PER_HR',
+    queueFactor: 2, maxText: 4000, rate: '1.89', // 48 GB pools; a cold start loads ~16 GB of weights; dramabox_contract.MAX_PROMPT_CHARS
+  },
 };
+
+/* Chatterbox (worker chatterbox_contract.py). One worker, three versions ("model"):
+ *   turbo:        English, sound tags inline, temperature 0.05-2. Its clip must be over 5 s.
+ *   original:     English, exaggeration 0.25-2, cfg_weight above 0 up to 1, temperature 0.05-5.
+ *   multilingual: language_id (23 codes, required), exaggeration, cfg_weight 0-1, temperature 0.05-5.
+ * The worker reads ANY [bracketed words] as a tag for Turbo and refuses an unknown one, so the bridge
+ * does the same, in a plain sentence, before GPU time. */
+const CHATTERBOX = {
+  versions: ['turbo', 'original', 'multilingual'],
+  versionLabels: { turbo: 'Turbo', original: 'Original', multilingual: 'Multilingual' },
+  eventTags: ['[clear throat]', '[sigh]', '[shush]', '[cough]', '[groan]', '[sniff]', '[gasp]', '[chuckle]', '[laugh]'],
+  styleTags: ['[angry]', '[fear]', '[surprised]', '[whispering]', '[advertisement]', '[dramatic]', '[narration]', '[crying]', '[happy]', '[sarcastic]'],
+  aliases: ['laughs', 'laughing', 'laughter', 'chuckles', 'giggle', 'giggles', 'sighs', 'sighing', 'coughs', 'coughing', 'gasps', 'groans',
+    'sniffs', 'sniffle', 'throat clear', 'clears throat', 'clearing throat', 'shh', 'whisper', 'whispers', 'cries', 'crying', 'sarcasm', 'surprise', 'scared'],
+  languages: ['ar', 'da', 'de', 'el', 'en', 'es', 'fi', 'fr', 'he', 'hi', 'it', 'ja', 'ko', 'ms', 'nl', 'no', 'pl', 'pt', 'ru', 'sv', 'sw', 'tr', 'zh'],
+  temperature: { turbo: [0.05, 2], original: [0.05, 5], multilingual: [0.05, 5] },
+  exaggeration: [0.25, 2],
+  turboClipMinS: 5,
+};
+const CB_TAG_RE = /\[([^\[\]]{1,40})\]/g; // the worker's own pattern
+const CB_KNOWN = new Set([...CHATTERBOX.eventTags, ...CHATTERBOX.styleTags].map((t) => t.slice(1, -1)).concat(CHATTERBOX.aliases));
+const cbTagName = (raw) => raw.replace(/\s+/g, ' ').trim().toLowerCase();
+
+/* DramaBox (worker dramabox_contract.py): one prose scene. Words inside straight double quotes are
+ * spoken; the rest is performed. Curly quotes count as straight ones (the worker swaps them). */
+const DRAMABOX = { maxDuration: 45, minDuration: 3, referenceSeconds: [3, 30] };
+const CURLY_QUOTES = /[“”„‟«»]/g;
+/* The spoken lines of a scene, in order (what a saved voice's clip actually says). */
+function spokenLines(scene) {
+  return [...String(scene || '').replace(CURLY_QUOTES, '"').matchAll(/"([^"]+)"/g)].map((m) => m[1].trim()).filter(Boolean).join(' ');
+}
+
+const numberOf = (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v.trim()) : v);
+const isSet = (v) => v !== undefined && v !== null && v !== '';
+
+/* Chatterbox's fields on a booth request -> worker fields, or { error }. */
+function chatterboxFields(b, input) {
+  const version = isSet(b.version) ? String(b.version).trim().toLowerCase() : 'turbo';
+  if (!CHATTERBOX.versions.includes(version)) return { error: 'Pick Turbo, Original or Multilingual for the version.' };
+  const name = CHATTERBOX.versionLabels[version];
+  const fields = { model: version };
+  let unknown = '';
+  let tagged = false;
+  for (const m of input.text.matchAll(CB_TAG_RE)) {
+    if (CB_KNOWN.has(cbTagName(m[1]))) tagged = true;
+    else if (!unknown) unknown = m[0];
+  }
+  if (version === 'turbo') {
+    if (unknown) return { error: `Chatterbox Turbo does not know the sound tag ${unknown}. Pick one from Sound tags, or take it out.` };
+    if (!input.text.replace(CB_TAG_RE, '').replace(/[\s.,!?]/g, '')) return { error: 'Type some words to say, not only sound tags.' };
+  } else if (tagged) return { error: 'Sound tags work only with Chatterbox Turbo. Take them out, or set the version to Turbo.' };
+  const temperature = numberOf(b.temperature);
+  if (isSet(temperature)) {
+    const [lo, hi] = CHATTERBOX.temperature[version];
+    if (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < lo || temperature > hi) return { error: `Variety must be a number from ${lo} to ${hi} for ${name}.` };
+    fields.temperature = temperature;
+  }
+  const exaggeration = numberOf(b.exaggeration);
+  const cfg = numberOf(b.cfg_weight);
+  if (version === 'turbo') {
+    if (isSet(exaggeration) || isSet(cfg)) return { error: 'Expressiveness and steadiness are for Original and Multilingual. Turbo does not use them.' };
+  } else {
+    if (isSet(exaggeration)) {
+      const [lo, hi] = CHATTERBOX.exaggeration;
+      if (typeof exaggeration !== 'number' || !Number.isFinite(exaggeration) || exaggeration < lo || exaggeration > hi) return { error: `Expressiveness must be a number from ${lo} to ${hi}.` };
+      fields.exaggeration = exaggeration;
+    }
+    if (isSet(cfg)) {
+      const zeroOk = version === 'multilingual';
+      if (typeof cfg !== 'number' || !Number.isFinite(cfg) || cfg > 1 || cfg < 0 || (cfg === 0 && !zeroOk)) {
+        return { error: zeroOk ? 'Steadiness must be a number from 0 to 1.' : 'Steadiness must be above 0 and at most 1 for Original.' };
+      }
+      fields.cfg_weight = cfg;
+    }
+  }
+  const lang = isSet(b.language_id) ? String(b.language_id).trim().toLowerCase() : '';
+  if (version === 'multilingual') {
+    if (!CHATTERBOX.languages.includes(lang)) return { error: 'Pick a language for Multilingual.' };
+    fields.language_id = lang;
+  } else if (lang && lang !== 'en') return { error: `${name} speaks English only. Set the version to Multilingual for other languages.` };
+  return { fields };
+}
+
+/* DramaBox's fields on a booth request -> worker fields, or { error }. The scene goes as `prompt`. */
+function dramaboxFields(b, input) {
+  const scene = input.text.replace(CURLY_QUOTES, '"');
+  if ((scene.match(/"/g) || []).length % 2) return { error: 'A quote mark in the scene is not closed. Put every spoken line inside double quotes.' };
+  if (!spokenLines(scene)) return { error: 'The scene needs at least one spoken line inside double quotes. Words outside the quotes are acted, not spoken.' };
+  const fields = { watermark: false }; // full quality; the LTX-2 licence does not ask for a watermark
+  const duration = numberOf(b.duration);
+  if (isSet(duration) && duration !== 0) {
+    if (typeof duration !== 'number' || !Number.isFinite(duration) || duration < DRAMABOX.minDuration || duration > DRAMABOX.maxDuration) {
+      return { error: `Scene length must be from ${DRAMABOX.minDuration} to ${DRAMABOX.maxDuration} seconds, or empty to let DramaBox decide.` };
+    }
+    fields.duration = duration;
+  }
+  const refS = numberOf(b.reference_seconds);
+  if (isSet(refS)) {
+    const [lo, hi] = DRAMABOX.referenceSeconds;
+    if (input.mode !== 'clone') return { error: 'How much of the clip to use is for Speak with a voice.' };
+    if (typeof refS !== 'number' || !Number.isFinite(refS) || refS < lo || refS > hi) return { error: `Use from ${lo} to ${hi} seconds of the clip.` };
+    fields.reference_seconds = refS;
+  }
+  return { fields };
+}
 
 /* Ming's extra controls (worker ming_contract.py). Ming runs one task per take and refuses a mix,
  * so the bridge checks the same rules first and says them plainly:
@@ -81,6 +205,8 @@ const VOICE_LABELS = {
 };
 const LANGUAGE_NAMES = { en: 'English', zh: 'Chinese', de: 'German', es: 'Spanish', fr: 'French', ko: 'Korean', ja: 'Japanese' };
 const MING_FIELDS = ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language'];
+/* The controls each newer engine files in metadata.openVoice.controls (Ming files MING_FIELDS). */
+const OWN_FIELDS = { chatterbox: ['model', 'temperature', 'exaggeration', 'cfg_weight', 'language_id'], dramabox: ['duration', 'reference_seconds'] };
 const TAG_RE = /\[([A-Za-z][A-Za-z -]{0,30})\]/g; // the worker's own pattern; anything else is read as words
 const KNOWN_TAG = new Set([...MING.tags.map((t) => t.slice(1, -1).toLowerCase()), ...MING.aliases]);
 const NO_MIX = 'no style, emotion, speed, pitch or volume';
@@ -141,6 +267,13 @@ function mingControls(engine, b, input) {
   return { fields };
 }
 
+/* "Chatterbox Turbo", "DramaBox", "Ming": what My Creations and the take title say. */
+function engineLabel(job) {
+  const e = ENGINES[job.engine];
+  const v = job.version && CHATTERBOX.versionLabels[job.version];
+  return v ? `${e.label} ${v}` : e.label;
+}
+
 const LIVE = ['queued', 'running', 'filing'];
 const isLive = (j) => LIVE.includes(j.state);
 
@@ -152,6 +285,12 @@ function plainError(out = {}) {
   if (/^With prompt_text/i.test(raw)) return 'The exact words only work for a clip of thirty seconds or less. Leave the words out, or use a shorter clip.';
   if (/model cache is not ready/i.test(raw)) return 'The voice engine is still getting ready. Nothing was made. Try again in a few minutes.';
   if (/^The reference clip (must be stored|host is not public)/i.test(raw)) return 'That clip is not stored with the platform. Import it again.';
+  /* Chatterbox and DramaBox's own clip and scene sentences, said plainly. */
+  if (/^The reference clip must be longer than 5 seconds for model turbo/i.test(raw)) return 'Chatterbox Turbo needs a clip longer than 5 seconds. Use a longer clip, or set the version to Original.';
+  if (/^The reference clip must be (at least|longer than) \d+ seconds?/i.test(raw)) return 'That clip is too short. Use a clip of at least 5 seconds of clear speech.';
+  if (/^The reference clip is mostly silent/i.test(raw)) return 'That clip is mostly silent. It needs at least 3 seconds of clear voice.';
+  if (/^The scene is too long: about \d+ s of audio, at most \d+ s\.$/.test(raw)) return raw.replace(/ s of audio, at most (\d+) s\./, ' seconds of audio. The most is $1 seconds.');
+  if (/^One sentence is too long to say in one take/.test(raw)) return 'One spoken sentence is too long for one take. Break it into shorter sentences.';
   if (/^The reference clip [a-z ,]+\.$/i.test(raw) && raw.length <= 80) return raw;
   return 'The voice engine could not make this take. Nothing was made. Try again, or try a different clip.';
 }
@@ -178,17 +317,53 @@ function endpointOf(engine, env = process.env) {
   return /^[a-z0-9]{6,40}$/i.test(raw) ? raw : '';
 }
 
+/* Every try is a new take: a fresh seed, unless she typed one. */
+function seedOf(b) {
+  const typed = b.seed;
+  const seed = typeof typed === 'string' && /^\d+$/.test(typed.trim()) ? Number(typed.trim()) : typed;
+  if (seed !== undefined && seed !== null && seed !== '') {
+    if (!Number.isInteger(seed) || seed < 0 || seed > SEED_MAX) return { error: `The voice number must be a whole number from 0 to ${SEED_MAX}.` };
+    return { seed };
+  }
+  return { seed: freshSeed() };
+}
+
 /* A booth request -> the worker's input, or { error } in a plain sentence. */
 function buildInput(engine, b = {}, env = process.env) {
   const e = ENGINES[engine];
-  if (!e) return { error: 'Pick VoxCPM2 or Ming.' };
+  if (!e) return { error: 'Pick a voice engine from the list.' };
   const mode = b.mode === 'speak' ? 'clone' : b.mode;
   if (mode !== 'design' && mode !== 'clone') return { error: 'Choose Design a voice or Speak with a voice.' };
+  const scene = engine === 'dramabox';
   const text = typeof b.text === 'string' ? b.text.trim() : '';
-  if (!text) return { error: 'Type the words to say.' };
+  if (!text) return { error: scene ? 'Write the scene first.' : 'Type the words to say.' };
   const maxText = e.maxText || MAX_TEXT;
-  if (text.length > maxText) return { error: `The words are too long for ${e.label}. The most is ${maxText} characters.` };
+  if (text.length > maxText) return { error: `The ${scene ? 'scene is' : 'words are'} too long for ${e.label}. The most is ${maxText} characters.` };
   const input = { mode, text };
+  if (engine === 'chatterbox' || scene) {
+    /* No description and no style: the worker would refuse them (Chatterbox) or never read them (DramaBox). */
+    if (oneLine(b.description)) {
+      return { error: scene ? 'DramaBox takes no description. Describe the speaker in the scene, outside the quotes.'
+        : 'Chatterbox uses its own built-in voice here. To use your own voice, choose Speak with a voice.' };
+    }
+    if (oneLine(b.style)) return { error: `${e.label} takes no style. ${scene ? 'Write how it is said in the scene, outside the quotes.' : 'Clear the style.'}` };
+    if (mode === 'clone') {
+      const url = typeof b.reference_voice_url === 'string' ? b.reference_voice_url.trim() : '';
+      if (!url) return { error: 'Pick a saved voice or a clip first.' };
+      if (!ourClip(url, env)) return { error: 'That clip is not stored with the platform. Import it again.' };
+      input.reference_url = url; // both workers' own name (they read reference_voice_url too)
+    }
+    const ming = mingControls(engine, b, input);
+    if (ming.error) return { error: ming.error };
+    const own = scene ? dramaboxFields(b, input) : chatterboxFields(b, input);
+    if (own.error) return { error: own.error };
+    if (scene) { input.prompt = input.text; delete input.text; }
+    Object.assign(input, own.fields);
+    const seeded = seedOf(b);
+    if (seeded.error) return seeded;
+    input.seed = seeded.seed;
+    return { input };
+  }
   if (mode === 'design') {
     const description = oneLine(b.description);
     const builtIn = engine === 'ming' && typeof b.voice === 'string' && b.voice.trim();
@@ -210,13 +385,9 @@ function buildInput(engine, b = {}, env = process.env) {
   const ming = mingControls(engine, b, input);
   if (ming.error) return { error: ming.error };
   Object.assign(input, ming.fields);
-  /* Every try is a new take: a fresh seed, unless she typed one. */
-  const typed = b.seed;
-  const seed = typeof typed === 'string' && /^\d+$/.test(typed.trim()) ? Number(typed.trim()) : typed;
-  if (seed !== undefined && seed !== null && seed !== '') {
-    if (!Number.isInteger(seed) || seed < 0 || seed > SEED_MAX) return { error: `The voice number must be a whole number from 0 to ${SEED_MAX}.` };
-    input.seed = seed;
-  } else input.seed = freshSeed();
+  const seeded = seedOf(b);
+  if (seeded.error) return seeded;
+  input.seed = seeded.seed;
   if (typeof b.cfg === 'number' && b.cfg >= e.cfg.min && b.cfg <= e.cfg.max) input[e.cfg.name] = b.cfg;
   if (Number.isInteger(b.steps) && b.steps >= e.steps.min && b.steps <= e.steps.max) input[e.steps.name] = b.steps;
   if (typeof b.normalize === 'boolean') input.normalize = b.normalize;
@@ -306,20 +477,28 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (!USAGE_SECRET) return;
     const e = ENGINES[job.engine];
     const voice = job.controls && job.controls.voice;
-    const prompt = job.mode === 'design' ? `${job.description || `Built-in voice: ${VOICE_LABELS[voice] || voice}`}\n\n${job.text}` : job.text;
+    const label = engineLabel(job);
+    const prompt = job.engine === 'dramabox' || job.mode !== 'design' ? job.text
+      : job.engine === 'chatterbox' ? `${label} built-in voice\n\n${job.text}`
+        : `${job.description || `Built-in voice: ${VOICE_LABELS[voice] || voice}`}\n\n${job.text}`;
+    /* `words` is what the take says (a saved voice's clip words): a scene's spoken lines only, and
+     * no Chatterbox sound tags. */
+    const words = job.engine === 'dramabox' ? spokenLines(job.text)
+      : job.engine === 'chatterbox' ? job.text.replace(CB_TAG_RE, ' ').replace(/\s+/g, ' ').trim() : job.text;
     try {
       await http.post(`${FORK_URL}/api/kade/asset-event`, { secret: USAGE_SECRET, userId: job.userId, kind: 'audio', service: e.service,
         url: out.url, prompt, model: e.model, costUSD,
         metadata: { jobId: job.id, openVoice: { engine: job.engine, mode: job.mode, seed: out.seed, description: job.description || undefined,
-          style: job.style || undefined, words: job.text.slice(0, 1000), seconds: out.duration_seconds, ...(job.controls ? { controls: job.controls } : {}) },
-        durationS: out.duration_seconds, seed: out.seed, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, engine: e.label, agent: 'Sound Booth' } },
+          style: job.style || undefined, words: words.slice(0, 1000), seconds: out.duration_seconds, ...(job.version ? { version: job.version } : {}),
+          ...(job.controls ? { controls: job.controls } : {}) },
+        durationS: out.duration_seconds, seed: out.seed, b2Key: out.key, wavUrl: out.wav_url, wavKey: out.wav_key, engine: label, agent: 'Sound Booth' } },
       { headers: { 'User-Agent': UA }, timeout: 15000 });
     } catch (err) { console.warn('[open-voices] asset post failed:', err.message); }
   }
 
   async function start(b = {}) {
     const engine = String(b.engine || '');
-    if (!ENGINES[engine]) return { error: 'Pick VoxCPM2 or Ming.' };
+    if (!ENGINES[engine]) return { error: 'Pick a voice engine from the list.' };
     if (!ENABLED) return { error: 'The open voices are switched off right now.' };
     if (!KEY || !endpointOf(engine, env)) return { error: `${ENGINES[engine].label} is not set up yet.` };
     const userId = String(b.userId || '').trim();
@@ -332,9 +511,11 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (open) return { error: 'One take at a time. The last one is still being made.', jobId: open.id };
     const cap = await readCapacity(engine);
     const input = { ...built.input }; // exactly the worker contract's fields; the user id stays here
+    const own = OWN_FIELDS[engine] || MING_FIELDS;
     const job = { id: `ov_${now().toString(36)}${crypto.randomBytes(3).toString('hex')}`, userId, engine, mode: input.mode,
-      text: input.text, description: input.description || '', style: input.style || '', seed: input.seed,
-      ...(MING_FIELDS.some((k) => input[k]) ? { controls: Object.fromEntries(MING_FIELDS.filter((k) => input[k]).map((k) => [k, input[k]])) } : {}),
+      text: input.text || input.prompt, description: input.description || '', style: input.style || '', seed: input.seed,
+      ...(engine === 'chatterbox' ? { version: input.model } : {}),
+      ...(own.some((k) => isSet(input[k])) ? { controls: Object.fromEntries(own.filter((k) => isSet(input[k])).map((k) => [k, input[k]])) } : {}),
       hasPromptText: !!input.prompt_text, state: 'queued', createdAt: new Date(now()).toISOString(), runpodId: null,
       coldLikely: coldLikely(cap), result: null, error: null, costUSD: null };
     try {
@@ -381,7 +562,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
     if (!job.assetPosted) { await postAsset(job, out, cost); job.assetPosted = true; save(); }
     job.state = 'done'; job.finishedAt = new Date(now()).toISOString();
     job.result = { url: out.url, wavUrl: out.wav_url, seconds: out.duration_seconds, seed: out.seed, sampleRate: out.sample_rate,
-      mode: out.mode, engine: out.engine, cold: (job.delayMs || 0) > 45000, executionS: Math.round((job.executionMs || 0) / 100) / 10 };
+      mode: out.mode, engine: out.engine, ...(job.version ? { version: job.version } : {}), cold: (job.delayMs || 0) > 45000, executionS: Math.round((job.executionMs || 0) / 100) / 10 };
     delete job.out;
     save();
   }
@@ -477,7 +658,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
       /* `controls: true` tells the fork this bridge reads Ming's extra controls (mingControls), so
        * the fork offers them only once this code is live. */
       engines: Object.fromEntries(Object.keys(ENGINES).map((k) => [k, { label: ENGINES[k].label, configured: ready(k), endpointId: endpointOf(k, env) || null,
-        ...(k === 'ming' ? { controls: true } : {}) }])),
+        ...(k === 'ming' ? { controls: true } : {}), maxText: ENGINES[k].maxText }])),
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP },
       spend: { dayUSD: spendSince(now() - 86400000), monthUSD: spendSince(now() - 30 * 86400000) },
       open: jobs.filter(isLive).length,
@@ -533,4 +714,5 @@ function attachOpenVoices(app, d = {}, opts = {}) {
   return lane;
 }
 
-module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, VOICE_LABELS, SEED_MAX };
+module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, chatterboxFields, dramaboxFields, spokenLines, engineLabel,
+  ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, CHATTERBOX, DRAMABOX, VOICE_LABELS, SEED_MAX };
