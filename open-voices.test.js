@@ -258,6 +258,9 @@ test('worker errors reach her as plain sentences', () => {
   assert.match(ov.plainError({ error: 'clone mode needs reference_voice_url.' }), /^The voice engine could not make this take/);
   assert.match(ov.plainError({ error: 'The VoxCPM2 worker is missing a required component.', error_code: 'missing_dependency' }), /missing a part/);
   assert.match(ov.plainError({ error: 'With prompt_text the clip must be at most 30 s and the transcript must cover all of it.' }), /thirty seconds or less/);
+  assert.equal(ov.plainError({ error: 'The reference clip must be at least 3 seconds long.' }), 'That clip is too short. Use a clip of at least 3 seconds of clear speech.');
+  assert.equal(ov.plainError({ error: 'The reference clip must be longer than 1 seconds for model original.' }), 'That clip is too short. Use a clip longer than 1 second of clear speech.');
+  assert.match(ov.plainError({ error: 'The reference clip must be longer than 5 seconds for model turbo.' }), /^Chatterbox Turbo needs a clip longer than 5 seconds/);
   for (const m of ['RuntimeError', 'reference_voice_url', 'prompt_text']) {
     assert.equal(/RuntimeError|reference_voice_url|prompt_text/.test(ov.plainError({ error: m })), false, m);
   }

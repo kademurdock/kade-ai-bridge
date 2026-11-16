@@ -287,7 +287,11 @@ function plainError(out = {}) {
   if (/^The reference clip (must be stored|host is not public)/i.test(raw)) return 'That clip is not stored with the platform. Import it again.';
   /* Chatterbox and DramaBox's own clip and scene sentences, said plainly. */
   if (/^The reference clip must be longer than 5 seconds for model turbo/i.test(raw)) return 'Chatterbox Turbo needs a clip longer than 5 seconds. Use a longer clip, or set the version to Original.';
-  if (/^The reference clip must be (at least|longer than) \d+ seconds?/i.test(raw)) return 'That clip is too short. Use a clip of at least 5 seconds of clear speech.';
+  const tooShort = raw.match(/^The reference clip must be (at least|longer than) (\d+(?:\.\d+)?) seconds?/i);
+  if (tooShort) {
+    const n = Number(tooShort[2]);
+    return `That clip is too short. Use a clip ${/^at/i.test(tooShort[1]) ? 'of at least' : 'longer than'} ${n} second${n === 1 ? '' : 's'} of clear speech.`;
+  }
   if (/^The reference clip is mostly silent/i.test(raw)) return 'That clip is mostly silent. It needs at least 3 seconds of clear voice.';
   if (/^The scene is too long: about \d+ s of audio, at most \d+ s\.$/.test(raw)) return raw.replace(/ s of audio, at most (\d+) s\./, ' seconds of audio. The most is $1 seconds.');
   if (/^One sentence is too long to say in one take/.test(raw)) return 'One spoken sentence is too long for one take. Break it into shorter sentences.';
