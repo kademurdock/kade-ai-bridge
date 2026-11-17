@@ -9,7 +9,7 @@
  *   seed, text up to 5000 characters. Output { url, wav_url, duration_seconds, sample_rate, mode,
  *   seed, engine, key, wav_key, ... } or { error }.
  * The two workers name the two quality knobs differently (VoxCPM2 cfg_value / inference_timesteps,
- * Ming cfg_scale / flow_steps); the fork sends neither today, and `cfg` / `steps` map to each.
+ * Ming cfg_scale / flow_steps); `cfg` / `steps` map to each (tuneFields; DramaBox takes `cfg` too).
  *
  * Same pattern as scenema.js: RunPod /run, the bridge polls /status, the finished take lands in the
  * user's My Creations through the fork's asset lane (which mirrors it to our storage for good) and
@@ -94,7 +94,7 @@ const cbTagName = (raw) => raw.replace(/\s+/g, ' ').trim().toLowerCase();
 
 /* DramaBox (worker dramabox_contract.py): one prose scene. Words inside straight double quotes are
  * spoken; the rest is performed. Curly quotes count as straight ones (the worker swaps them). */
-const DRAMABOX = { maxDuration: 45, minDuration: 3, referenceSeconds: [3, 30] };
+const DRAMABOX = { maxDuration: 45, minDuration: 3, referenceSeconds: [3, 30], cfg: { name: 'cfg_scale', min: 1, max: 10 } };
 const CURLY_QUOTES = /[“”„‟«»]/g;
 /* The spoken lines of a scene, in order (what a saved voice's clip actually says). */
 function spokenLines(scene) {
@@ -103,6 +103,27 @@ function spokenLines(scene) {
 
 const numberOf = (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v.trim()) : v);
 const isSet = (v) => v !== undefined && v !== null && v !== '';
+
+/* Nov 16 2026, her yes: the booth's Quality (`steps`) and How closely it follows (`cfg`) menus, mapped
+ * to each worker's own names (VoxCPM2 inference_timesteps / cfg_value, Ming flow_steps / cfg_scale,
+ * DramaBox cfg_scale; DramaBox has no steps, Chatterbox neither). A value out of range is refused in a
+ * plain sentence before any GPU time (it used to be dropped without a word). */
+const TUNE_NAMES = { steps: 'Quality', cfg: 'How closely it follows' };
+function tuneFields(engine, b) {
+  const knobs = engine === 'dramabox' ? { cfg: DRAMABOX.cfg } : engine === 'chatterbox' ? {} : { cfg: ENGINES[engine].cfg, steps: ENGINES[engine].steps };
+  const fields = {};
+  for (const k of ['steps', 'cfg']) {
+    const v = numberOf(b[k]);
+    if (!isSet(v)) continue;
+    const knob = knobs[k];
+    if (!knob) return { error: `${TUNE_NAMES[k]} is not a setting ${ENGINES[engine].label} has. Set it back to the usual.` };
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < knob.min || v > knob.max || (k === 'steps' && !Number.isInteger(v))) {
+      return { error: `${TUNE_NAMES[k]} must be ${k === 'steps' ? 'a whole number' : 'a number'} from ${knob.min} to ${knob.max}.` };
+    }
+    fields[knob.name] = v;
+  }
+  return { fields };
+}
 
 /* Chatterbox's fields on a booth request -> worker fields, or { error }. */
 function chatterboxFields(b, input) {
@@ -206,7 +227,8 @@ const VOICE_LABELS = {
 const LANGUAGE_NAMES = { en: 'English', zh: 'Chinese', de: 'German', es: 'Spanish', fr: 'French', ko: 'Korean', ja: 'Japanese' };
 const MING_FIELDS = ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language'];
 /* The controls each newer engine files in metadata.openVoice.controls (Ming files MING_FIELDS). */
-const OWN_FIELDS = { chatterbox: ['model', 'temperature', 'exaggeration', 'cfg_weight', 'language_id'], dramabox: ['duration', 'reference_seconds'] };
+const OWN_FIELDS = { chatterbox: ['model', 'temperature', 'exaggeration', 'cfg_weight', 'language_id'], dramabox: ['duration', 'reference_seconds', 'cfg_scale'],
+  voxcpm: ['cfg_value', 'inference_timesteps'], ming: [...MING_FIELDS, 'cfg_scale', 'flow_steps'] };
 const TAG_RE = /\[([A-Za-z][A-Za-z -]{0,30})\]/g; // the worker's own pattern; anything else is read as words
 const KNOWN_TAG = new Set([...MING.tags.map((t) => t.slice(1, -1).toLowerCase()), ...MING.aliases]);
 const NO_MIX = 'no style, emotion, speed, pitch or volume';
@@ -361,8 +383,10 @@ function buildInput(engine, b = {}, env = process.env) {
     if (ming.error) return { error: ming.error };
     const own = scene ? dramaboxFields(b, input) : chatterboxFields(b, input);
     if (own.error) return { error: own.error };
+    const tuned = tuneFields(engine, b);
+    if (tuned.error) return tuned;
     if (scene) { input.prompt = input.text; delete input.text; }
-    Object.assign(input, own.fields);
+    Object.assign(input, own.fields, tuned.fields);
     const seeded = seedOf(b);
     if (seeded.error) return seeded;
     input.seed = seeded.seed;
@@ -392,8 +416,9 @@ function buildInput(engine, b = {}, env = process.env) {
   const seeded = seedOf(b);
   if (seeded.error) return seeded;
   input.seed = seeded.seed;
-  if (typeof b.cfg === 'number' && b.cfg >= e.cfg.min && b.cfg <= e.cfg.max) input[e.cfg.name] = b.cfg;
-  if (Number.isInteger(b.steps) && b.steps >= e.steps.min && b.steps <= e.steps.max) input[e.steps.name] = b.steps;
+  const tuned = tuneFields(engine, b);
+  if (tuned.error) return tuned;
+  Object.assign(input, tuned.fields);
   if (typeof b.normalize === 'boolean') input.normalize = b.normalize;
   return { input };
 }
@@ -718,5 +743,5 @@ function attachOpenVoices(app, d = {}, opts = {}) {
   return lane;
 }
 
-module.exports = { attachOpenVoices, createOpenVoices, buildInput, mingControls, soundTags, chatterboxFields, dramaboxFields, spokenLines, engineLabel,
+module.exports = { attachOpenVoices, createOpenVoices, buildInput, tuneFields, mingControls, soundTags, chatterboxFields, dramaboxFields, spokenLines, engineLabel,
   ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, CHATTERBOX, DRAMABOX, VOICE_LABELS, SEED_MAX };

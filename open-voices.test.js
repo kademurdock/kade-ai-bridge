@@ -62,9 +62,10 @@ test('a typed seed is kept; a bad one is refused plainly', () => {
 test('speak input: our clip, style and the clip words; knobs map to each worker', () => {
   const v = ov.buildInput('voxcpm', { mode: 'speak', reference_voice_url: CLIP, text: 'Words', style: 'slightly faster, cheerful', prompt_text: 'what the clip says', cfg: 2.5, steps: 12 });
   assert.deepEqual({ ...v.input, seed: 0 }, { mode: 'clone', text: 'Words', reference_voice_url: CLIP, style: 'slightly faster, cheerful', prompt_text: 'what the clip says', seed: 0, cfg_value: 2.5, inference_timesteps: 12 });
-  const m = ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'Words', cfg: 0.7, steps: 12 });
+  const m = ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'Words', steps: 12 });
   assert.equal(m.input.flow_steps, 12);
-  assert.equal(m.input.cfg_scale, undefined, 'Ming takes cfg_scale from 1');
+  assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'Words', cfg: 0.7 }).error, /How closely it follows must be a number from 1 to 5/,
+    'out of range is said, not dropped');
   assert.match(ov.buildInput('ming', { mode: 'clone', text: 'Words' }).error, /saved voice or a clip/);
   assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: 'https://evil.example/a.wav', text: 'Words' }).error, /not stored/);
   assert.match(ov.buildInput('ming', { mode: 'clone', reference_voice_url: CLIP, text: 'x'.repeat(2501) }).error, /2500/);
@@ -516,4 +517,30 @@ test('every engine keeps one shape for Ming, VoxCPM2 and the labels', () => {
   assert.equal(ov.engineLabel({ engine: 'chatterbox', version: 'multilingual' }), 'Chatterbox Multilingual');
   assert.equal(ov.engineLabel({ engine: 'ming' }), 'Ming');
   assert.deepEqual(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'W', version: 'turbo', duration: 9, seed: 1 }).input, { mode: 'design', text: 'W', description: 'd', seed: 1 }, 'the new fields never reach VoxCPM2');
+});
+
+test('Quality and How closely it follows: strings from the page, each worker own names, plain refusals', () => {
+  const v = ov.buildInput('voxcpm', { mode: 'design', description: 'A warm voice', text: 'Hi', steps: '30', cfg: '2.5', seed: 1 });
+  assert.deepEqual(v.input, { mode: 'design', text: 'Hi', description: 'A warm voice', seed: 1, cfg_value: 2.5, inference_timesteps: 30 });
+  assert.match(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'Hi', steps: '12.5' }).error, /Quality must be a whole number from 4 to 50/);
+  assert.match(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'Hi', steps: 51 }).error, /from 4 to 50/);
+  assert.match(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'Hi', cfg: 'lots' }).error, /from 0.5 to 5/);
+  assert.equal(ov.buildInput('voxcpm', { mode: 'design', description: 'd', text: 'Hi', steps: '', cfg: null }).error, undefined, 'empty is the usual');
+  const scene = 'An old sailor. "Storm is coming."';
+  const d = ov.buildInput('dramabox', { mode: 'design', text: scene, cfg: '3.5', seed: 2 });
+  assert.equal(d.input.cfg_scale, 3.5);
+  assert.equal(d.input.prompt, scene);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: scene, cfg: 11 }).error, /from 1 to 10/);
+  assert.match(ov.buildInput('dramabox', { mode: 'design', text: scene, steps: 20 }).error, /Quality is not a setting DramaBox has/);
+  assert.match(ov.buildInput('chatterbox', { mode: 'design', text: 'Hi', cfg: 2 }).error, /not a setting Chatterbox has/);
+});
+
+test('the chosen settings are filed with the take', async () => {
+  const http = fakeHttp({ post: (url) => (url.endsWith('/run') ? { id: 'rp1', status: 'IN_QUEUE' } : {}), get: () => ({ workers: { idle: 1, ready: 1, running: 0 } }) });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k', DRAMABOX_ENDPOINT_ID: 'dramaboxend1' }, http, dataDir: tmp() });
+  const r = await lane.start({ engine: 'dramabox', userId: 'u1', mode: 'design', text: 'A man. "Hello."', cfg: 3.5 });
+  assert.ok(!r.error, r.error);
+  const run = http.calls.find((c) => c.url.endsWith('/run'));
+  assert.equal(run.body.input.cfg_scale, 3.5);
+  assert.equal(lane.find(r.jobId).controls.cfg_scale, 3.5);
 });
