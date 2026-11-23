@@ -741,7 +741,118 @@ function muteLiveTurn(session) {
     noteStop(session); // once per muted turn, and only with LIVE_STOP_NOTE=1
   }
   try { session.sendClear && session.sendClear(); } catch {}
+  playbackCleared(session);
   return true;
+}
+
+/* SPOTTER ECHO GUARD (Nov 22 2026). Kade: "spotter is talking over itself upon first call answer,
+ * it's hearing itself talk through the speaker". Her call that night (01:45Z): she asked "What
+ * flavor is this?", Whittney began "That flavor is Watermelon Slice…", and 2.4 s in our own
+ * transcriber logged a caller turn "That flavor?" (Whittney's words coming back through the phone's
+ * speaker into its mic). Google hears that same mic, took it as her talking, cut the answer off and
+ * started a new one ("That one's Watermelon Ice."). The mic goes to Google raw the whole time, so
+ * any echo the phone does not cancel is a barge-in.
+ *
+ * While the Spotter's audio is still playing on the phone (by the bytes we sent: 24 kHz PCM16 is 48
+ * bytes a millisecond, queued back to back, plus LIVE_ECHO_TAIL_MS for the network and the room),
+ * Google gets silence of the same length instead of the mic. The real mic is kept for the last
+ * LIVE_ECHO_REPLAY_MS. Barge-in still works: when our transcriber hears the CALLER (words that are
+ * not the Spotter's own, or a lone "stop"/"wait"; voice-stream decides), the mic opens for the rest
+ * of that stretch and the kept audio is replayed first, so Google hears her whole sentence. Stop
+ * and "live off" are untouched. LIVE_ECHO_GUARD=0 sends the raw mic again. */
+const liveEchoGuardOn = () => process.env.LIVE_ECHO_GUARD !== '0';
+function envMs(name, dflt) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : dflt;
+}
+const LIVE_ECHO_TAIL_MS = () => envMs('LIVE_ECHO_TAIL_MS', 700);
+const LIVE_ECHO_REPLAY_MS = () => envMs('LIVE_ECHO_REPLAY_MS', 1500);
+// How long after the Spotter's audio a heard phrase is still compared with what it said (our
+// transcriber closes a turn up to about a second after the words).
+const LIVE_ECHO_WORDS_MS = () => envMs('LIVE_ECHO_WORDS_MS', 2500);
+
+function echoStats(session) {
+  if (!session._liveEcho) session._liveEcho = { heldMs: 0, loudMs: 0, peak: 0, opens: 0, echoTurns: 0, stretches: 0 };
+  return session._liveEcho;
+}
+/** `bytes` of Spotter audio (24 kHz PCM16) went to the phone at `now`. */
+function notePlayback(session, bytes, now = Date.now()) {
+  if (!bytes) return;
+  const until = session._livePlayUntil || 0;
+  if (!until || now > until + LIVE_ECHO_TAIL_MS()) {
+    // A new stretch of the Spotter talking: the mic is guarded again.
+    session._liveEchoOpen = false;
+    session._liveEchoRing = [];
+    echoStats(session).stretches++;
+  }
+  session._livePlayUntil = Math.max(now, until) + bytes / 48;
+}
+/** The phone flushed what it had queued (a barge-in, Stop, live off). */
+function playbackCleared(session, now = Date.now()) {
+  if (session._livePlayUntil && session._livePlayUntil > now) session._livePlayUntil = now;
+}
+/** Could the Spotter's voice be in the mic right now? */
+function spotterAudible(session, now = Date.now()) {
+  return !!session._livePlayUntil && now < session._livePlayUntil + LIVE_ECHO_TAIL_MS();
+}
+/** What the Spotter is saying or just said, while a phrase heard now could still be its echo
+ * (empty otherwise). voice-stream compares a heard phrase against it. */
+function spotterWords(session, now = Date.now()) {
+  if (!session._livePlayUntil || now >= session._livePlayUntil + LIVE_ECHO_WORDS_MS()) return '';
+  return `${session._liveRecentText || ''} ${session._liveModelText || ''}`.trim();
+}
+const silenceB64 = new Map();
+function silentLike(len) {
+  let s = silenceB64.get(len);
+  if (!s) { s = Buffer.alloc(len).toString('base64'); if (silenceB64.size < 64) silenceB64.set(len, s); }
+  return s;
+}
+/** The mic chunk Google should get now: the real one, or silence while the Spotter is audible. */
+function guardMic(session, b64, pcm, now = Date.now()) {
+  if (!liveEchoGuardOn() || session._liveEchoOpen || !spotterAudible(session, now)) {
+    session._liveEchoRing = null;
+    return b64;
+  }
+  const buf = pcm || Buffer.from(b64, 'base64');
+  const ms = buf.length / 32; // 16 kHz PCM16: 32 bytes a millisecond
+  const st = echoStats(session);
+  st.heldMs += ms;
+  const rms = pcmRms(buf);
+  if (rms > st.peak) st.peak = Math.round(rms);
+  if (rms >= LIVE_VAD_RMS()) st.loudMs += ms; // how much of the Spotter came back loud enough to read as a voice
+  const ring = session._liveEchoRing || (session._liveEchoRing = []);
+  ring.push({ at: now, b64 });
+  const keep = LIVE_ECHO_REPLAY_MS();
+  while (ring.length && now - ring[0].at > keep) ring.shift();
+  return silentLike(buf.length);
+}
+/** voice-stream heard the caller (not the Spotter) while the Spotter was audible: open the mic for
+ * the rest of this stretch, kept audio first. Returns true when it opened. */
+function openEchoGate(session, receipt = '', now = Date.now()) {
+  if (!liveEchoGuardOn() || session._liveEchoOpen || !spotterAudible(session, now)) return false;
+  session._liveEchoOpen = true;
+  echoStats(session).opens++;
+  const ring = session._liveEchoRing || [];
+  session._liveEchoRing = null;
+  const gws = session._liveWs;
+  let replayed = 0;
+  if (gws && gws.readyState === 1) {
+    for (const r of ring) {
+      try {
+        gws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: 'audio/pcm;rate=16000', data: r.b64 } } }));
+        replayed += Buffer.byteLength(r.b64, 'base64') / 32;
+      } catch { break; }
+    }
+  }
+  console.log(`[video-live] echo guard: the caller spoke over the Spotter ${receipt}; mic open again (replayed ${Math.round(replayed)}ms) (user=${session.userId})`);
+  return true;
+}
+/** voice-stream dropped a heard phrase as the Spotter's own voice. */
+function noteEchoTurn(session) { echoStats(session).echoTurns++; }
+function logEchoSummary(session) {
+  const st = session._liveEcho;
+  if (!st || !st.stretches) return;
+  console.log(`[video-live] echo guard: ${(st.heldMs / 1000).toFixed(1)}s of mic held under the Spotter's voice across ${st.stretches} stretch(es); ${(st.loudMs / 1000).toFixed(1)}s of it voice-loud (peak RMS ${st.peak}); opened ${st.opens} time(s) for the caller; ${st.echoTurns} echo turn(s) dropped (user=${session.userId})`);
 }
 
 function handleGoogleMessage(session, raw, gws) {
@@ -854,6 +965,7 @@ function handleGoogleMessage(session, raw, gws) {
           const pcm = Buffer.from(p.inlineData.data, 'base64');
           if (pcm.length && session.ws && session.ws.readyState === 1) {
             session.ws.send(Buffer.concat([LIVE_AUDIO_MAGIC, pcm]), { binary: true });
+            notePlayback(session, pcm.length, audioAt); // the echo guard's clock
           }
         } catch { /* one dropped chunk ≠ dead lane */ }
       }
@@ -873,6 +985,10 @@ function handleGoogleMessage(session, raw, gws) {
     if (sc.turnComplete || sc.generationComplete || sc.interrupted) {
       const t = (session._liveModelText || '').trim();
       session._liveModelText = '';
+      // The echo guard compares heard phrases with the last two turns too (an echo can land after
+      // the turn closed).
+      if (t) session._liveRecentText = `${session._liveLastTurnText || ''} ${t}`.trim().slice(-800);
+      if (t) session._liveLastTurnText = t;
       // Tag the turn with the SPOTTER's own name (July 2026) so the post-call
       // transcript/mint credits it to the Spotter (e.g. Whitney), not the base
       // agent the call started on. effectiveSpotter always resolves a name
@@ -904,8 +1020,13 @@ function handleGoogleMessage(session, raw, gws) {
       // 5000, 0 = old always-flush behavior).
       const graceMs = parseInt(process.env.LIVE_GREETING_GRACE_MS || '5000', 10);
       const inGrace = graceMs > 0 && session._liveStartedAt && (Date.now() - session._liveStartedAt) < graceMs;
+      // Nov 22 2026: say so, with how far into the Spotter's audio it landed, so a self-interrupt
+      // shows in the log (the echo guard's whole question).
+      const into = session._liveAudioAt && session._livePlayUntil ? Math.max(0, Math.round(session._livePlayUntil - Date.now())) : 0;
+      console.log(`[video-live] Google cut the Spotter off (${inGrace ? 'greeting grace, phone keeps playing' : 'phone flushed'}; ${into}ms of its audio was still queued; mic ${session._liveEchoOpen ? 'open' : spotterAudible(session) ? 'guarded' : 'raw'}) (user=${session.userId})`);
       if (!inGrace) {
         try { session.sendClear && session.sendClear(); } catch {}
+        playbackCleared(session);
       }
     }
   }
@@ -919,7 +1040,10 @@ function forwardAudio(session, b64pcm16k, pcm) {
   try {
     // realtimeInput.mediaChunks is DEPRECATED-REJECTED (verified July 16 2026:
     // server 1007-closes with "Use audio, video, or text instead").
-    gws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: 'audio/pcm;rate=16000', data: b64pcm16k } } }));
+    // Nov 22 2026: silence instead of the mic while the Spotter's own voice could be in it (echo guard).
+    let data = b64pcm16k;
+    try { data = guardMic(session, b64pcm16k, pcm); } catch { /* the guard must never hurt the call */ }
+    gws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: 'audio/pcm;rate=16000', data } } }));
   } catch { /* fail-soft */ }
   try {
     if (watchingSilence(session)) noteCallerAudio(session, pcm || Buffer.from(b64pcm16k, 'base64'));
@@ -1006,6 +1130,14 @@ function stopLive(session, reason) {
   try { liveBilling.endSegment(session); liveBilling.flush(session, 'stop').catch(() => {}); } catch {}
   // Flush any Live audio still queued in the browser so "live off" is instant.
   try { session.sendClear && session.sendClear(); } catch {}
+  // Nov 22 2026: the echo guard's line for this stretch of live, then a clean slate.
+  try { logEchoSummary(session); } catch {}
+  session._liveEcho = null;
+  session._livePlayUntil = 0;
+  session._liveEchoOpen = false;
+  session._liveEchoRing = null;
+  session._liveRecentText = '';
+  session._liveLastTurnText = '';
   const gws = session._liveWs;
   session._liveWs = null;
   if (gws) { try { gws.close(); } catch {} }
@@ -1100,6 +1232,6 @@ function handleLiveMsg(session, msg, speak) {
 module.exports = {
   shouldWarnLiveSilence, noteCallerWords,
   LIVE_SILENT_LINE, LIVE_CAMERA_LOST, LIVE_STOP_NOTE, enabled, handleLiveMsg, forwardAudio, forwardFrame, noteCamera, stopLive, minutesLeft, effectiveSpotter,
-  muteLiveTurn };
+  muteLiveTurn, spotterWords, openEchoGate, noteEchoTurn };
 // Exported for the pre-push test harness only — not called across modules.
-module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive, liveSilenceDueAt, pcmRms, noteCallerAudio };
+module.exports._test = { buildSetupMessage, handleGoogleMessage, liveUrl, liveCompression, startLive, LIVE_CREDIT_LINE, LIVE_QUOTA_LINE, noteResumeHandle, resumeLive, liveSilenceDueAt, pcmRms, noteCallerAudio, guardMic, spotterAudible, notePlayback };

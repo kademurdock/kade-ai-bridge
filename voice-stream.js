@@ -881,6 +881,28 @@ function looksLikeScreenReader(heard) {
     t === ph || t.startsWith(ph + ' ') || t.endsWith(' ' + ph) || t.includes(' ' + ph + ' '));
 }
 
+/* SPOTTER ECHO GUARD, the transcriber's half (Nov 22 2026; the reasons are in video-live.js).
+ * While the Spotter's voice could be in the mic, Google gets silence; these decide whether a phrase
+ * our transcriber hears is the CALLER (open the mic to Google) or the Spotter coming back through
+ * the speaker (keep it shut, and keep it out of her transcript). Same tests as the character's
+ * barge-in: word overlap with what the Spotter is saying, the lone-word allow-list, the screen
+ * reader's vocabulary. */
+function liveEchoOfSpotter(session, heard) {
+  const said = videoLive.spotterWords(session);
+  if (!said) return false;
+  if (looksLikeEcho(heard, said)) return true;
+  const words = normalizeWords(heard);
+  return words.length === 1 && normalizeWords(said).includes(words[0]);
+}
+function liveCallerOverSpotter(session, heard) {
+  try {
+    if (!session.liveOn || !heard) return;
+    if (liveEchoOfSpotter(session, heard)) return;
+    if (!isPlausibleBargeIn(heard) || looksLikeScreenReader(heard)) return;
+    videoLive.openEchoGate(session, textReceipt(heard));
+  } catch { /* the guard must never hurt the call */ }
+}
+
 // Mean confidence over whatever word objects the STT actually handed us. Returns
 // null when there is nothing to measure — callers read null as "no opinion",
 // never as "fail".
@@ -1578,6 +1600,7 @@ function openDeepgramFlux(session, key) {
       // new EndOfTurn instead of firing the held one.
       if (text && session._fluxGraceTimer) { clearTimeout(session._fluxGraceTimer); session._fluxGraceTimer = null; }
       if (!text) return;
+      if (session.liveOn) liveCallerOverSpotter(session, text); // Nov 22 2026: Spotter echo guard
       // Barge-in: every guard now lives in shouldBargeIn() — the grace window,
       // the echo gate, the single-word allow-list, and (app/web only) the room
       // gate. This path and the nova path below used to carry hand-copied
@@ -1801,6 +1824,7 @@ function openDeepgram(session) {
       const text = (alt?.transcript || '').trim();
       if (!text) return;
       noteCallerHeard(session, 'words', text); // Nov 10 2026: the quiet-line watch (call-limits.js)
+      if (session.liveOn) liveCallerOverSpotter(session, text); // Nov 22 2026: Spotter echo guard
       // Nov 14 2026: the outbound quiet watch's sign of life (not while our own voice could be what it heard).
       if (!session.isSpeaking && Date.now() - (session.lastSpokAt || 0) > 1500) session._lastCalleeWordsAt = Date.now();
       else if (limitLineActive(session) && !limitLineEcho(text, session._limitLine)) session._lastCalleeWordsAt = Date.now();
@@ -2933,6 +2957,13 @@ async function handleUtterance(session, text) {
     // character. (The Spotter's own replies are audio-only; the caller's words
     // are where the durable facts live.) lane 'live' (Part 295) marks it as a
     // turn the Spotter heard, not one the text model answered.
+    // Nov 22 2026 (Spotter echo guard): the Spotter's own words coming back through the speaker are
+    // not a caller turn. Her Nov 22 transcript had "That flavor?" between two answers.
+    if (liveEchoOfSpotter(session, text)) {
+      try { videoLive.noteEchoTurn(session); } catch {}
+      console.log(`[video-live] echo-dropped: heard the Spotter's own words, not a caller turn: ${textReceipt(text)}`);
+      return;
+    }
     try { session.history.push({ role: 'user', content: text, lane: 'live' }); } catch {}
     // Oct 20 2026: the caller's words start (or move) the live-silence
     // watchdog's count; it no longer runs from connect.
@@ -6391,4 +6422,6 @@ module.exports._test = {
   firstRoundOn, strangerGreetingCall, voicemailCue, greetingStartWait,
   // Nov 14 2026 (late): the second verification round.
   businessOnlyRound, talkedIntoGreeting, noteWordsOverPart1,
+  // Nov 22 2026: the Spotter echo guard.
+  liveEchoOfSpotter, liveCallerOverSpotter,
 };
