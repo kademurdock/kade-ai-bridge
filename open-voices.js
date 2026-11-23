@@ -19,10 +19,14 @@
  * voice or a clip at reference_url) and DramaBox (dramabox_contract.py: one prose scene as `prompt`,
  * words in double quotes spoken, the rest acted; optional clip). See CHATTERBOX / DRAMABOX below.
  *
+ * Nov 22 2026: Qwen (worker qwentts_contract.py on branch claude/qwen-tts-20261122): design = a voice
+ * from a description (Qwen3-TTS 1.7B VoiceDesign); speak = a kept take's clip plus its exact words
+ * (1.7B Base). See QWEN below.
+ *
  * Env: RUNPOD_API_KEY · VOXCPM_ENDPOINT_ID (default dewjq1ibxkp2c3) · MING_ENDPOINT_ID,
- * CHATTERBOX_ENDPOINT_ID, DRAMABOX_ENDPOINT_ID (no defaults; unset = that engine is hidden and
- * refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR / CHATTERBOX_RATE_PER_HR / DRAMABOX_RATE_PER_HR
- * (defaults 1.34 / 1.89 / 1.34 / 1.89) ·
+ * CHATTERBOX_ENDPOINT_ID, DRAMABOX_ENDPOINT_ID, QWEN_TTS_ENDPOINT_ID (no defaults; unset = that engine
+ * is hidden and refused) · VOXCPM_RATE_PER_HR / MING_RATE_PER_HR / CHATTERBOX_RATE_PER_HR /
+ * DRAMABOX_RATE_PER_HR / QWEN_TTS_RATE_PER_HR (defaults 1.34 / 1.89 / 1.34 / 1.89 / 1.34) ·
  * OPEN_VOICES_DAILY_CAP_USD (1.00) / OPEN_VOICES_MONTHLY_CAP_USD (20) · OPEN_VOICES_QUEUE_TIMEOUT_MS
  * (15 min; Ming gets twice that) · OPEN_VOICES_RUN_CEILING_MS (20 min more, past which any job is given up) ·
  * OPEN_VOICES_AUDIO_HOSTS (extra storage hosts, comma list) ·
@@ -68,7 +72,26 @@ const ENGINES = {
     endpointEnv: 'DRAMABOX_ENDPOINT_ID', defaultEndpoint: '', rateEnv: 'DRAMABOX_RATE_PER_HR',
     queueFactor: 2, maxText: 4000, rate: '1.89', // 48 GB pools; a cold start loads ~16 GB of weights; dramabox_contract.MAX_PROMPT_CHARS
   },
+  /* Nov 22 2026. Off until QWEN_TTS_ENDPOINT_ID is set. Its image carries both models (~9 GB), so a
+   * first pull on a new host waits longer: twice the queue time. */
+  qwen: {
+    id: 'qwen', label: 'Qwen', model: 'Qwen/Qwen3-TTS-12Hz-1.7B', service: 'qwen_tts_audio',
+    endpointEnv: 'QWEN_TTS_ENDPOINT_ID', defaultEndpoint: '', rateEnv: 'QWEN_TTS_RATE_PER_HR',
+    maxPrefix: 1000, queueFactor: 2, maxText: 5000, rate: '1.34', // top of its 24 GB pools (4090); qwentts_contract.MAX_TEXT_CHARS
+  },
 };
+
+/* Qwen (worker qwentts_contract.py). design: `description` + text (one take, at most 1500
+ * characters: a second call would design a second voice). speak: the kept clip as reference_url and
+ * its exact words as reference_text (the close copy; without the words only the voice's sound is
+ * used). language is a name (Auto, English, ...). Sampling knobs and defaults are the models' own
+ * generation_config.json. No style, no description when speaking (the Base model reads none). */
+const QWEN = {
+  languages: ['auto', 'english', 'chinese', 'japanese', 'korean', 'german', 'french', 'russian', 'portuguese', 'spanish', 'italian'],
+  maxDesignText: 1500,
+  temperature: [0.1, 2], topP: [0.05, 1], topK: [1, 200], repetitionPenalty: [1, 2],
+};
+const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /* Chatterbox (worker chatterbox_contract.py). One worker, three versions ("model"):
  *   turbo:        English, sound tags inline, temperature 0.05-2. Its clip must be over 5 s.
@@ -110,7 +133,7 @@ const isSet = (v) => v !== undefined && v !== null && v !== '';
  * plain sentence before any GPU time (it used to be dropped without a word). */
 const TUNE_NAMES = { steps: 'Quality', cfg: 'How closely it follows' };
 function tuneFields(engine, b) {
-  const knobs = engine === 'dramabox' ? { cfg: DRAMABOX.cfg } : engine === 'chatterbox' ? {} : { cfg: ENGINES[engine].cfg, steps: ENGINES[engine].steps };
+  const knobs = engine === 'dramabox' ? { cfg: DRAMABOX.cfg } : engine === 'chatterbox' || engine === 'qwen' ? {} : { cfg: ENGINES[engine].cfg, steps: ENGINES[engine].steps };
   const fields = {};
   for (const k of ['steps', 'cfg']) {
     const v = numberOf(b[k]);
@@ -196,6 +219,27 @@ function dramaboxFields(b, input) {
   return { fields };
 }
 
+/* Qwen's fields on a booth request -> worker fields, or { error }. Empty values mean "the usual". */
+function qwenFields(b, input) {
+  const fields = {};
+  const lang = isSet(b.language) ? String(b.language).trim().toLowerCase() : '';
+  if (lang) {
+    if (!QWEN.languages.includes(lang)) return { error: 'Pick a language from the list, or Auto.' };
+    fields.language = capital(lang);
+  }
+  const knobs = [['temperature', 'Variety', QWEN.temperature, false], ['top_p', 'Word choice range', QWEN.topP, false],
+    ['top_k', 'Choices per step', QWEN.topK, true], ['repetition_penalty', 'Repeat guard', QWEN.repetitionPenalty, false]];
+  for (const [k, name, [lo, hi], whole] of knobs) {
+    const v = numberOf(b[k]);
+    if (!isSet(v)) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi || (whole && !Number.isInteger(v))) {
+      return { error: `${name} must be ${whole ? 'a whole number' : 'a number'} from ${lo} to ${hi}.` };
+    }
+    fields[k] = v;
+  }
+  return { fields };
+}
+
 /* Ming's extra controls (worker ming_contract.py). Ming runs one task per take and refuses a mix,
  * so the bridge checks the same rules first and says them plainly:
  *   design: `voice` (a built-in voice) instead of a description -> ip.
@@ -228,7 +272,8 @@ const LANGUAGE_NAMES = { en: 'English', zh: 'Chinese', de: 'German', es: 'Spanis
 const MING_FIELDS = ['voice', 'emotion', 'speed', 'pitch', 'volume', 'language'];
 /* The controls each newer engine files in metadata.openVoice.controls (Ming files MING_FIELDS). */
 const OWN_FIELDS = { chatterbox: ['model', 'temperature', 'exaggeration', 'cfg_weight', 'language_id'], dramabox: ['duration', 'reference_seconds', 'cfg_scale'],
-  voxcpm: ['cfg_value', 'inference_timesteps'], ming: [...MING_FIELDS, 'cfg_scale', 'flow_steps'] };
+  voxcpm: ['cfg_value', 'inference_timesteps'], ming: [...MING_FIELDS, 'cfg_scale', 'flow_steps'],
+  qwen: ['language', 'temperature', 'top_p', 'top_k', 'repetition_penalty'] };
 const TAG_RE = /\[([A-Za-z][A-Za-z -]{0,30})\]/g; // the worker's own pattern; anything else is read as words
 const KNOWN_TAG = new Set([...MING.tags.map((t) => t.slice(1, -1).toLowerCase()), ...MING.aliases]);
 const NO_MIX = 'no style, emotion, speed, pitch or volume';
@@ -318,6 +363,9 @@ function plainError(out = {}) {
   if (/^The scene is too long: about \d+ s of audio, at most \d+ s\.$/.test(raw)) return raw.replace(/ s of audio, at most (\d+) s\./, ' seconds of audio. The most is $1 seconds.');
   if (/^One sentence is too long to say in one take/.test(raw)) return 'One spoken sentence is too long for one take. Break it into shorter sentences.';
   if (/^The reference clip [a-z ,]+\.$/i.test(raw) && raw.length <= 80) return raw;
+  /* Qwen's own sentences (the bridge checks the same things first). */
+  if (/^A designed voice speaks at most \d+ characters in one take\./.test(raw)) return raw;
+  if (/^The Qwen \w+ model files are (not in this worker|incomplete)/.test(raw)) return 'The voice engine is missing a part right now. Nothing was made. Try again later.';
   return 'The voice engine could not make this take. Nothing was made. Try again, or try a different clip.';
 }
 
@@ -366,6 +414,39 @@ function buildInput(engine, b = {}, env = process.env) {
   const maxText = e.maxText || MAX_TEXT;
   if (text.length > maxText) return { error: `The ${scene ? 'scene is' : 'words are'} too long for ${e.label}. The most is ${maxText} characters.` };
   const input = { mode, text };
+  if (engine === 'qwen') {
+    for (const k of ['voice', 'emotion', 'speed', 'pitch', 'volume']) {
+      if (isSet(typeof b[k] === 'string' ? b[k].trim() : b[k])) return { error: 'Built-in voices, emotion, speed, pitch and volume work only with Ming.' };
+    }
+    if (oneLine(b.style)) return { error: 'Qwen takes no style. Put how it sounds in the voice description when you design it.' };
+    if (mode === 'design') {
+      const description = oneLine(b.description);
+      if (!description) return { error: 'Describe the voice first.' };
+      if (description.length > e.maxPrefix) return { error: `The description is too long. The most is ${e.maxPrefix} characters.` };
+      if (text.length > QWEN.maxDesignText) {
+        return { error: `Qwen designs a voice from at most ${QWEN.maxDesignText} characters. Keep a take, then speak longer words with the kept voice.` };
+      }
+      input.description = description;
+    } else {
+      if (oneLine(b.description)) return { error: 'A kept voice already sounds the way it sounds. Clear the description, or design a new voice.' };
+      const url = typeof b.reference_voice_url === 'string' ? b.reference_voice_url.trim() : '';
+      if (!url) return { error: 'Pick a saved voice or a clip first.' };
+      if (!ourClip(url, env)) return { error: 'That clip is not stored with the platform. Import it again.' };
+      input.reference_url = url;
+      const words = oneLine(b.prompt_text);
+      if (words.length > MAX_PROMPT_TEXT) return { error: `The clip's words are too long. The most is ${MAX_PROMPT_TEXT} characters.` };
+      if (words) input.reference_text = words; // the close copy; without it only the voice's sound is used
+    }
+    const own = qwenFields(b, input);
+    if (own.error) return own;
+    const tuned = tuneFields(engine, b);
+    if (tuned.error) return tuned;
+    Object.assign(input, own.fields);
+    const seeded = seedOf(b);
+    if (seeded.error) return seeded;
+    input.seed = seeded.seed;
+    return { input };
+  }
   if (engine === 'chatterbox' || scene) {
     /* No description and no style: the worker would refuse them (Chatterbox) or never read them (DramaBox). */
     if (oneLine(b.description)) {
@@ -545,7 +626,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
       text: input.text || input.prompt, description: input.description || '', style: input.style || '', seed: input.seed,
       ...(engine === 'chatterbox' ? { version: input.model } : {}),
       ...(own.some((k) => isSet(input[k])) ? { controls: Object.fromEntries(own.filter((k) => isSet(input[k])).map((k) => [k, input[k]])) } : {}),
-      hasPromptText: !!input.prompt_text, state: 'queued', createdAt: new Date(now()).toISOString(), runpodId: null,
+      hasPromptText: !!(input.prompt_text || input.reference_text), state: 'queued', createdAt: new Date(now()).toISOString(), runpodId: null,
       coldLikely: coldLikely(cap), result: null, error: null, costUSD: null };
     try {
       const r = await http.post(`${base(engine)}/run`, { input }, { headers: headers(), timeout: 30000 });
@@ -687,7 +768,7 @@ function createOpenVoices({ env = process.env, http, dataDir, now = () => Date.n
       /* `controls: true` tells the fork this bridge reads Ming's extra controls (mingControls), so
        * the fork offers them only once this code is live. */
       engines: Object.fromEntries(Object.keys(ENGINES).map((k) => [k, { label: ENGINES[k].label, configured: ready(k), endpointId: endpointOf(k, env) || null,
-        ...(k === 'ming' ? { controls: true } : {}), maxText: ENGINES[k].maxText }])),
+        ...(k === 'ming' ? { controls: true } : {}), ...(k === 'qwen' ? { maxDesignText: QWEN.maxDesignText } : {}), maxText: ENGINES[k].maxText }])),
       caps: { dailyUSD: DAILY_CAP, monthlyUSD: MONTHLY_CAP },
       spend: { dayUSD: spendSince(now() - 86400000), monthUSD: spendSince(now() - 30 * 86400000) },
       open: jobs.filter(isLive).length,
@@ -744,4 +825,4 @@ function attachOpenVoices(app, d = {}, opts = {}) {
 }
 
 module.exports = { attachOpenVoices, createOpenVoices, buildInput, tuneFields, mingControls, soundTags, chatterboxFields, dramaboxFields, spokenLines, engineLabel,
-  ourClip, endpointOf, coldLikely, saySeconds, plainError, ENGINES, MING, CHATTERBOX, DRAMABOX, VOICE_LABELS, SEED_MAX };
+  ourClip, endpointOf, coldLikely, saySeconds, plainError, qwenFields, ENGINES, MING, CHATTERBOX, DRAMABOX, QWEN, VOICE_LABELS, SEED_MAX };

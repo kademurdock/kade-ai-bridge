@@ -171,7 +171,9 @@ test('routes: secret required, status is per owner, health names both engines', 
   assert.equal(health.engines.ming.configured, false);
   assert.equal(health.engines.ming.controls, true, 'the fork offers Ming controls only when the bridge says it reads them');
   assert.equal(health.engines.voxcpm.controls, undefined);
-  assert.deepEqual(Object.keys(health.engines), ['voxcpm', 'ming', 'chatterbox', 'dramabox']);
+  assert.deepEqual(Object.keys(health.engines), ['voxcpm', 'ming', 'chatterbox', 'dramabox', 'qwen']);
+  assert.equal(health.engines.qwen.configured, false, 'off until QWEN_TTS_ENDPOINT_ID is set');
+  assert.equal(health.engines.qwen.maxDesignText, 1500);
   assert.equal(health.engines.chatterbox.configured, false, 'off until CHATTERBOX_ENDPOINT_ID is set');
   assert.equal(health.engines.dramabox.configured, false, 'off until DRAMABOX_ENDPOINT_ID is set');
   assert.equal(health.engines.dramabox.maxText, 4000);
@@ -543,4 +545,79 @@ test('the chosen settings are filed with the take', async () => {
   const run = http.calls.find((c) => c.url.endsWith('/run'));
   assert.equal(run.body.input.cfg_scale, 3.5);
   assert.equal(lane.find(r.jobId).controls.cfg_scale, 3.5);
+});
+
+/* ---------- Qwen (Nov 22 2026; worker qwentts_contract.py) ---------- */
+
+test('Qwen is off until QWEN_TTS_ENDPOINT_ID is set', () => {
+  assert.equal(ov.endpointOf('qwen', {}), '');
+  assert.equal(ov.endpointOf('qwen', { QWEN_TTS_ENDPOINT_ID: 'qwen00001' }), 'qwen00001');
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k' }, http: fakeHttp(), dataDir: tmp() });
+  assert.equal(lane.ready('qwen'), false);
+  assert.equal(ov.engineLabel({ engine: 'qwen' }), 'Qwen');
+});
+
+test('Qwen design: description and words, language as a name, knobs checked; one take is at most 1500 characters', () => {
+  assert.deepEqual(ov.buildInput('qwen', { mode: 'design', description: ' A warm, low voice. ', text: ' Hello there. ', seed: 4 }).input,
+    { mode: 'design', text: 'Hello there.', description: 'A warm, low voice.', seed: 4 });
+  assert.deepEqual(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', language: 'english', temperature: '0.7', top_p: 0.8, top_k: '30', repetition_penalty: 1.2, seed: 1 }).input,
+    { mode: 'design', text: 'Hi', description: 'd', language: 'English', temperature: 0.7, top_p: 0.8, top_k: 30, repetition_penalty: 1.2, seed: 1 });
+  assert.equal(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', language: '' }).input.language, undefined, 'empty = Auto, the worker default');
+  assert.match(ov.buildInput('qwen', { mode: 'design', text: 'Hi' }).error, /Describe the voice first/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'x'.repeat(1001), text: 'Hi' }).error, /description is too long. The most is 1000/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'x'.repeat(1501) }).error, /at most 1500 characters. Keep a take/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', language: 'klingon' }).error, /Pick a language/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', temperature: 3 }).error, /Variety must be a number from 0.1 to 2/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', top_k: 2.5 }).error, /Choices per step must be a whole number/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', style: 'calm' }).error, /Qwen takes no style/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', cfg: 2 }).error, /not a setting Qwen has/);
+  assert.match(ov.buildInput('qwen', { mode: 'design', description: 'd', text: 'Hi', emotion: 'happy' }).error, /work only with Ming/);
+});
+
+test('Qwen speak: the kept clip as reference_url and its words as reference_text; no description', () => {
+  assert.deepEqual(ov.buildInput('qwen', { mode: 'speak', reference_voice_url: CLIP, prompt_text: ' The kept words. ', text: 'New line.', seed: 2 }).input,
+    { mode: 'clone', text: 'New line.', reference_url: CLIP, reference_text: 'The kept words.', seed: 2 });
+  assert.equal(ov.buildInput('qwen', { mode: 'speak', reference_voice_url: CLIP, text: 'x'.repeat(4000), seed: 2 }).input.reference_text, undefined, 'no words = voice only; long scripts are fine');
+  assert.match(ov.buildInput('qwen', { mode: 'speak', text: 'Hi' }).error, /saved voice or a clip/);
+  assert.match(ov.buildInput('qwen', { mode: 'speak', reference_voice_url: 'https://evil.example/a.wav', text: 'Hi' }).error, /not stored/);
+  assert.match(ov.buildInput('qwen', { mode: 'speak', reference_voice_url: CLIP, text: 'Hi', description: 'warm' }).error, /already sounds the way it sounds/);
+  assert.match(ov.buildInput('qwen', { mode: 'speak', reference_voice_url: CLIP, text: 'Hi', prompt_text: 'x'.repeat(1001) }).error, /clip's words are too long/);
+});
+
+test('lane: a Qwen design take sends exactly the worker fields, files description and words, and waits twice as long', async () => {
+  const dir = tmp();
+  t_after(dir);
+  let done = false;
+  const out = { url: 'https://s3.us-east-005.backblazeb2.com/b/qwen-tts/x.mp3?sig', wav_url: 'https://s3.us-east-005.backblazeb2.com/b/qwen-tts/x.wav?sig', key: 'qwen-tts/x.mp3', wav_key: 'qwen-tts/x.wav', duration_seconds: 3.1, sample_rate: 24000, mode: 'design', seed: 8, engine: 'qwen-tts' };
+  const http = fakeHttp({
+    get: (url) => url.endsWith('/health') ? { workers: { idle: 1 } } : done ? { status: 'COMPLETED', executionTime: 3600000, output: out } : { status: 'IN_PROGRESS' },
+    post: (url) => url.endsWith('/run') ? { id: 'rp-q', status: 'IN_QUEUE' } : { ok: true },
+  });
+  const lane = ov.createOpenVoices({ env: { RUNPOD_API_KEY: 'k', QWEN_TTS_ENDPOINT_ID: 'qwen00001', KADE_USAGE_EVENT_SECRET: 's', FORK_USAGE_URL: 'https://fork.test' }, http, dataDir: dir });
+  const r = await lane.start({ engine: 'qwen', userId: 'u1', mode: 'design', description: 'An old storyteller, slow and gravelly.', text: 'Sit down a spell.', language: 'English', temperature: 0.8, seed: 8 });
+  assert.equal(r.ok, true, r.error);
+  const run = http.calls.find((c) => c.url.endsWith('/run'));
+  assert.equal(run.url, 'https://api.runpod.ai/v2/qwen00001/run');
+  assert.deepEqual(run.body.input, { mode: 'design', text: 'Sit down a spell.', description: 'An old storyteller, slow and gravelly.', language: 'English', temperature: 0.8, seed: 8 });
+  assert.equal(ov.ENGINES.qwen.queueFactor, 2);
+  done = true;
+  await lane.pump();
+  const job = lane.find(r.jobId);
+  assert.equal(job.state, 'done');
+  assert.equal(job.costUSD, 1.34, 'the 24 GB rate');
+  const asset = http.calls.find((c) => c.url.endsWith('/asset-event'));
+  assert.equal(asset.body.service, 'qwen_tts_audio');
+  assert.equal(asset.body.metadata.engine, 'Qwen');
+  assert.equal(asset.body.prompt, 'An old storyteller, slow and gravelly.\n\nSit down a spell.');
+  assert.equal(asset.body.metadata.openVoice.words, 'Sit down a spell.', 'a kept take speaks these words later as its clip words');
+  assert.equal(asset.body.metadata.openVoice.description, 'An old storyteller, slow and gravelly.');
+  assert.deepEqual(asset.body.metadata.openVoice.controls, { language: 'English', temperature: 0.8 });
+});
+
+test('Qwen worker sentences reach her plainly', () => {
+  assert.equal(ov.plainError({ error: 'The reference clip must be longer than 1 second (5 to 15 seconds of clear speech is best).' }),
+    'That clip is too short. Use a clip longer than 1 second of clear speech.');
+  assert.match(ov.plainError({ error: 'A designed voice speaks at most 1500 characters in one take. Keep the take, then speak longer scripts with the kept voice.' }), /^A designed voice/);
+  assert.match(ov.plainError({ error: 'The Qwen clone model files are not in this worker. No audio was generated.' }), /missing a part/);
+  assert.match(ov.plainError({ error: 'Qwen could not finish (RuntimeError). No audio was generated.' }), /could not make this take/);
 });
