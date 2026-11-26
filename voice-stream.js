@@ -2662,6 +2662,15 @@ async function handleRegistrationTurn(session, text) {
 
 async function finishRegistration(session) {
   const reg = session.reg;
+  // Nov 26 2026 (lockdown review): a site account is made, and this phone linked to it, only on a
+  // socket proven to be Twilio's stream for a real call (site-caps.js). A forged socket that names
+  // someone's number gets nothing saved. BRIDGE_PHONE_SIGNUP_UNPROVEN=1 turns this check off.
+  if (!(await require('./site-caps').callerProvenForSignup(session))) {
+    session.reg = null;
+    console.warn('[reg] sign-up not tried: this call is not proven real (no ticket or Twilio word)');
+    await speak(session, "I can't finish setting up an account on this call. Kade can set you up on the website. Let's keep talking.", session.voice);
+    return;
+  }
   const res = await session.cfg.createAccount({
     name: reg.name || session.callerName || 'Friend',
     email: reg.email, password: reg.password, child: !!session.childCaller, phone: session.from,
@@ -2915,10 +2924,16 @@ async function handleGateTurn(session, text) {
           whyHere: 'Asked by voice on the Kade-AI phone line.',
         });
       } catch (e) { console.error('[gate] access request failed:', e.message); }
-      await gateHangup(session, filed
-        ? `That's rung through to Kade herself — if she knows you, expect to hear back at this number. Take care now!`
-        : `The doorbell's jammed on my end right now — but I've noted your name and number, and Kade will see it. Take care now!`);
-      if (!filed) {
+      // Nov 26 2026 (review fix): over the bridge's knock limit (site-caps.js). No front-desk
+      // note either, or the limit would cut nothing: Kade would still be pinged every time.
+      const limited = filed === 'limited';
+      if (limited) filed = false;
+      await gateHangup(session, limited
+        ? `I've already rung Kade's doorbell as many times as I can for now. Try again tomorrow, or ask someone Kade knows to tell her. Take care now!`
+        : filed
+          ? `That's rung through to Kade herself — if she knows you, expect to hear back at this number. Take care now!`
+          : `The doorbell's jammed on my end right now — but I've noted your name and number, and Kade will see it. Take care now!`);
+      if (!filed && !limited) {
         // Fail-soft: the ask must never vanish — land it as a front-desk note.
         g.message = `Wants an account. Said: "${t.slice(0, 300)}"`;
         g.fromName = g.doorName || null;

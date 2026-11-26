@@ -17,6 +17,17 @@
  * The site has its own limits behind these (failed sign-ins per email, and one
  * shared hourly count of service knocks). These counts live in memory, so a
  * restart starts them fresh. Every limit can be changed with a variable.
+ *
+ * Nov 26 2026 (second review): a limit per caller number means little when the
+ * caller picks the number. In the default `log` mode of TWILIO_WEBHOOK_GATE
+ * and CALL_SOCKET_GATE, a forged webhook or call socket could name any number
+ * and run the phone sign-up. So a phone sign-up (a new site account, a phone
+ * linked to one, or a guest row saved from the older spoken-menu lane) now
+ * also needs proof that the call is real: Twilio's valid signature on that
+ * webhook, or the call socket gate's proof (a signed ticket, or Twilio's own
+ * word about the call). Without proof the caller still talks; nothing is saved.
+ * BRIDGE_PHONE_SIGNUP_UNPROVEN=1 is the kill switch that brings back the old
+ * behaviour, for use only if the proof fails on real calls.
  */
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -88,6 +99,37 @@ function makeSiteCaps(env = process.env, now = () => Date.now()) {
   };
 }
 
+const TRUE_WORDS = ['1', 'on', 'true', 'yes'];
+
+/** The kill switch: phone sign-ups without proof the call is real, as before Nov 26 2026. */
+function unprovenSignupAllowed(env = process.env) {
+  return TRUE_WORDS.includes(String(env.BRIDGE_PHONE_SIGNUP_UNPROVEN || '').trim().toLowerCase());
+}
+
+/** For the webhook lane: did this very request carry Twilio's valid signature (twilio-gate.js)? */
+function webhookProvenForSignup(req, env = process.env) {
+  if (unprovenSignupAllowed(env)) return true;
+  return !!req && req.twilioSignatureOk === true;
+}
+
+/**
+ * For the call socket lane: is this session's socket proven to be Twilio's stream for a real call?
+ * Waits (at most waitMs) for a lookup that is still running, then reads the answer it left.
+ */
+async function callerProvenForSignup(session, { env = process.env, waitMs = 5000 } = {}) {
+  if (unprovenSignupAllowed(env)) return true;
+  if (!session) return false;
+  if (session.callerVerified !== true && session.callerCheck && typeof session.callerCheck.then === 'function') {
+    let timer = null;
+    await Promise.race([
+      Promise.resolve(session.callerCheck).catch(() => {}),
+      new Promise((resolve) => { timer = setTimeout(resolve, waitMs); }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+  return session.callerVerified === true;
+}
+
 /* The bridge's one shared set, made when first asked for. */
 let shared = null;
 function siteCaps() {
@@ -95,4 +137,4 @@ function siteCaps() {
   return shared;
 }
 
-module.exports = { makeSiteCaps, siteCaps, phoneKey, emailKey };
+module.exports = { makeSiteCaps, siteCaps, phoneKey, emailKey, unprovenSignupAllowed, webhookProvenForSignup, callerProvenForSignup };

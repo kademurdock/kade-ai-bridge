@@ -15,8 +15,16 @@
  * Unset KADE_SERVICE_LIMIT_SECRET = no header is sent. The site ignores a
  * value shorter than 24 characters or holding a comma, so this file follows
  * the same rule: such a value is never sent, and one warning says so.
+ *
+ * Nov 26 2026 (review fix): site calls also carry X-Kade-Service-Name: bridge.
+ * It is not a secret. The site reads it only on a request whose seat matched,
+ * to keep the bridge's failed sign-ins in a count of its own, apart from the
+ * inworld proxy's, so one service holding a stale password cannot lock the
+ * other out. It is taken off a redirect to another host with the seat.
  */
 const HEADER = 'X-Kade-Service';
+const NAME_HEADER = 'X-Kade-Service-Name';
+const SERVICE_NAME = 'bridge';
 const DEFAULT_SITE = 'https://kademurdock.com';
 
 function originOf(value) {
@@ -70,8 +78,10 @@ function axiosUrl(config) {
 
 function deleteHeader(headers) {
   if (!headers) return;
-  if (typeof headers.delete === 'function') headers.delete(HEADER);
-  for (const k of Object.keys(headers)) if (k.toLowerCase() === HEADER.toLowerCase()) delete headers[k];
+  for (const name of [HEADER, NAME_HEADER]) {
+    if (typeof headers.delete === 'function') headers.delete(name);
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === name.toLowerCase()) delete headers[k];
+  }
 }
 
 /** follow-redirects calls this before following a redirect: keep the header only on the site. */
@@ -92,8 +102,12 @@ function seatRequest(config, env = process.env) {
   const secret = seatSecret(env);
   if (!secret || !config) return config;
   if (!isSiteUrl(axiosUrl(config), env)) return config;
-  if (config.headers && typeof config.headers.set === 'function') config.headers.set(HEADER, secret);
-  else config.headers = { ...(config.headers || {}), [HEADER]: secret };
+  if (config.headers && typeof config.headers.set === 'function') {
+    config.headers.set(HEADER, secret);
+    config.headers.set(NAME_HEADER, SERVICE_NAME);
+  } else {
+    config.headers = { ...(config.headers || {}), [HEADER]: secret, [NAME_HEADER]: SERVICE_NAME };
+  }
   config.beforeRedirect = redirectGuard(config.beforeRedirect, env);
   return config;
 }
@@ -122,10 +136,12 @@ function installAxiosSeat(axios, env = process.env) {
   if (installed || !axios || !axios.interceptors) return false;
   const problem = seatSecretProblem(env);
   if (problem) console.warn(`[site-seat] ${problem}`); // the rule only, never the value
+  // One line at boot, so the logs show whether site calls carry the seat. Never the value.
+  else console.log(seatSecret(env) ? '[site-seat] site calls carry the service seat (as "bridge")' : '[site-seat] KADE_SERVICE_LIMIT_SECRET unset: site calls carry no service seat');
   axios.interceptors.request.use((config) => seatRequest(config, env));
   if (axios.interceptors.response) axios.interceptors.response.use((r) => r, (err) => Promise.reject(scrubError(err)));
   installed = true;
   return true;
 }
 
-module.exports = { HEADER, MIN_SECRET_LENGTH, seatSecret, seatSecretProblem, siteOrigins, isSiteUrl, axiosUrl, seatRequest, redirectGuard, scrubError, installAxiosSeat };
+module.exports = { HEADER, NAME_HEADER, SERVICE_NAME, MIN_SECRET_LENGTH, seatSecret, seatSecretProblem, siteOrigins, isSiteUrl, axiosUrl, seatRequest, redirectGuard, scrubError, installAxiosSeat };

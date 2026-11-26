@@ -70,6 +70,14 @@ function sameBridgeSecret(v) {
   if (typeof v !== 'string' || !v) return false;
   return crypto.timingSafeEqual(crypto.createHash('sha256').update(v).digest(), BRIDGE_SECRET_HASH);
 }
+// Nov 26 2026 (lockdown review): the same constant-time check for the scoped secrets below.
+// Only a text value can match, and an unset secret matches nothing, the same as the old ===.
+function sameSecretText(v, expected) {
+  if (typeof v !== 'string' || !v || typeof expected !== 'string' || !expected) return false;
+  const a = crypto.createHash('sha256').update(v).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 function bridgeSecretOk(req, provided) {
   if (!BRIDGE_SECRET) return false;
   const h = req.get && req.get('x-bridge-secret');
@@ -86,7 +94,7 @@ function notifySecretOk(req, provided) {
   if (bridgeSecretOk(req, provided)) return true;
   if (!NOTIFY_AGENT_SECRET) return false;
   const h = req.get && req.get('x-notify-secret');
-  return h === NOTIFY_AGENT_SECRET || provided === NOTIFY_AGENT_SECRET;
+  return sameSecretText(h, NOTIFY_AGENT_SECRET) || sameSecretText(provided, NOTIFY_AGENT_SECRET);
 }
 
 // Aug 7 2026: SCOPED broadcast secret for owner-triggered platform-wide
@@ -99,7 +107,7 @@ const NOTIFY_BROADCAST_SECRET = process.env.NOTIFY_BROADCAST_SECRET || '';
 function broadcastSecretOk(req, provided) {
   if (!NOTIFY_BROADCAST_SECRET) return false;
   const h = req.get && req.get('x-notify-broadcast-secret');
-  return h === NOTIFY_BROADCAST_SECRET || provided === NOTIFY_BROADCAST_SECRET;
+  return sameSecretText(h, NOTIFY_BROADCAST_SECRET) || sameSecretText(provided, NOTIFY_BROADCAST_SECRET);
 }
 const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
@@ -802,12 +810,12 @@ function writeKianaSelf(takes) {
 }
 app.get('/kiana-self', (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'admin only' });
   res.json({ takes: readKianaSelf() });
 });
 app.post('/kiana-self', (req, res) => {
   const h = req.get('x-kade-secret') || (req.body && req.body.secret);
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'admin only' });
   let takes = readKianaSelf();
   const b = req.body || {};
   if (Array.isArray(b.takes)) takes = b.takes.filter(t => typeof t === 'string' && t.trim()).slice(0, 40);
@@ -824,13 +832,13 @@ app.get('/diagnostics', (req, res) => {
   // shipped (the POST lane + log lines worked; the GET was never exercised
   // until Kade asked to read the ring). Same auth shape as /clock/status.
   const h = req.get('x-kade-secret') || req.query.secret;
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'admin only' });
   res.json({ count: diagRing.length, entries: diagRing, seats: diagSeats });
 });
 // Forget one seat (admin): DELETE /diagnostics/seat?key=android|Name <email>
 app.delete('/diagnostics/seat', (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'admin only' });
   const key = String(req.query.key || '');
   if (!Object.prototype.hasOwnProperty.call(diagSeats, key)) return res.status(404).json({ ok: false });
   delete diagSeats[key];
@@ -1990,7 +1998,13 @@ app.post('/voice/setup-confirm/:callSid', async (req, res) => {
   const state   = voiceStates.get(callSid);
   const speech  = (req.body.SpeechResult || '').trim().toLowerCase();
 
-  if (/^y(es|ep|eah)?/.test(speech) && state?.pendingEmail) {
+  // Nov 26 2026 (lockdown review): an account is made only when this webhook carried Twilio's
+  // valid signature (site-caps.js), so a forged POST cannot make site accounts with made-up numbers.
+  // Unproven, the caller still chats as an unsaved guest. BRIDGE_PHONE_SIGNUP_UNPROVEN=1 turns this off.
+  if (/^y(es|ep|eah)?/.test(speech) && state?.pendingEmail && !require('./site-caps').webhookProvenForSignup(req)) {
+    console.warn('[voice] account not made: this webhook is not proven to be from Twilio');
+    await playOrSay(twiml, `I can't set up an account on this call, but you can still chat as a guest. Kade can set you up on the website.`);
+  } else if (/^y(es|ep|eah)?/.test(speech) && state?.pendingEmail) {
     // Confirmed — create the account
     const name     = state.pendingName || 'Friend';
     const email    = state.pendingEmail;
@@ -2058,7 +2072,11 @@ app.post('/voice/setup-guest/:callSid', async (req, res) => {
   const state   = voiceStates.get(callSid);
   const name    = state?.pendingName || 'Friend';
 
-  if (state?.from) {
+  // Nov 26 2026 (lockdown review): the guest row is saved only when this webhook carried Twilio's
+  // valid signature (site-caps.js). A forged POST with a made-up number used to save one each time.
+  if (state?.from && !require('./site-caps').webhookProvenForSignup(req)) {
+    console.warn('[voice] guest not saved: this webhook is not proven to be from Twilio');
+  } else if (state?.from) {
     users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
     saveUsers();
     console.log(`[voice] registered ${state.from} as guest "${name}"`);
@@ -4469,9 +4487,11 @@ async function fileAccessRequestByPhone({ name, contact, whoYouAre, whyHere, pho
   // knocks by address, so the bridge keeps its own limits: a couple a day per
   // caller number, a few an hour in all (site-caps.js). The site also holds
   // all services to one shared hourly count.
+  // Over the limit it answers 'limited' (not false), so the gate does not send Kade a
+  // front-desk note instead: the point of the limit is fewer pings.
   if (!require('./site-caps').siteCaps().allowKnock({ phone: phone || contact })) {
     console.warn('[gate] knock not filed: over the bridge knock limit');
-    return false;
+    return 'limited';
   }
   const r = await axios.post(`${LIBRECHAT_URL}/api/access-request`, { name, contact, whoYouAre, whyHere }, {
     headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' }, timeout: 8000,
@@ -4816,7 +4836,7 @@ setInterval(async () => {
 // the earliest pending reminder changes. null/absent = nothing scheduled.
 app.post('/clock/next-due', (req, res) => {
   const h = req.get('x-kade-secret') || (req.body && req.body.secret);
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'Unauthorized' });
   const v = req.body ? req.body.nextDueAt : undefined;
   if (v !== null && v !== undefined && Number.isNaN(Date.parse(v))) {
     return res.status(400).json({ error: 'Bad nextDueAt' });
@@ -4829,7 +4849,7 @@ app.post('/clock/next-due', (req, res) => {
 // Observability: GET /clock/status?secret=... (or x-kade-secret header)
 app.get('/clock/status', (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'Unauthorized' });
   res.json({
     enabled: process.env.CLOCK_ENABLED === 'true',
     smartNudges: process.env.CLOCK_NUDGE_SMART === 'true',
@@ -5110,7 +5130,7 @@ const mediaDaily = { day: '', counts: new Map() };
 function mediaSecretOk(req, provided) {
   const s = process.env.MEDIA_TOOL_SECRET;
   const h = (req.get && req.get('x-media-secret')) || provided;
-  return (s && h === s) || (BRIDGE_SECRET && h === BRIDGE_SECRET);
+  return sameSecretText(h, s) || (!!BRIDGE_SECRET && sameBridgeSecret(h));
 }
 const MEDIA_PROMPT = (focus) =>
   /* Rebuilt on the platform's own researched describer doctrine (Part 82
@@ -5342,7 +5362,7 @@ app.post('/media/describe', async (req, res) => {
 
 app.post('/canary/run', async (req, res) => {
   const h = req.get('x-kade-secret') || req.query.secret;
-  if (!BRIDGE_SECRET || h !== BRIDGE_SECRET) return res.status(403).json({ error: 'admin only' });
+  if (!BRIDGE_SECRET || !sameBridgeSecret(h)) return res.status(403).json({ error: 'admin only' });
   try {
     // ?probe=N (or body.probe) selects a specific probe by index — receipts
     // and smoke tests; omit for the normal random draw. The tool probe is
@@ -6355,8 +6375,8 @@ async function slopStatsForSpeech() {
 
 app.get('/platform-status', async (req, res) => {
   const provided = req.get('x-notify-secret') || req.get('x-kade-secret') || req.query.secret;
-  const scopedOk = NOTIFY_AGENT_SECRET && provided === NOTIFY_AGENT_SECRET;
-  const adminOk = BRIDGE_SECRET && provided === BRIDGE_SECRET;
+  const scopedOk = sameSecretText(provided, NOTIFY_AGENT_SECRET);
+  const adminOk = !!BRIDGE_SECRET && sameBridgeSecret(provided);
   if (!scopedOk && !adminOk) return res.status(403).json({ error: 'Unauthorized' });
   try {
     const services = await checkPlatformServices();

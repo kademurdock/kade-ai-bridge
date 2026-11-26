@@ -17,7 +17,7 @@ function listen(handler) {
 }
 const echo = (req, res) => {
   res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify({ seat: req.headers['x-kade-service'] || null }));
+  res.end(JSON.stringify({ seat: req.headers['x-kade-service'] || null, name: req.headers['x-kade-service-name'] || null }));
 };
 
 test('only the site origins count', () => {
@@ -34,11 +34,13 @@ test('seatRequest adds the header for the site only, and only when the secret is
   const env = { LIBRECHAT_URL: 'https://kademurdock.com', KADE_SERVICE_LIMIT_SECRET: SECRET };
   const site = seat.seatRequest({ url: 'https://kademurdock.com/api/auth/login', headers: { 'User-Agent': 'x' } }, env);
   assert.equal(site.headers['X-Kade-Service'], SECRET);
+  assert.equal(site.headers['X-Kade-Service-Name'], 'bridge');
   assert.equal(site.headers['User-Agent'], 'x');
   const based = seat.seatRequest({ baseURL: 'https://kademurdock.com', url: '/api/x', headers: {} }, env);
   assert.equal(based.headers['X-Kade-Service'], SECRET);
   const other = seat.seatRequest({ url: 'https://api.openrouter.ai/v1', headers: {} }, env);
   assert.equal(other.headers['X-Kade-Service'], undefined);
+  assert.equal(other.headers['X-Kade-Service-Name'], undefined);
   const off = seat.seatRequest({ url: 'https://kademurdock.com/api/x', headers: {} }, { LIBRECHAT_URL: 'https://kademurdock.com' });
   assert.equal(off.headers['X-Kade-Service'], undefined);
 });
@@ -54,10 +56,10 @@ test('through real axios: the site gets the header, another host does not, a red
   const ax = axios.create();
   ax.interceptors.request.use((c) => seat.seatRequest(c, env));
   try {
-    assert.equal((await ax.post(`${site.base}/api/auth/login`, {})).data.seat, SECRET);
+    assert.deepEqual((await ax.post(`${site.base}/api/auth/login`, {})).data, { seat: SECRET, name: 'bridge' });
     assert.equal((await ax.get(`${other.base}/x`)).data.seat, null);
     assert.equal((await ax.get(`${site.base}/stay`)).data.seat, SECRET);
-    assert.equal((await ax.get(`${site.base}/away`)).data.seat, null);
+    assert.deepEqual((await ax.get(`${site.base}/away`)).data, { seat: null, name: null });
   } finally {
     site.server.close();
     other.server.close();

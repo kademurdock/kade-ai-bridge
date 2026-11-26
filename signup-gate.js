@@ -22,9 +22,12 @@
  *
  * Guessing the code is slowed down two ways: 5 code tries per address every 15 minutes, and 30
  * wrong codes from everyone together in an hour, after which the code is refused for the rest of
- * that hour. The address is a best guess (the last X-Forwarded-For entry, which Railway's edge adds),
- * so the shared cap is what really stops guessing from many made-up addresses. Posts that carry the
- * bridge secret are never slowed down.
+ * that hour. The address is a best guess: on Railway X-Forwarded-For arrives as "<client>, <edge>"
+ * (the Part 460 evidence the site's TRUST_PROXY=2 rests on), so the second-to-last entry is the
+ * caller and the last is Railway's edge, which everyone on that edge shares. Anything before those
+ * two is typed by the caller and never read. The shared cap is what really stops guessing from many
+ * addresses. Posts that carry the bridge secret are never slowed down. If a code is ever set, make
+ * it long and random: 30 an hour is still 720 guesses a day.
  *
  * Nothing here logs the code, the secret or a phone number.
  */
@@ -51,7 +54,8 @@ function sameCode(given, expected) {
 function requestAddress(req) {
   const fwd = String((req.headers && req.headers['x-forwarded-for']) || '');
   const parts = fwd.split(',').map((s) => s.trim()).filter(Boolean);
-  if (parts.length) return parts[parts.length - 1];
+  if (parts.length >= 2) return parts[parts.length - 2];
+  if (parts.length) return parts[0];
   return String((req.socket && req.socket.remoteAddress) || req.ip || 'unknown');
 }
 

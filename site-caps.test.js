@@ -3,7 +3,7 @@
  * sign-up tries and doorbell knocks. No network. */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeSiteCaps, phoneKey, emailKey } = require('./site-caps');
+const { makeSiteCaps, phoneKey, emailKey, unprovenSignupAllowed, webhookProvenForSignup, callerProvenForSignup } = require('./site-caps');
 
 const HOUR = 60 * 60 * 1000;
 function clock() {
@@ -59,4 +59,28 @@ test('every limit can be changed with a variable', () => {
   assert.equal(caps.allowKnock({ phone: '+14175550100' }), false);
   assert.equal(caps.allowSignup({ phone: '+14175550100', email: 'a@x.com' }), true);
   assert.equal(caps.allowSignup({ phone: '+14175550101', email: 'a@x.com' }), false);
+});
+
+test('a phone sign-up needs proof the call is real, unless the kill switch is on', async () => {
+  assert.equal(unprovenSignupAllowed({}), false);
+  assert.equal(unprovenSignupAllowed({ BRIDGE_PHONE_SIGNUP_UNPROVEN: 'yes' }), true);
+  // The webhook lane: only Twilio's valid signature on this very request.
+  assert.equal(webhookProvenForSignup({ twilioSignatureOk: true }, {}), true);
+  assert.equal(webhookProvenForSignup({}, {}), false);
+  assert.equal(webhookProvenForSignup(null, {}), false);
+  assert.equal(webhookProvenForSignup({}, { BRIDGE_PHONE_SIGNUP_UNPROVEN: '1' }), true);
+  // The call socket lane.
+  assert.equal(await callerProvenForSignup({ callerVerified: true }, { env: {} }), true);
+  assert.equal(await callerProvenForSignup({ callerVerified: false, callerCheck: Promise.resolve(true) }, { env: {} }), false);
+  assert.equal(await callerProvenForSignup(null, { env: {} }), false);
+  assert.equal(await callerProvenForSignup({ callerVerified: false }, { env: { BRIDGE_PHONE_SIGNUP_UNPROVEN: 'on' } }), true);
+  // A lookup still running is waited for, and its answer counts.
+  const late = { callerVerified: false };
+  late.callerCheck = new Promise((resolve) => setTimeout(() => { late.callerVerified = true; resolve(true); }, 20));
+  assert.equal(await callerProvenForSignup(late, { env: {} }), true);
+  // One that never answers is not waited for past the limit.
+  const stuck = { callerVerified: false, callerCheck: new Promise(() => {}) };
+  const t0 = Date.now();
+  assert.equal(await callerProvenForSignup(stuck, { env: {}, waitMs: 30 }), false);
+  assert.ok(Date.now() - t0 < 1000);
 });

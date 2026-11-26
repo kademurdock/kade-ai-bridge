@@ -195,6 +195,9 @@ function serverHarness(initial = health(), env = {}) {
   };
   vm.createContext(context);
   vm.runInContext(sourceBetween('const MEMORY_KEEPER_DEAD_H =', '/* ── VOICE REPORT') + '\nthis.tick = memoryKeeperAlarmTick; this.speech = memoryHealthForSpeech;', context);
+  // Nov 26 2026: the route compares secrets with the server's own constant-time helpers.
+  context.crypto = require('crypto');
+  vm.runInContext(sourceBetween('const BRIDGE_SECRET_HASH =', 'function bridgeSecretOk('), context);
   vm.runInContext(sourceBetween("app.get('/platform-status',", '// Deep research engine'), context);
   return {
     sent, intervals, timeouts, context,

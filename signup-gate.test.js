@@ -117,7 +117,10 @@ test('the address list never grows past its limit, even with new addresses insid
 });
 
 test('the address is the last X-Forwarded-For entry, which Railway adds, not the first one the caller writes', () => {
-  assert.equal(requestAddress(fakeReq({}, { 'x-forwarded-for': '1.2.3.4, 203.0.113.50' })), '203.0.113.50');
+  // Railway's shape is "<client>, <edge>": the caller is the second-to-last entry, never one typed before it.
+  assert.equal(requestAddress(fakeReq({}, { 'x-forwarded-for': '1.2.3.4, 203.0.113.50' })), '1.2.3.4');
+  assert.equal(requestAddress(fakeReq({}, { 'x-forwarded-for': '6.6.6.6, 1.2.3.4, 203.0.113.50' })), '1.2.3.4');
+  assert.equal(requestAddress(fakeReq({}, { 'x-forwarded-for': '203.0.113.50' })), '203.0.113.50');
   assert.equal(requestAddress(fakeReq({}, {}, '127.0.0.1')), '127.0.0.1');
 });
 
