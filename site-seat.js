@@ -12,7 +12,9 @@
  * the site (LIBRECHAT_URL, FORK_USAGE_URL, or kademurdock.com), and to nothing
  * else. If the site ever redirected one of these requests to another host, the
  * header is taken off before the request follows. The value is never logged.
- * Unset KADE_SERVICE_LIMIT_SECRET = no header is sent.
+ * Unset KADE_SERVICE_LIMIT_SECRET = no header is sent. The site ignores a
+ * value shorter than 24 characters or holding a comma, so this file follows
+ * the same rule: such a value is never sent, and one warning says so.
  */
 const HEADER = 'X-Kade-Service';
 const DEFAULT_SITE = 'https://kademurdock.com';
@@ -32,8 +34,21 @@ function siteOrigins(env = process.env) {
   return out;
 }
 
+const MIN_SECRET_LENGTH = 24; // the same rule the site uses
+
+/** Why the secret will not be used, or '' when it is fine or unset. Never includes the value. */
+function seatSecretProblem(env = process.env) {
+  const s = typeof env.KADE_SERVICE_LIMIT_SECRET === 'string' ? env.KADE_SERVICE_LIMIT_SECRET.trim() : '';
+  if (!s) return '';
+  if (s.length < MIN_SECRET_LENGTH || s.includes(',')) {
+    return `KADE_SERVICE_LIMIT_SECRET must be at least ${MIN_SECRET_LENGTH} characters with no comma, so the service seat header is not sent`;
+  }
+  return '';
+}
+
 function seatSecret(env = process.env) {
   const s = typeof env.KADE_SERVICE_LIMIT_SECRET === 'string' ? env.KADE_SERVICE_LIMIT_SECRET.trim() : '';
+  if (!s || seatSecretProblem(env)) return '';
   return s;
 }
 
@@ -105,10 +120,12 @@ let installed = false;
 /** Add the hook to the shared axios instance once. Every module that requires 'axios' shares it. */
 function installAxiosSeat(axios, env = process.env) {
   if (installed || !axios || !axios.interceptors) return false;
+  const problem = seatSecretProblem(env);
+  if (problem) console.warn(`[site-seat] ${problem}`); // the rule only, never the value
   axios.interceptors.request.use((config) => seatRequest(config, env));
   if (axios.interceptors.response) axios.interceptors.response.use((r) => r, (err) => Promise.reject(scrubError(err)));
   installed = true;
   return true;
 }
 
-module.exports = { HEADER, siteOrigins, isSiteUrl, axiosUrl, seatRequest, redirectGuard, scrubError, installAxiosSeat };
+module.exports = { HEADER, MIN_SECRET_LENGTH, seatSecret, seatSecretProblem, siteOrigins, isSiteUrl, axiosUrl, seatRequest, redirectGuard, scrubError, installAxiosSeat };

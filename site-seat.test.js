@@ -91,3 +91,16 @@ test('server.js installs the hook right after it loads axios', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8');
   assert.match(src, /const axios\s+= require\('axios'\);\n[^\n]*\nrequire\('\.\/site-seat'\)\.installAxiosSeat\(axios\);/);
 });
+
+test('a secret the site would ignore (short, or with a comma) is never sent', () => {
+  for (const bad of ['short-secret', 'abc,defghijklmnopqrstuvwxyz0123']) {
+    const env = { LIBRECHAT_URL: 'https://kademurdock.com', KADE_SERVICE_LIMIT_SECRET: bad };
+    assert.equal(seat.seatSecret(env), '');
+    assert.match(seat.seatSecretProblem(env), /at least 24 characters/);
+    assert.equal(seat.seatSecretProblem(env).includes(bad), false);
+    const cfg = seat.seatRequest({ url: 'https://kademurdock.com/api/auth/login', headers: {} }, env);
+    assert.equal(cfg.headers['X-Kade-Service'], undefined);
+  }
+  assert.equal(seat.seatSecretProblem({}), '');
+  assert.equal(seat.seatSecretProblem({ KADE_SERVICE_LIMIT_SECRET: SECRET }), '');
+});
