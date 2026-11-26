@@ -18,6 +18,8 @@ const http2    = require('http2');
 const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd, characterRateFor } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
+// Nov 26 2026 (Part 461): every call to the site carries the service seat header (KADE_SERVICE_LIMIT_SECRET), and no other host gets it.
+require('./site-seat').installAxiosSeat(axios);
 const crypto   = require('crypto');
 const fs       = require('fs');
 const path     = require('path');
