@@ -15,4 +15,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --no-audit --no-fund
 COPY . .
-CMD ["npm", "start"]
+# Nov 26 2026: run node directly. Under "npm start", npm got the SIGTERM a redeploy sends and
+# exited with an error, so every redeploy showed up as "Deployment crashed". package.json start
+# is only "node server.js", so nothing else changes.
+CMD ["node", "server.js"]

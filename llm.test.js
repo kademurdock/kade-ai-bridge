@@ -16,11 +16,19 @@ test('the default model is off Moonshot and rides zero-retention fast hosts', ()
   assert.equal(call.body.response_format, undefined);
   assert.equal(call.body.provider.zdr, true);
   assert.equal(call.body.provider.data_collection, 'deny');
-  assert.deepEqual(call.body.provider.order, ['together', 'parasail', 'modal', 'makora']);
+  assert.deepEqual(call.body.provider.order, ['parasail', 'modal', 'makora']);
+  assert.deepEqual(call.body.provider.ignore, ['morph', 'relace', 'deepinfra', 'digitalocean', 'together', 'gmicloud', 'minimax']);
   assert.equal(call.body.temperature, undefined);
   assert.deepEqual(llm.request(llm.DEFAULT_MODEL, messages, { maxTokens: 5, effort: 'low' }, env).body.reasoning, { enabled: true, effort: 'low', exclude: true });
   const priced = llm.request(llm.DEFAULT_MODEL, messages, { maxTokens: 5 }, { ...env, KADE_DEEPSEEK_ORDER: '' });
   assert.equal(priced.body.provider.sort, 'price'); assert.equal(priced.body.provider.order, undefined); assert.equal(priced.body.provider.zdr, true);
+  assert.ok(priced.body.provider.ignore.includes('together'), 'the never-hosts stay out when sorting by price too');
+});
+
+test('Together, GMI Cloud and MiniMax stay out even when Railway variables rewrite the lists (Nov 26 2026)', () => {
+  const call = llm.request(llm.DEFAULT_MODEL, messages, { maxTokens: 5 }, { ...env, KADE_DEEPSEEK_ORDER: 'together,parasail', KADE_DEEPSEEK_IGNORE: 'morph' });
+  assert.deepEqual(call.body.provider.order, ['parasail']);
+  assert.deepEqual(call.body.provider.ignore, ['morph', 'together', 'gmicloud', 'minimax']);
 });
 
 test('a kimi model named in an env var still goes to Moonshot with its two load-bearing facts', () => {

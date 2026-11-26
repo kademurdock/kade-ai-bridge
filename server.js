@@ -102,6 +102,34 @@ process.on('uncaughtException', (err) => {
   console.error('[bridge] UNCAUGHT EXCEPTION (exiting for clean restart):', err);
   process.exit(1);
 });
+// Nov 26 2026: a clean stop for redeploys. Railway stops the old copy with SIGTERM. There was no
+// handler, so the process died from the signal and Railway sent a "Deployment crashed" email for
+// every normal redeploy (24 of them since Nov 10). Now the bridge stops taking new connections and
+// exits with code 0. A live call or socket can hold the listener open, so after 8 seconds it exits
+// anyway, still with code 0.
+// Nothing needs flushing first: every store here (users, push tokens, reminders, call plans and the
+// rest) is written to disk at the moment it changes, with writeFileSync. Saving the users again here
+// would be risky: if the file could not be read at boot the map is empty, and a save would wipe it.
+let bridgeShuttingDown = false;
+function shutDownCleanly(signal) {
+  if (bridgeShuttingDown) return;
+  bridgeShuttingDown = true;
+  console.log(`[bridge] ${signal} received: closing the listener, then exiting`);
+  const forceExit = setTimeout(() => {
+    console.log('[bridge] still busy after 8 seconds: exiting now');
+    process.exit(0);
+  }, 8000);
+  forceExit.unref();
+  try {
+    server.close(() => process.exit(0));
+    if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+  } catch (e) {
+    // The listener was never started (a signal during startup): nothing to close.
+    process.exit(0);
+  }
+}
+process.on('SIGTERM', () => shutDownCleanly('SIGTERM'));
+process.on('SIGINT', () => shutDownCleanly('SIGINT'));
 
 const TTS_PROXY_URL      = 'https://inworld-tts-proxy-production.up.railway.app';
 const DEFAULT_PHONE_VOICE = process.env.DEFAULT_PHONE_VOICE || 'Kiana (Comedian)';
@@ -1898,7 +1926,10 @@ app.post('/voice/setup-email/:callSid', async (req, res) => {
 
   // "skip" → guest
   if (/^skip/.test(speech) || !speech) {
-    return res.type('text/xml').send(await buildGuestRegistration(twiml, callSid));
+    // Nov 26 2026: this used to call buildGuestRegistration, which was never written, so
+    // saying "skip" threw. It now goes to the guest step like every other way out.
+    twiml.redirect({ method: 'POST' }, `/voice/setup-guest/${callSid}`);
+    return res.type('text/xml').send(twiml.toString());
   }
 
   const email = parseSpokenEmail(speech);
@@ -1957,20 +1988,20 @@ app.post('/voice/setup-confirm/:callSid', async (req, res) => {
     } catch (err) {
       const alreadyExists = err.response?.status === 400 || err.response?.status === 409
         || (err.response?.data?.message || '').toLowerCase().includes('exist');
+      // Nov 26 2026: when no account was made, the caller is NOT saved any more. Both branches
+      // below used to write the caller into the user store, so anyone who reached this step
+      // (including fake calls with made-up numbers) became a saved user. The caller still chats
+      // for the rest of this call, because the call's own state is enough. Next time they call
+      // they are asked again, and saying "skip" goes to the guest step, which saves a guest on purpose.
       if (alreadyExists) {
-        console.log(`[voice] ${email} already registered — saving as guest for now`);
+        console.log('[voice] that email is already registered: chatting as an unsaved guest for this call');
         await playOrSay(twiml,
           `Looks like ${email.replace('@', ' at ')} already has an account at kademurdock.com. ` +
           `You're good to chat — log in on the website to see your history.`
         );
-        // Register with name only, no creds (we don't have their password)
-        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
-        saveUsers();
       } else {
-        console.error('[voice] account creation failed:', err.message);
+        console.error('[voice] account creation failed (caller not saved):', err.message);
         await playOrSay(twiml, `Something went wrong setting up your account, but you can still chat as a guest.`);
-        users.set(state.from, { name, agentId: DEFAULT_AGENT, agentName: DEFAULT_AGENT_NAME });
-        saveUsers();
       }
     }
   } else {

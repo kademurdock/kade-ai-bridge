@@ -24,8 +24,14 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'deepseek/deepseek-v4.1-flash';
 
 const list = (value, fallback) => (value === undefined ? fallback : String(value).split(',').map((s) => s.trim()).filter(Boolean));
-const FAST_ORDER = ['together', 'parasail', 'modal', 'makora'];
+// Nov 26 2026: Together is out of the order, and Together, GMI Cloud and MiniMax are never used.
+// Kade asked for those three to be kept away from her data. NEVER_HOSTS is added to the ignore list
+// even when KADE_DEEPSEEK_IGNORE replaces the rest of it, so a Railway variable cannot bring them back.
+// Parasail, Modal and Makora (all zero-retention) charge the same as Together or less for DeepSeek.
+const FAST_ORDER = ['parasail', 'modal', 'makora'];
 const SLOW_IGNORE = ['morph', 'relace', 'deepinfra', 'digitalocean'];
+const NEVER_HOSTS = ['together', 'gmicloud', 'minimax'];
+const withNeverHosts = (ignore) => [...ignore, ...NEVER_HOSTS.filter((h) => !ignore.includes(h))];
 
 function isMoonshot(model) { return /^kimi-/i.test(String(model || '')); }
 
@@ -57,10 +63,11 @@ function request(model, messages, { maxTokens, json = false, effort = 'none' } =
    * host that does not is silently dropped from routing. Both desks already
    * ask for JSON in words and parse leniently (jsonFrom). */
   if (/^deepseek\//i.test(model)) {
-    const order = list(env.KADE_DEEPSEEK_ORDER, FAST_ORDER), ignore = list(env.KADE_DEEPSEEK_IGNORE, SLOW_IGNORE);
+    const ignore = withNeverHosts(list(env.KADE_DEEPSEEK_IGNORE, SLOW_IGNORE));
+    const order = list(env.KADE_DEEPSEEK_ORDER, FAST_ORDER).filter((h) => !NEVER_HOSTS.includes(h));
     body.provider = order.length
-      ? { zdr: true, data_collection: 'deny', order, ...(ignore.length ? { ignore } : {}), allow_fallbacks: true }
-      : { zdr: true, data_collection: 'deny', sort: 'price', allow_fallbacks: true };
+      ? { zdr: true, data_collection: 'deny', order, ignore, allow_fallbacks: true }
+      : { zdr: true, data_collection: 'deny', sort: 'price', ignore, allow_fallbacks: true };
   }
   return {
     url: `${OPENROUTER_URL}/chat/completions`,

@@ -52,7 +52,8 @@ const PROVIDERS = {
       };
       if (effort && effort !== 'none') shaped.max_tokens = Math.max(body.max_tokens || 0, 3000);
       if (/^deepseek\//i.test(String(body.model))) {
-        shaped.provider = { zdr: true, data_collection: 'deny', order: ['together', 'parasail', 'modal', 'makora'], ignore: ['morph', 'relace', 'deepinfra', 'digitalocean'], allow_fallbacks: true };
+        // Nov 26 2026: Together is out of the order, and Together, GMI Cloud and MiniMax are never used.
+        shaped.provider = { zdr: true, data_collection: 'deny', order: ['parasail', 'modal', 'makora'], ignore: ['morph', 'relace', 'deepinfra', 'digitalocean', 'together', 'gmicloud', 'minimax'], allow_fallbacks: true };
       }
       return shaped;
     },
