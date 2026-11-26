@@ -63,6 +63,9 @@ function signupHandler(users) {
   const context = vm.createContext({
     app: { post: (_path, fn) => { handler = fn; } },
     users, saveUsers: () => saved.push(JSON.stringify([...users])), signupRecord,
+    // Nov 26 2026: the lock in front of the form (signup-gate.js, tested in signup-gate.test.js).
+    // These tests are about what a let-in post does to the rows, so the gate lets every post in.
+    signupGate: { check: () => ({ ok: true, via: 'secret' }) },
     DEFAULT_AGENT: DEFAULTS.agentId, DEFAULT_AGENT_NAME: DEFAULTS.agentName,
     console: { log() {} }, String,
   });

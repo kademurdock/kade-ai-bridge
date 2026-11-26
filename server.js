@@ -5,7 +5,9 @@
  *   TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER
  *   LIBRECHAT_URL / LIBRECHAT_EMAIL / LIBRECHAT_PASSWORD
  *   DEFAULT_AGENT_ID  — fallback agent (Kiana)
- *   BRIDGE_SECRET     — protects /register & /users
+ *   BRIDGE_SECRET     — protects /register & /users (and /signup since Nov 26 2026)
+ *   BRIDGE_SIGNUP_CODE — optional: lets the /signup browser form in with this code (signup-gate.js)
+ *   BRIDGE_SIGNUP_OPEN — kill switch: 1 reopens /signup to anyone, as before Nov 26 2026
  *   PORT / PUBLIC_URL — set automatically by Railway
  */
 
@@ -153,7 +155,7 @@ const { PHONE_VOICES, findVoice, extractVoiceSwitch, VOICE_IDENTIFY_REGEX, PHONE
         fixPronunciation, editDistance, phoneticFold, stripSwitchPadding, extractSwitchTarget, findAgent, fuzzyFindAgent, BROWSER_UA, scrubTranscriptText } = require('./voice-commands');
 
 
-const SIGNUP_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Register your phone — Kade AI</title>\n  <style>\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e8e8e8; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }\n    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 2rem; width: 100%; max-width: 400px; }\n    h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }\n    p { color: #999; font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5; }\n    label { display: block; font-size: 0.85rem; color: #ccc; margin-bottom: 0.35rem; }\n    input { width: 100%; padding: 0.65rem 0.85rem; background: #111; border: 1px solid #333; border-radius: 8px; color: #e8e8e8; font-size: 1rem; margin-bottom: 1rem; }\n    input:focus { outline: none; border-color: #555; }\n    button { width: 100%; padding: 0.75rem; background: #7c3aed; border: none; border-radius: 8px; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; }\n    button:hover { background: #6d28d9; }\n    .msg { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; text-align: center; display: none; }\n    .msg.ok { background: #14532d; color: #86efac; display: block; }\n    .msg.err { background: #450a0a; color: #fca5a5; display: block; }\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Register your phone</h1>\n    <p>So the AI knows who you are when you call in to the Kade AI line.</p>\n    <form id=\"f\">\n      <label for=\"name\">Your name</label>\n      <input id=\"name\" name=\"name\" type=\"text\" placeholder=\"Mom\" required autocomplete=\"name\">\n      <label for=\"phone\">Phone number</label>\n      <input id=\"phone\" name=\"phone\" type=\"tel\" placeholder=\"417-555-1234\" required autocomplete=\"tel\">\n      <button type=\"submit\">Register</button>\n    </form>\n    <div id=\"msg\" class=\"msg\"></div>\n  </div>\n  <script>\n    document.getElementById('f').addEventListener('submit', async e => {\n      e.preventDefault();\n      const btn = e.target.querySelector('button');\n      btn.disabled = true; btn.textContent = 'Registering...';\n      const msg = document.getElementById('msg');\n      msg.className = 'msg'; msg.textContent = '';\n      try {\n        const r = await fetch('/signup', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ name: document.getElementById('name').value.trim(), phone: document.getElementById('phone').value.trim() })\n        });\n        const d = await r.json();\n        if (d.ok) { msg.className = 'msg ok'; msg.textContent = \"You're registered! Next time you call, the AI will know your name.\"; e.target.reset(); }\n        else { msg.className = 'msg err'; msg.textContent = d.error || 'Something went wrong. Try again.'; }\n      } catch { msg.className = 'msg err'; msg.textContent = 'Network error. Try again.'; }\n      btn.disabled = false; btn.textContent = 'Register';\n    });\n  </script>\n</body>\n</html>";
+const SIGNUP_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Register your phone — Kade AI</title>\n  <style>\n    * { box-sizing: border-box; margin: 0; padding: 0; }\n    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e8e8e8; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }\n    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 2rem; width: 100%; max-width: 400px; }\n    h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }\n    p { color: #999; font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5; }\n    label { display: block; font-size: 0.85rem; color: #ccc; margin-bottom: 0.35rem; }\n    input { width: 100%; padding: 0.65rem 0.85rem; background: #111; border: 1px solid #333; border-radius: 8px; color: #e8e8e8; font-size: 1rem; margin-bottom: 1rem; }\n    input:focus { outline: none; border-color: #555; }\n    button { width: 100%; padding: 0.75rem; background: #7c3aed; border: none; border-radius: 8px; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; }\n    button:hover { background: #6d28d9; }\n    .msg { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; font-size: 0.9rem; text-align: center; display: none; }\n    .msg.ok { background: #14532d; color: #86efac; display: block; }\n    .msg.err { background: #450a0a; color: #fca5a5; display: block; }\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Register your phone</h1>\n    <p>So the AI knows who you are when you call in to the Kade AI line.</p>\n    <form id=\"f\">\n      <label for=\"name\">Your name</label>\n      <input id=\"name\" name=\"name\" type=\"text\" placeholder=\"Mom\" required autocomplete=\"name\">\n      <label for=\"phone\">Phone number</label>\n      <input id=\"phone\" name=\"phone\" type=\"tel\" placeholder=\"417-555-1234\" required autocomplete=\"tel\">\n      <label for=\"code\">Signup code (ask Kade)</label>\n      <input id=\"code\" name=\"code\" type=\"text\" autocomplete=\"off\">\n      <button type=\"submit\">Register</button>\n    </form>\n    <div id=\"msg\" class=\"msg\"></div>\n  </div>\n  <script>\n    document.getElementById('f').addEventListener('submit', async e => {\n      e.preventDefault();\n      const btn = e.target.querySelector('button');\n      btn.disabled = true; btn.textContent = 'Registering...';\n      const msg = document.getElementById('msg');\n      msg.className = 'msg'; msg.textContent = '';\n      try {\n        const r = await fetch('/signup', {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ name: document.getElementById('name').value.trim(), phone: document.getElementById('phone').value.trim(), code: document.getElementById('code').value.trim() })\n        });\n        const d = await r.json();\n        if (d.ok) { msg.className = 'msg ok'; msg.textContent = \"You're registered! Next time you call, the AI will know your name.\"; e.target.reset(); }\n        else { msg.className = 'msg err'; msg.textContent = d.error || 'Something went wrong. Try again.'; }\n      } catch { msg.className = 'msg err'; msg.textContent = 'Network error. Try again.'; }\n      btn.disabled = false; btn.textContent = 'Register';\n    });\n  </script>\n</body>\n</html>";
 
 // findVoice: shared — see voice-commands.js
 
@@ -182,6 +184,7 @@ console.log(require('./call-limits').limitsStartupLine());
 // lcEmail/lcPass = real LibreChat account creds. Guests omit these and use admin token.
 const credstore = require('./credstore');
 const { signupRecord } = require('./signup-record');
+const { createSignupGate, signupGateConfig, signupStartupLine, CLOSED_MESSAGE: SIGNUP_CLOSED_MESSAGE } = require('./signup-gate');
 const USERS_FILE = path.join(
   process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir(),
   'bridge-users.json'
@@ -2169,12 +2172,26 @@ app.post('/voice/continue/:callSid', async (req, res) => {
 
 
 // ── Self-registration web form ────────────────────────────────────────────────
+// Nov 26 2026 (lockdown): this form was open to anyone, which is how the fake "AuditProbe" rows got
+// in. It now needs the bridge secret (the LibreChat site sends it), or the code in
+// BRIDGE_SIGNUP_CODE when that is set. BRIDGE_SIGNUP_OPEN=1 brings back the old open form.
+// See signup-gate.js for who uses it and why.
+const signupGate = createSignupGate({ config: signupGateConfig(), secretOk: bridgeSecretOk });
+console.log(signupStartupLine());
+const SIGNUP_CLOSED_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>Register your phone - Kade AI</title>\n</head>\n<body>\n  <main>\n    <h1>Register your phone</h1>\n    <p>' + SIGNUP_CLOSED_MESSAGE + '</p>\n  </main>\n</body>\n</html>';
 app.get('/signup', (_req, res) => {
   res.setHeader('Content-Type', 'text/html');
-  res.send(SIGNUP_HTML);
+  res.send(signupGate.formOpen() ? SIGNUP_HTML : SIGNUP_CLOSED_HTML);
 });
 
 app.post('/signup', (req, res) => {
+  const gate = signupGate.check(req);
+  if (!gate.ok) {
+    // The first 20 refusals are logged, then every 100th, so a flood cannot fill the log.
+    const refused = signupGate.refused();
+    if (refused <= 20 || refused % 100 === 0) console.log('[signup] refused with ' + gate.status + ' (' + refused + ' refused since start; no number logged)');
+    return res.status(gate.status).json({ error: gate.error });
+  }
   const { name, phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone number is required.' });
   if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required.' });
@@ -2195,7 +2212,7 @@ app.post('/signup', (req, res) => {
     users.set(e164, record);
     saveUsers();
   }
-  console.log('[bridge] Self-registered ' + e164 + (created ? ' as "' + name.trim() + '"' : (changed ? ' (already registered: missing name or agent filled in)' : ' (already registered: row kept)')) + (record.accountType === 'child' ? ' (child account)' : ''));
+  console.log('[bridge] Self-registered (via ' + gate.via + ') ' + e164 + (created ? ' as "' + name.trim() + '"' : (changed ? ' (already registered: missing name or agent filled in)' : ' (already registered: row kept)')) + (record.accountType === 'child' ? ' (child account)' : ''));
   res.json({ ok: true, phone: e164 });
 });
 
