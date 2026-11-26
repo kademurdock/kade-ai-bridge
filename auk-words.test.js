@@ -86,6 +86,7 @@ test('MiMo is asked on zero-retention hosts and a reply that never heard the aud
   assert.equal(calls[0].body.model, 'xiaomi/mimo-v2.6-flash');
   assert.equal(calls[0].body.provider.zdr, true);
   assert.deepEqual(calls[0].body.provider.only, ['Makora', 'Novita']);
+  assert.deepEqual(calls[0].body.provider.ignore, ['together', 'gmicloud', 'minimax']);
   assert.equal(calls[0].body.messages[0].content[1].input_audio.format, 'wav');
   const heard = { post: async () => ({ data: { choices: [{ message: { content: 'see you thursday' } }], usage: { prompt_tokens: 90 } } }) };
   assert.equal((await words.mimoHear(heard, Buffer.from('ID3x'), { OPENROUTER_KEY: 'synthetic-only' })).text, 'see you thursday');

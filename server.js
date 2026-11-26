@@ -25,6 +25,7 @@ const os       = require('os');
 const testSeatPolicy = require('./test-seat-policy');
 // Part 295 (Sep 26 2026): BYOK-safe OpenRouter cost, and the Google key's alarm + spend ledger.
 const { openRouterCost, upstreamCost } = require('./or-cost');
+const { neverHostsProvider } = require('./llm'); // Nov 26 2026: never Together, GMI Cloud or MiniMax
 const googleWatch = require('./google-watch');
 const { pendingRing, canAnswerRing, DesktopPresence } = require('./desktop-calls');
 const { speechHeaders } = require('./speech-auth'); // Oct 16 2026: the voice proxy wants KADE_SPEECH_SECRET
@@ -40,6 +41,11 @@ app.use(express.json({ limit: '600kb' })); // Aug 10 2026: raised from the 100kb
 // ── Config ────────────────────────────────────────────────────────────────────
 const TWILIO_SID      = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_TOKEN    = process.env.TWILIO_AUTH_TOKEN;
+// Nov 26 2026: only set while the Twilio auth token is being rotated (see twilio-gate.js for the order).
+const TWILIO_TOKEN_NEXT = process.env.TWILIO_AUTH_TOKEN_NEXT || '';
+/** True when Twilio signed this request with the current token or, mid-rotation, the next one. */
+const twilioSignedFor = (req, url) => [TWILIO_TOKEN, TWILIO_TOKEN_NEXT].some((t) => !!t &&
+  twilio.validateRequest(t, req.get('X-Twilio-Signature') || '', url, req.body || {}) === true);
 const LIBRECHAT_URL   = (process.env.LIBRECHAT_URL || 'https://kademurdock.com').replace(/\/$/, '');
 const LIBRECHAT_EMAIL = process.env.LIBRECHAT_EMAIL;
 const LIBRECHAT_PASS  = process.env.LIBRECHAT_PASSWORD;
@@ -88,10 +94,11 @@ const PUBLIC_URL      = process.env.RAILWAY_PUBLIC_DOMAIN
 // Default mode is `log`: nothing is refused until TWILIO_WEBHOOK_GATE=enforce is set.
 const twilioGate = require('./twilio-gate');
 const twilioWebhookGate = twilioGate.createTwilioGate({
-  token: TWILIO_TOKEN, publicUrl: PUBLIC_URL, validateRequest: twilio.validateRequest,
+  token: TWILIO_TOKEN, nextToken: TWILIO_TOKEN_NEXT, publicUrl: PUBLIC_URL, validateRequest: twilio.validateRequest,
 });
 app.use(twilioGate.TWILIO_PATHS, twilioWebhookGate);
 console.log(twilioGate.gateStartupLine({ token: TWILIO_TOKEN }));
+if (TWILIO_TOKEN_NEXT) console.log('[twilio-gate] TWILIO_AUTH_TOKEN_NEXT is set: a token rotation is under way; delete it once the new token is promoted');
 // A phone bridge must not die because one async callback raced a hang-up.
 // Unhandled rejections get logged loudly and the process stays up; genuinely
 // unknown exceptions still exit(1) so Railway restarts us into a clean state.
@@ -2462,8 +2469,7 @@ app.post('/account-welcome-call', welcomeCalls.accountWelcomeCallHandler({
 app.post('/account-welcome-call/twiml/:token', welcomeCalls.accountWelcomeTwimlHandler({
   store: welcomeStore,
   checkSignature: (req) => !TWILIO_TOKEN || !twilio.validateRequest ||
-    twilio.validateRequest(TWILIO_TOKEN, req.get('X-Twilio-Signature') || '',
-      `${PUBLIC_URL}/account-welcome-call/twiml/${req.params.token}`, req.body || {}),
+    twilioSignedFor(req, `${PUBLIC_URL}/account-welcome-call/twiml/${req.params.token}`),
 }));
 app.get('/account-welcome-call/:sid', welcomeCalls.accountWelcomeStatusHandler({
   secretOk: bridgeSecretOk,
@@ -2863,7 +2869,7 @@ app.post('/amd-status', (req, res) => {
   // live CallSid to do anything (unknown sids no-op in the handler).
   try {
     if (TWILIO_TOKEN && twilio.validateRequest) {
-      const ok = twilio.validateRequest(TWILIO_TOKEN, req.get('X-Twilio-Signature') || '', `${PUBLIC_URL}/amd-status`, req.body || {});
+      const ok = twilioSignedFor(req, `${PUBLIC_URL}/amd-status`);
       if (!ok) console.warn(`[amd] SIGNATURE MISMATCH for ${CallSid} — investigate if this ever fires on a real Twilio callback`);
     }
   } catch {}
@@ -5190,6 +5196,7 @@ app.post('/media/describe', async (req, res) => {
             {
               model: MEDIA_OR_MODEL,
               messages: [{ role: 'user', content: [orMedia, { type: 'text', text: MEDIA_PROMPT(b.focus) + metaNote }] }],
+              provider: neverHostsProvider(),
             },
             {
               timeout: 120000,

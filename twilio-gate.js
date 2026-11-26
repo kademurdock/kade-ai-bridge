@@ -41,6 +41,15 @@
  *
  * The log line names the route, the mode and whether a signature header came. Never the body, the
  * number or the signature itself.
+ *
+ * Nov 26 2026: ROTATING THE TWILIO AUTH TOKEN WITHOUT CUTTING CALLS. Twilio signs with its PRIMARY
+ * token until the moment the secondary is promoted, so one token on the bridge always leaves a gap
+ * in enforce. The gate also accepts TWILIO_AUTH_TOKEN_NEXT. The order:
+ *   1. In the Twilio console, create a secondary auth token.
+ *   2. Set TWILIO_AUTH_TOKEN_NEXT on the bridge to it. Wait for the deploy.
+ *   3. Promote the secondary token in Twilio (the old primary stops working).
+ *   4. Set TWILIO_AUTH_TOKEN to the new token and delete TWILIO_AUTH_TOKEN_NEXT.
+ *   5. Make a test call and a test text; look for `[twilio-gate] refused ... signature header: yes`.
  */
 const MODES = new Set(['off', 'log', 'enforce']);
 const LOG_WINDOW_MS = 10 * 60 * 1000;
@@ -56,7 +65,7 @@ function routeLabel(originalUrl) {
   return String(originalUrl || '').split('?')[0].replace(/\/(CA|MG|SM)[0-9a-fA-F]{8,}/g, '/<sid>').slice(0, 80);
 }
 
-function createTwilioGate({ token, publicUrl, validateRequest, mode = gateMode(), log = console, now = () => Date.now() }) {
+function createTwilioGate({ token, nextToken, publicUrl, validateRequest, mode = gateMode(), log = console, now = () => Date.now() }) {
   const base = String(publicUrl || '').replace(/\/$/, '');
   const seen = { ok: 0, mismatch: 0, unsigned: 0, refused: 0, unchecked: 0, windowStart: now(), logged: { mismatch: 0, unsigned: 0 }, saidNoToken: false };
   // `kind` is 'mismatch' or 'unsigned': each has its own budget of lines per window.
@@ -86,7 +95,10 @@ function createTwilioGate({ token, publicUrl, validateRequest, mode = gateMode()
     try {
       const signature = (req.get && req.get('X-Twilio-Signature')) || '';
       hasSignature = !!signature;
-      ok = hasSignature && validateRequest(token, signature, base + req.originalUrl, req.body || {}) === true;
+      const url = base + req.originalUrl;
+      const body = req.body || {};
+      ok = hasSignature && (validateRequest(token, signature, url, body) === true
+        || (!!nextToken && validateRequest(nextToken, signature, url, body) === true));
     } catch (e) {
       ok = false;
     }

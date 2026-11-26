@@ -56,6 +56,7 @@ const os = require('os');
 const path = require('path');
 const axios = require('axios');
 const { openRouterCost } = require('./or-cost');
+const { neverHostsProvider } = require('./llm'); // Nov 26 2026: never Together, GMI Cloud or MiniMax
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -302,6 +303,7 @@ function makeBattery({ proxyUrl, proxySecret, openrouterKey, log = console, jev 
        * calls (glm once). 2500 is the budget; a thin score still says so. */
       max_tokens: maxTokens,
       reasoning: { effort: 'low' },
+      provider: neverHostsProvider(),
     }, {
       headers: { Authorization: `Bearer ${openrouterKey}`, 'Content-Type': 'application/json', 'User-Agent': UA,
         'HTTP-Referer': 'https://kademurdock.com', 'X-Title': 'kade-ai persona battery' },

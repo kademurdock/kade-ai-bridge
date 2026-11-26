@@ -12,13 +12,13 @@ const { createTwilioGate, gateMode, gateStartupLine, routeLabel, TWILIO_PATHS } 
 const TOKEN = 'test-auth-token-0123456789abcdef';
 const PUBLIC = 'https://bridge.example.test';
 
-async function withApp(mode, run, { token = TOKEN } = {}) {
+async function withApp(mode, run, { token = TOKEN, nextToken } = {}) {
   const logs = [];
   const handled = [];
   const app = express();
   app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
-  const gate = createTwilioGate({ token, publicUrl: PUBLIC, validateRequest: twilio.validateRequest, mode, log: { warn: (l) => logs.push(l) } });
+  const gate = createTwilioGate({ token, nextToken, publicUrl: PUBLIC, validateRequest: twilio.validateRequest, mode, log: { warn: (l) => logs.push(l) } });
   app.use(TWILIO_PATHS, gate);
   for (const route of ['/sms', '/voice', '/voice/continue/:callSid', '/voice-ws', '/voice-status', '/recording-status', '/signup', '/voicemail-list']) {
     app.post(route, (req, res) => { handled.push(req.path); res.type('text/xml').send('<Response/>'); });
@@ -188,4 +188,19 @@ test('server.js mounts the gate on the Twilio paths before any route', () => {
   for (const m of source.matchAll(/app\.post\('(\/(?:sms|voice|voice-ws|voice-ws-outbound|voice-status|recording-status)(?:\/[^']*)?)'/g)) {
     assert.ok(TWILIO_PATHS.some((p) => m[1] === p || m[1].startsWith(p + '/')), `${m[1]} is covered`);
   }
+});
+
+test('Nov 26: mid-rotation the gate takes the current token or TWILIO_AUTH_TOKEN_NEXT, and nothing else', async () => {
+  const NEXT = 'next-auth-token-fedcba9876543210';
+  const form = { From: '+15550000000', Body: 'hi' };
+  const signWith = (key) => ({ 'X-Twilio-Signature': twilio.getExpectedTwilioSignature(key, PUBLIC + '/sms', form) });
+  await withApp('enforce', async ({ post }) => {
+    assert.equal((await post('/sms', form, signWith(TOKEN))).status, 200);
+    assert.equal((await post('/sms', form, signWith(NEXT))).status, 200);
+    assert.equal((await post('/sms', form, signWith('some-other-token-000000000000'))).status, 403);
+    assert.equal((await post('/sms', form)).status, 403);
+  }, { nextToken: NEXT });
+  await withApp('enforce', async ({ post }) => {
+    assert.equal((await post('/sms', form, signWith(NEXT))).status, 403);
+  });
 });

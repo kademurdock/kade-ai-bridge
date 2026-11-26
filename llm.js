@@ -32,6 +32,9 @@ const FAST_ORDER = ['parasail', 'modal', 'makora'];
 const SLOW_IGNORE = ['morph', 'relace', 'deepinfra', 'digitalocean'];
 const NEVER_HOSTS = ['together', 'gmicloud', 'minimax'];
 const withNeverHosts = (ignore) => [...ignore, ...NEVER_HOSTS.filter((h) => !ignore.includes(h))];
+// The bridge's other OpenRouter callers (battery judge, video looks, media senses, council) send
+// this as their provider block, so the same three hosts are kept away from those calls too.
+const neverHostsProvider = () => ({ ignore: [...NEVER_HOSTS] });
 
 function isMoonshot(model) { return /^kimi-/i.test(String(model || '')); }
 
@@ -80,4 +83,4 @@ function request(model, messages, { maxTokens, json = false, effort = 'none' } =
  * fast zero-retention hosts billed on Sep 20 2026. */
 const PRICES = { 'kimi-k3': { in: 3, out: 15 }, 'kimi-k2.6': { in: 0.95, out: 4 }, 'deepseek/deepseek-v4.1-flash': { in: 0.3, out: 1.2 } };
 
-module.exports = { DEFAULT_MODEL, PRICES, isMoonshot, keyFor, missingKey, request };
+module.exports = { DEFAULT_MODEL, PRICES, NEVER_HOSTS, neverHostsProvider, isMoonshot, keyFor, missingKey, request };

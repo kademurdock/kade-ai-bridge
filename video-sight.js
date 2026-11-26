@@ -24,6 +24,7 @@ const path = require('path');
 const os = require('os');
 const axios = require('axios');
 const { openRouterCost, upstreamCost } = require('./or-cost');
+const { neverHostsProvider } = require('./llm'); // Nov 26 2026: never Together, GMI Cloud or MiniMax
 const googleWatch = require('./google-watch');
 
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
@@ -181,6 +182,7 @@ async function _describeFrame(session) {
       model,
       max_tokens: 350,
       usage: { include: true },
+      provider: neverHostsProvider(),
       messages: [{
         role: 'user',
         content: [
@@ -259,6 +261,7 @@ async function checkWatch(session) {
       model: watchModel(),
       max_tokens: 4,
       usage: { include: true },
+      provider: neverHostsProvider(),
       messages: [{
         role: 'user',
         content: [

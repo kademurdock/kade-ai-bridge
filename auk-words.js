@@ -13,6 +13,7 @@
  * Contract: F:/KadeAI-work/auk-20261114/CONTRACT.md. */
 
 const crypto = require('crypto');
+const { neverHostsProvider } = require('./llm'); // Nov 26 2026: never Together, GMI Cloud or MiniMax
 
 const MAX_TEXT = 200;
 const MAX_SEEDS = 4;
@@ -278,7 +279,7 @@ async function mimoHear(axios, buffer, env = process.env, { seconds } = {}) {
     temperature: 0,
     reasoning: { enabled: false },
     usage: { include: true },
-    provider: { order: hosts, only: hosts, allow_fallbacks: false, zdr: true, data_collection: 'deny' },
+    provider: { order: hosts, only: hosts, ignore: neverHostsProvider().ignore, allow_fallbacks: false, zdr: true, data_collection: 'deny' },
   }, {
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': UA, 'HTTP-Referer': 'https://kademurdock.com', 'X-Title': 'Kade-AI bridge' },
     timeout: 45000,

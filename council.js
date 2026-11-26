@@ -30,6 +30,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { neverHostsProvider } = require('./llm'); // Nov 26 2026: never Together, GMI Cloud or MiniMax
 
 const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : __dirname);
 const MINUTES_FILE = path.join(DATA_DIR, 'council-minutes.jsonl');
@@ -171,6 +172,7 @@ function callSeat(model, system, user, maxTokens) {
     max_tokens: maxTokens || 256,
     temperature: 0.4,
     reasoning: { effort: 'none', enabled: false },
+    provider: neverHostsProvider(),
   });
   return new Promise((resolve, reject) => {
     const req = https.request({
@@ -276,6 +278,7 @@ function callVision(model, system, userText, imagesB64) {
     max_tokens: 400,
     temperature: 0.4,
     reasoning: { effort: 'none', enabled: false },
+    provider: neverHostsProvider(),
   });
   return new Promise((resolve, reject) => {
     const req = https.request({

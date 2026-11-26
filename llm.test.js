@@ -47,3 +47,16 @@ test('a desk is disabled by the key its models actually need', () => {
   assert.equal(llm.missingKey([llm.DEFAULT_MODEL, 'kimi-k2.6'], { OPENROUTER_KEY: 'x' }), 'MOONSHOT_KEY is not set on the bridge');
   assert.ok(llm.PRICES[llm.DEFAULT_MODEL].out > 0);
 });
+
+test('every other OpenRouter caller in the bridge keeps Together, GMI Cloud and MiniMax away', () => {
+  assert.deepEqual(llm.neverHostsProvider(), { ignore: ['together', 'gmicloud', 'minimax'] });
+  const fs = require('fs');
+  const path = require('path');
+  // Each file that posts to OpenRouter must send the never-hosts provider block once per call.
+  const callers = { 'battery.js': 1, 'video-sight.js': 2, 'server.js': 1, 'council.js': 2, 'auk-words.js': 1 };
+  for (const [file, calls] of Object.entries(callers)) {
+    const src = fs.readFileSync(path.join(__dirname, file), 'utf8');
+    const uses = src.split('neverHostsProvider()').length - 1;
+    assert.equal(uses, calls, `${file} should send neverHostsProvider() on each of its ${calls} OpenRouter call(s)`);
+  }
+});
