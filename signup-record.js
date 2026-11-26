@@ -1,5 +1,9 @@
 'use strict';
-/* Nov 10 2026 (bug sweep). POST /signup is the public self-registration form: no secret, by design.
+/* Nov 26 2026 (lockdown): POST /signup is no longer open. signup-gate.js decides who may use it
+ * (the bridge secret, or the BRIDGE_SIGNUP_CODE code, or the BRIDGE_SIGNUP_OPEN kill switch). The
+ * notes below date from when it was open to anyone; the no-overwrite rule still holds either way.
+ *
+ * Nov 10 2026 (bug sweep). POST /signup was the public self-registration form: no secret, by design.
  * It built a FRESH row and wrote it over whatever was there, so anyone who posted a registered
  * number wiped that person's row: their site sign-in (lcEmail / lcPass), their voice, their speed and
  * their agent. Their next call was answered as a guest on the default agent, on the admin seat.

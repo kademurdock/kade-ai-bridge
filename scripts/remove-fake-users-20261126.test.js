@@ -74,3 +74,51 @@ test('with no file and no volume it refuses', () => {
 test('odd characters in a stranger\'s name never reach the terminal', () => {
   assert.equal(safeText('a\u001b[2Jb\n'), 'a?[2Jb?');
 });
+
+test('names cannot hide or reorder text: direction marks and invisible characters are replaced', () => {
+  const sneaky = 'Kade' + String.fromCharCode(0x202e) + 'evorp' + String.fromCharCode(0x200b, 0x2066, 0xfeff, 0x00ad) + 'x';
+  assert.equal(safeText(sneaky), 'Kade?evorp????x');
+  assert.equal(safeText('Jos' + String.fromCharCode(0xe9)), 'Jos' + String.fromCharCode(0xe9), 'accented letters stay');
+  assert.equal(safeText('a' + String.fromCharCode(0x85, 0x2028) + 'b'), 'a??b');
+});
+
+test('a broken file is refused with a plain message that quotes nothing from it', () => {
+  withFile({}, ({ dir, file }) => {
+    fs.writeFileSync(file, '{"+14175550142": {"name": "Kade", "lcPassEnc": "v1:secretish" ');
+    const lines = [];
+    assert.equal(run(['--file', file, '--apply'], {}, (l) => lines.push(l)), 2);
+    assert.deepEqual(lines, ['The file is not valid JSON. Nothing changed.']);
+    assert.deepEqual(fs.readdirSync(dir), ['bridge-users.json'], 'no backups were written');
+  });
+});
+
+test('if the bridge saves the file while the script runs, the script stops and changes nothing', () => {
+  withFile(ROWS, ({ dir, file }) => {
+    const realRead = fs.readFileSync;
+    let reads = 0;
+    const bridgeSave = JSON.stringify({ ...ROWS, '+14175550177': { name: 'New Person' } });
+    fs.readFileSync = function (p, ...rest) {
+      if (String(p) === file && ++reads === 1) {
+        const first = realRead.call(fs, p, ...rest);
+        fs.writeFileSync(file, bridgeSave); // the bridge saves right after the script read it
+        return first;
+      }
+      return realRead.call(fs, p, ...rest);
+    };
+    let code;
+    const lines = [];
+    try { code = run(['--file', file, '--apply'], {}, (l) => lines.push(l)); } finally { fs.readFileSync = realRead; }
+    assert.equal(code, 1);
+    assert.match(lines.join('\n'), /The file changed while the script was reading it/);
+    assert.equal(fs.readFileSync(file, 'utf8'), bridgeSave, "the bridge's save is kept");
+    assert.deepEqual(fs.readdirSync(dir), ['bridge-users.json'], 'no backups were written');
+  });
+});
+
+test('after --apply it says to delete the full copy once the result is confirmed', () => {
+  withFile(ROWS, ({ file }) => {
+    const lines = [];
+    assert.equal(run(['--file', file, '--apply'], {}, (l) => lines.push(l)), 0);
+    assert.match(lines.join('\n'), /delete the full copy/);
+  });
+});

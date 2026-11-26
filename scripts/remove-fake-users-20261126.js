@@ -22,6 +22,9 @@
  *   --file <path> reads another copy of the file instead of the one on the volume.
  * With --apply it first writes two backups next to the file: the removed rows on their own, and a
  * full copy of the file as it was. Then it writes the new file in one step (temp file, then rename).
+ * The full copy holds every row, stored sign-ins too, so delete it once the result is confirmed.
+ * If the file changes while the script runs (the bridge saved it), the script stops and changes
+ * nothing.
  *
  * IMPORTANT: the running bridge holds the user list in memory and writes the WHOLE list back every
  * time anyone registers or changes their agent. So restart the bridge right after --apply, or the
@@ -38,9 +41,14 @@ const NAMES = ['Mallory Probe7979', 'pentest-i6575'];
 const LEAVE_ALONE = ['+14175550134', '+14175550101']; // the two "Destiny" rows: report only
 const LOOKS_FAKE = /probe|pentest|audit|mallory/i;
 
-/* Names came from a stranger: keep only printable characters so nothing odd reaches the terminal. */
+/* Names came from a stranger, so only plain characters reach the terminal (and the screen reader).
+ * Replaced with '?': control characters; the invisible ones (zero-width spaces and joiners, the soft
+ * hyphen, the byte-order mark); the ones that flip or reorder text direction (U+202A to U+202E,
+ * U+2066 to U+2069); line and paragraph separators; and anything outside the basic plane, such as
+ * emoji. Letters with accents are kept. This is only for printing: names are matched as stored. */
+const ODD_CHARS = /[^\x20-\x7E\u00A0-\uFFFF]|[\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB\uD800-\uDFFF]/g;
 function safeText(v) {
-  return String(v == null ? '' : v).replace(/[^\x20-\x7E -￿]/g, '?').slice(0, 80);
+  return String(v == null ? '' : v).replace(ODD_CHARS, '?').slice(0, 80);
 }
 function nameOf(row) {
   return row && typeof row === 'object' ? String(row.name || '') : '';
@@ -92,6 +100,11 @@ function plan(rows) {
   return { remove, skipped, leftAlone, lookAt };
 }
 
+/* JSON.parse's own error message can quote a piece of the file, so it is never printed. */
+function parseRows(text) {
+  try { return { ok: true, rows: JSON.parse(text) }; } catch (_) { return { ok: false }; }
+}
+
 function line(r) {
   return `  ${r.phone || '(no number)'}  "${safeText(r.name)}"${r.why ? '  - ' + r.why : ''}`;
 }
@@ -112,7 +125,9 @@ function run(argv = process.argv.slice(2), env = process.env, out = console.log)
   }
   if (!fs.existsSync(file)) { out(`The file is not there: ${file}`); return 2; }
   const raw = fs.readFileSync(file, 'utf8');
-  const rows = JSON.parse(raw);
+  const parsed = parseRows(raw);
+  if (!parsed.ok) { out('The file is not valid JSON. Nothing changed.'); return 2; }
+  const rows = parsed.rows;
   if (!rows || typeof rows !== 'object' || Array.isArray(rows)) { out('The file is not a list of phone rows. Nothing changed.'); return 2; }
 
   const p = plan(rows);
@@ -135,6 +150,12 @@ function run(argv = process.argv.slice(2), env = process.env, out = console.log)
   if (!apply) { out('Look-only run: nothing changed.'); return 0; }
   if (!p.remove.length) { out('Nothing to remove. Nothing changed.'); return 0; }
 
+  /* If the bridge saved the file while this script was reading it, stop: writing now would throw
+   * that save away. Run the script again; it reads the new file. */
+  if (fs.readFileSync(file, 'utf8') !== raw) {
+    out('The file changed while the script was reading it (the bridge saved it). Nothing changed. Run it again.');
+    return 1;
+  }
   const dir = path.dirname(file);
   const when = stamp();
   const removedFile = path.join(dir, `bridge-users.removed-20261126-${when}.json`);
@@ -152,16 +173,22 @@ function run(argv = process.argv.slice(2), env = process.env, out = console.log)
   fs.writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
   fs.renameSync(tmp, file);
 
-  const check = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const checked = parseRows(fs.readFileSync(file, 'utf8'));
+  if (!checked.ok) { out(`The new file does not read back as JSON. Put the full copy back: ${fullFile}`); return 1; }
+  const check = checked.rows;
   const stillThere = p.remove.filter((r) => Object.prototype.hasOwnProperty.call(check, r.phone));
   out(`Removed ${p.remove.length - stillThere.length} row(s). Rows now: ${Object.keys(check).length}.`);
   if (stillThere.length) { out('Some rows are still there. Check the file.'); return 1; }
   out('');
   out('NOW RESTART THE BRIDGE. The running bridge still has these rows in memory and writes its whole');
   out('list back on the next change. After the restart, run this again without --apply to confirm.');
+  out('');
+  out('Once that look-only run finds nothing to remove, delete the full copy. It holds every row,');
+  out(`stored sign-ins too: rm ${fullFile}`);
+  out('Keep the removed-rows backup; it holds only the fake rows.');
   return 0;
 }
 
 if (require.main === module) process.exitCode = run();
 
-module.exports = { plan, run, safeText, FIXED_NUMBERS, NAMES, LEAVE_ALONE };
+module.exports = { plan, run, safeText, parseRows, FIXED_NUMBERS, NAMES, LEAVE_ALONE };

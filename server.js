@@ -60,10 +60,20 @@ const DEFAULT_AGENT_NAME = 'Kiana';
 const BRIDGE_SECRET   = process.env.BRIDGE_SECRET || '';
 // Header-first secret check (query strings land in edge logs); query/body
 // still accepted so existing callers keep working.
+// Nov 26 2026 (lockdown): compared in constant time, so the time an answer takes
+// says nothing about how much of a guess was right. Both sides are hashed first
+// so their lengths match. Only a text value can match, the same as before.
+const BRIDGE_SECRET_HASH = crypto.createHash('sha256').update(BRIDGE_SECRET).digest();
+function sameBridgeSecret(v) {
+  if (typeof v !== 'string' || !v) return false;
+  return crypto.timingSafeEqual(crypto.createHash('sha256').update(v).digest(), BRIDGE_SECRET_HASH);
+}
 function bridgeSecretOk(req, provided) {
   if (!BRIDGE_SECRET) return false;
   const h = req.get && req.get('x-bridge-secret');
-  return h === BRIDGE_SECRET || provided === BRIDGE_SECRET;
+  const headerOk = sameBridgeSecret(h);
+  const providedOk = sameBridgeSecret(provided);
+  return headerOk || providedOk;
 }
 
 // July 15 2026: SCOPED secret for the agent /notify primitive only. Agents send

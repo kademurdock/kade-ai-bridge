@@ -92,6 +92,30 @@ test('30 wrong codes from many made-up addresses close the code for the hour', (
   assert.equal(gate.stats().wrongCode, 30);
 });
 
+test('once the code is closed for the hour, a flood from made-up addresses adds nothing to the address list', () => {
+  const t = 7_000_000;
+  const gate = createSignupGate({ config: { open: false, code: CODE }, secretOk, now: () => t });
+  for (let i = 0; i < 30; i++) gate.check(fakeReq({ code: 'guess' }, { 'x-forwarded-for': `10.1.${i}.1` }));
+  assert.equal(gate.addressCount(), 30);
+  for (let i = 0; i < 500; i++) {
+    assert.equal(gate.check(fakeReq({ code: 'guess' }, { 'x-forwarded-for': `10.2.${i % 250}.${i}` })).status, 429);
+  }
+  assert.equal(gate.addressCount(), 30, 'no new entries while the shared cap is closed');
+});
+
+test('the address list never grows past its limit, even with new addresses inside 15 minutes', () => {
+  let t = 9_000_000;
+  const gate = createSignupGate({
+    config: { open: false, code: CODE }, secretOk, now: () => t, maxAddresses: 50, wrongCodeCap: 1_000_000,
+  });
+  for (let i = 0; i < 400; i++) {
+    t += 1000;
+    gate.check(fakeReq({ code: 'guess' }, { 'x-forwarded-for': `10.3.${i % 250}.${i}` }));
+    assert.ok(gate.addressCount() <= 50, `at most 50 addresses (had ${gate.addressCount()})`);
+  }
+  assert.equal(gate.check(fakeReq({ code: CODE }, { 'x-forwarded-for': '10.4.4.4' })).ok, true, 'the right code still works');
+});
+
 test('the address is the last X-Forwarded-For entry, which Railway adds, not the first one the caller writes', () => {
   assert.equal(requestAddress(fakeReq({}, { 'x-forwarded-for': '1.2.3.4, 203.0.113.50' })), '203.0.113.50');
   assert.equal(requestAddress(fakeReq({}, {}, '127.0.0.1')), '127.0.0.1');
@@ -119,9 +143,10 @@ async function withBridge(env, run) {
     createSignupGate, signupStartupLine: () => signupStartupLine(signupGateConfig(env)),
     signupGateConfig: () => signupGateConfig(env), SIGNUP_CLOSED_MESSAGE: gateLib.CLOSED_MESSAGE,
     DEFAULT_AGENT: 'agent_default', DEFAULT_AGENT_NAME: 'Kiana',
-    console: { log: (l) => logs.push(String(l)) }, String, JSON,
+    console: { log: (l) => logs.push(String(l)) }, String, JSON, crypto: require('node:crypto'),
   });
-  vm.runInContext(cut('function bridgeSecretOk(req, provided)', '\n}\n') + '\n}\n', context);
+  /* The real secret check: the constant-time compare and bridgeSecretOk. */
+  vm.runInContext(cut('const BRIDGE_SECRET_HASH = ', '\n// July 15 2026: SCOPED secret'), context);
   vm.runInContext(cut('const SIGNUP_HTML = ', '\n'), context);
   vm.runInContext(cut('const signupGate = createSignupGate(', '// ── Voice: heard'), context);
   const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });

@@ -68,15 +68,22 @@ function createSignupGate({
   perAddressWindowMs = 15 * 60 * 1000,
   wrongCodeCap = 30,
   wrongCodeWindowMs = 60 * 60 * 1000,
+  maxAddresses = 1000,
 } = {}) {
   if (typeof secretOk !== 'function') throw new Error('createSignupGate needs secretOk');
   const tries = new Map(); // address -> { since, count }
   let wrong = { since: 0, count: 0 };
   const counts = { secret: 0, code: 0, open: 0, closed: 0, noCode: 0, wrongCode: 0, slowed: 0 };
 
+  /* The address list never grows past maxAddresses. Old entries go first; if it is still full,
+   * the oldest entries are dropped (a Map keeps the order they were added in). */
   function prune(t) {
-    if (tries.size < 1000) return;
+    if (tries.size < maxAddresses) return;
     for (const [addr, e] of tries) if (t - e.since >= perAddressWindowMs) tries.delete(addr);
+    for (const addr of tries.keys()) {
+      if (tries.size < maxAddresses) break;
+      tries.delete(addr);
+    }
   }
 
   function check(req) {
@@ -87,11 +94,19 @@ function createSignupGate({
 
     const t = now();
     if (t - wrong.since >= wrongCodeWindowMs) wrong = { since: t, count: 0 };
-    prune(t);
+    /* The shared cap is checked first, so a flood after it closes adds nothing to the list. */
+    if (wrong.count >= wrongCodeCap) {
+      counts.slowed++;
+      return { ok: false, status: 429, error: SLOW_DOWN_MESSAGE };
+    }
     const addr = requestAddress(req);
     let e = tries.get(addr);
-    if (!e || t - e.since >= perAddressWindowMs) { e = { since: t, count: 0 }; tries.set(addr, e); }
-    if (e.count >= perAddressTries || wrong.count >= wrongCodeCap) {
+    if (!e || t - e.since >= perAddressWindowMs) {
+      prune(t);
+      e = { since: t, count: 0 };
+      tries.set(addr, e);
+    }
+    if (e.count >= perAddressTries) {
       counts.slowed++;
       return { ok: false, status: 429, error: SLOW_DOWN_MESSAGE };
     }
@@ -106,7 +121,10 @@ function createSignupGate({
 
   /* How many posts were turned away, for capping the log line in server.js. */
   const refused = () => counts.closed + counts.noCode + counts.wrongCode + counts.slowed;
-  return { check, stats: () => ({ ...counts }), refused, formOpen: () => config.open || !!config.code };
+  return {
+    check, stats: () => ({ ...counts }), refused, formOpen: () => config.open || !!config.code,
+    addressCount: () => tries.size,
+  };
 }
 
 function signupStartupLine(config = signupGateConfig()) {

@@ -124,10 +124,12 @@ test('no route compares a body secret to BRIDGE_SECRET bare (an unset secret wou
 });
 
 test('bridgeSecretOk refuses everything while the secret is unset', () => {
-  const start = SOURCE.indexOf('function bridgeSecretOk(req, provided)');
-  const end = SOURCE.indexOf('\n}\n', start) + 3;
+  /* The whole check: the constant-time compare (Nov 26 2026) and bridgeSecretOk itself. */
+  const start = SOURCE.indexOf('const BRIDGE_SECRET_HASH = ');
+  const end = SOURCE.indexOf('\n}\n', SOURCE.indexOf('function bridgeSecretOk(req, provided)')) + 3;
+  assert.ok(start > 0 && end > start, 'the secret check is where it was');
   const run = (secret) => {
-    const context = vm.createContext({ BRIDGE_SECRET: secret });
+    const context = vm.createContext({ BRIDGE_SECRET: secret, crypto: require('node:crypto') });
     vm.runInContext(SOURCE.slice(start, end) + '\nthis.ok = bridgeSecretOk;', context);
     return context.ok;
   };
@@ -137,4 +139,9 @@ test('bridgeSecretOk refuses everything while the secret is unset', () => {
   assert.equal(run('s3cret')(req(undefined), 's3cret'), true);
   assert.equal(run('s3cret')(req('s3cret'), undefined), true);
   assert.equal(run('s3cret')(req(undefined), ''), false);
+  /* Nov 26 2026: the compare is constant time now; it must still answer the same way. */
+  assert.equal(run('s3cret')(req('s3cre'), 's3cretX'), false, 'near misses of either length are refused');
+  assert.equal(run('s3cret')(req('wrong'), 's3cret'), true, 'a wrong header does not spoil a right body secret');
+  assert.equal(run('s3cret')(req(undefined), ['s3cret']), false, 'only a text value can match');
+  assert.equal(run('s3cret')(req(undefined), 123), false);
 });
