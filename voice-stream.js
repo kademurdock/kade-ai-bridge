@@ -2664,7 +2664,7 @@ async function finishRegistration(session) {
   const reg = session.reg;
   const res = await session.cfg.createAccount({
     name: reg.name || session.callerName || 'Friend',
-    email: reg.email, password: reg.password, child: !!session.childCaller,
+    email: reg.email, password: reg.password, child: !!session.childCaller, phone: session.from,
   });
   session.reg = null;
   if (res && res.ok) {
@@ -2674,6 +2674,8 @@ async function finishRegistration(session) {
     await speak(session, `You're all set${reg.name ? ', ' + reg.name : ''}! Your account is live at kademurdock dot com. Your password, spelled out: ${spelledPwd} — all lowercase, one word. You can change it on the website anytime. From your next call on, I'll know you by your own account. Now — where were we?`, session.voice);
   } else if (res && res.exists) {
     await speak(session, `Looks like ${spellOutEmail(reg.email)} already has an account. If that's yours, you're already good on the website — let's just keep talking.`, session.voice);
+  } else if (res && res.limited) {
+    await speak(session, "That's as many sign-up tries as I can do for now. Kade can set you up on the website, or we can try again tomorrow. Let's keep talking.", session.voice);
   } else if (res && res.passcode) {
     await speak(session, "Hm — signups are code-locked right now and my code isn't working. Kade will fix that; let's keep chatting and try later.", session.voice);
   } else {
@@ -2908,6 +2910,7 @@ async function handleGateTurn(session, text) {
         filed = await session.cfg.fileAccessRequest({
           name: g.doorName || 'Phone caller',
           contact: `phone ${session.from}`,
+          phone: session.from,
           whoYouAre: t.slice(0, 1200),
           whyHere: 'Asked by voice on the Kade-AI phone line.',
         });

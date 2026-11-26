@@ -20,6 +20,8 @@ const http2    = require('http2');
 const { attachMediaStreams, attachWebVoice, synthesize: vsSynthesize, handleAmdResult: vsHandleAmd, characterRateFor } = require('./voice-stream');
 const twilio   = require('twilio');
 const axios    = require('axios');
+// Nov 26 2026 (Part 461): every call to the site carries the service seat header (KADE_SERVICE_LIMIT_SECRET), and no other host gets it.
+require('./site-seat').installAxiosSeat(axios);
 const crypto   = require('crypto');
 const fs       = require('fs');
 const path     = require('path');
@@ -320,7 +322,7 @@ async function getTokenForCall(state) {
 }
 
 // ── LibreChat account creation ────────────────────────────────────────────────
-async function createLCAccount(name, email, password, accountType) {
+async function createLCAccount(name, email, password, accountType, phone) {
   // July 21 2026 (phone registration rebuild): site registration has been
   // passcode-gated since July 3 (env KADE_REG_CODE_ADULT / KADE_REG_CODE_CHILD
   // on the LibreChat service; same names mirrored onto this bridge). Without
@@ -330,6 +332,14 @@ async function createLCAccount(name, email, password, accountType) {
     ? process.env.KADE_REG_CODE_CHILD
     : process.env.KADE_REG_CODE_ADULT;
   if (!passcode) throw new Error('KADE_REG_CODE_* env missing on bridge');
+  // Nov 26 2026 (Part 461 review fix): each try below ends in a sign-in with the
+  // password the caller chose, so a few tries per caller number, per email and
+  // per hour, then no more. See site-caps.js.
+  if (!require('./site-caps').siteCaps().allowSignup({ phone, email })) {
+    const e = new Error('too many sign-up tries for now');
+    e.kadeLimited = true;
+    throw e;
+  }
   await axios.post(
     `${LIBRECHAT_URL}/api/auth/register`,
     { name, email, password, confirm_password: password, passcode },
@@ -1987,7 +1997,7 @@ app.post('/voice/setup-confirm/:callSid', async (req, res) => {
     const password = crypto.randomBytes(10).toString('base64url');
 
     try {
-      await createLCAccount(name, email, password);
+      await createLCAccount(name, email, password, undefined, state.from);
       console.log(`[voice] created LibreChat account for ${state.from}: ${email}`);
 
       // Update state + persist user
@@ -4451,11 +4461,18 @@ async function deliverFrontDeskMessage({ from, fromName, message, targetUserId, 
   return true;
 }
 
-async function fileAccessRequestByPhone({ name, contact, whoYouAre, whyHere }) {
+async function fileAccessRequestByPhone({ name, contact, whoYouAre, whyHere, phone }) {
   // Rides the SAME public doorbell the login page links (Aug 9 front-door
   // system) — one review queue, one push, one approve/deny surface. The
-  // fork's 3-per-IP-hour limit sees the bridge's IP; fine for a rare event,
-  // and the gate's fail-soft (front-desk note) catches a 429.
+  // gate's fail-soft (front-desk note) catches a refusal.
+  // Nov 26 2026 (Part 461 review fix): the site no longer counts the bridge's
+  // knocks by address, so the bridge keeps its own limits: a couple a day per
+  // caller number, a few an hour in all (site-caps.js). The site also holds
+  // all services to one shared hourly count.
+  if (!require('./site-caps').siteCaps().allowKnock({ phone: phone || contact })) {
+    console.warn('[gate] knock not filed: over the bridge knock limit');
+    return false;
+  }
   const r = await axios.post(`${LIBRECHAT_URL}/api/access-request`, { name, contact, whoYouAre, whyHere }, {
     headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' }, timeout: 8000,
   });
@@ -4503,11 +4520,12 @@ attachMediaStreams(server, users, {
   // name/agent/voice/accountType) so the caller's NEXT call rides their own
   // token via the existing lcEmail/lcPass path; hasAccount gates entry so
   // account-holders just hear "you're good."
-  createAccount: async ({ name, email, password, child }) => {
+  createAccount: async ({ name, email, password, child, phone }) => {
     try {
-      await createLCAccount(name, email, password, child ? 'child' : 'adult');
+      await createLCAccount(name, email, password, child ? 'child' : 'adult', phone);
       return { ok: true };
     } catch (err) {
+      if (err.kadeLimited) { console.warn('[reg] sign-up not tried: over the bridge sign-up limit'); return { limited: true }; }
       if (err.kadeExists) return { exists: true };
       const status = err.response?.status;
       const msg = (err.response?.data?.message || err.message || '').toLowerCase();
