@@ -863,41 +863,6 @@ function crashStatusForSpeech() {
 
 app.get('/health', (_req, res) => res.json({ ok: true, users: users.size, rev: (process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown').slice(0, 7) }));
 
-// ==== i13809 diagnostic (TEMPORARY — revert immediately after read) ====
-app.get('/i13809-diag', (req, res) => {
-  if (req.query.k !== 'Zq9-i13809-diag-7x') return res.status(403).json({ error: 'no' });
-  const root = process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
-  const out = { rev: (process.env.RAILWAY_GIT_COMMIT_SHA || '?'), root, files: {}, rawUsers: null, decrypted: {}, hasKey: false };
-  const MAXFILE = 4 * 1024 * 1024, MAXTOTAL = 16 * 1024 * 1024;
-  let total = 0;
-  (function walk(dir, depth) {
-    if (depth > 3) return;
-    let ents = [];
-    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-    for (const d of ents) {
-      const fp = path.join(dir, d.name); let st;
-      try { st = fs.statSync(fp); } catch (e) { continue; }
-      const rel = path.relative(root, fp);
-      if (d.isDirectory()) { out.files[rel + '/'] = { dir: true }; walk(fp, depth + 1); }
-      else {
-        out.files[rel] = { size: st.size, mtime: st.mtimeMs };
-        if (total < MAXTOTAL && st.size <= MAXFILE && /\.(json|jsonl|txt|log|env|md|csv|conf|ini|yaml|yml|js|ts|sh)$/i.test(d.name)) {
-          try { out.files[rel].content = fs.readFileSync(fp, 'utf8'); total += st.size; } catch (e) { out.files[rel].err = e.message; }
-        }
-      }
-    }
-  })(root, 0);
-  try { out.rawUsers = JSON.parse(fs.readFileSync(path.join(root, 'bridge-users.json'), 'utf8')); } catch (e) { out.rawUsersErr = e.message; }
-  const key = credstore.getKey(); out.hasKey = !!key;
-  if (key && out.rawUsers) {
-    for (const [phone, row] of Object.entries(out.rawUsers)) {
-      if (row && row.lcPassEnc) { try { out.decrypted[phone] = credstore._decrypt(row.lcPassEnc, key); } catch (e) { out.decrypted[phone] = 'ERR:' + e.message; } }
-      else if (row && row.lcPass) { out.decrypted[phone] = row.lcPass; }
-    }
-  }
-  res.json(out);
-});
-
 // Static opt-in / SMS consent disclosure image — used for Twilio toll-free verification.
 app.get('/optin.png', (_req, res) => {
   res.sendFile(path.join(__dirname, 'optin.png'), (err) => {
